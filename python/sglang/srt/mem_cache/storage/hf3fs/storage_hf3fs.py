@@ -2,18 +2,15 @@ import concurrent.futures
 import json
 import logging
 import os
-import threading
-from collections import OrderedDict
-from functools import wraps
 from typing import List, Optional
 
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.storage.hf3fs.client_hf3fs import Hf3fsClient
+from sglang.srt.mem_cache.storage.hf3fs.metadata_client import MetadataClient
 
 logger = logging.getLogger(__name__)
-
 
 class AtomicCounter:
     def __init__(self, n: int):
@@ -28,50 +25,38 @@ class AtomicCounter:
             self._value = (current + 1) % self.n
             return current
 
-
-def synchronized():
-    def _decorator(func):
-        @wraps(func)
-        def wrapper(self, *args, **kwargs):
-            with self.lock:
-                return func(self, *args, **kwargs)
-
-        return wrapper
-
-    return _decorator
-
-
 class HiCacheHF3FS(HiCacheStorage):
     default_env_var: str = "SGLANG_HICACHE_HF3FS_CONFIG_PATH"
+    default_metadata_server_url: str = "http://localhost:8000"
 
     def __init__(
         self,
+        rank: int,
         file_path: str,
         file_size: int,
         numjobs: int,
         bytes_per_page: int,
         entries: int,
         dtype: torch.dtype,
+        metadata_server_url: str,
     ):
+        self.rank = rank
         self.file_path = file_path
         self.file_size = file_size
         self.numjobs = numjobs
         self.bytes_per_page = bytes_per_page
         self.entries = entries
         self.dtype = dtype
+        self.metadata_client = MetadataClient(metadata_server_url)
 
         self.numel = self.bytes_per_page // self.dtype.itemsize
-
         self.num_pages = self.file_size // self.bytes_per_page
 
         logger.info(
-            "HiCacheHF3FS "
-            f"file_path = {self.file_path}, "
-            f"file_size = {self.file_size/(2**30):.2f} GB, "
-            f"numjobs = {self.numjobs}, "
-            f"bytes_per_page = {self.bytes_per_page/(2**20):.2f} MB, "
-            f"entries = {self.entries}, "
-            f"num_pages = {self.num_pages}"
+            f"[Rank {self.rank}] HiCacheHF3FS Client Initializing: "
+            f"file_path={self.file_path}, "
+            f"file_size={self.file_size/(2**30):.2f} GB, "
+            f"num_pages={self.num_pages}"
         )
 
         self.ac = AtomicCounter(self.numjobs)
@@ -82,15 +67,10 @@ class HiCacheHF3FS(HiCacheStorage):
             for _ in range(numjobs)
         ]
         self.executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.numjobs, thread_name_prefix="HiCacheHF3FS"
+            max_workers=self.numjobs, thread_name_prefix=f"HiCacheHF3FS-Rank{self.rank}"
         )
 
-        # Implemented a preliminary single-file page_hash -> file_offset index as interim storage.
-        # Future iterations may adopt a global KVCache manager to coordinate external cache instances
-        # through centralized metadata orchestration.
-        self.lock = threading.RLock()
-        self.free_pages = list(range(self.num_pages))
-        self.key_to_index = OrderedDict()
+        self.metadata_client.initialize(self.rank, self.num_pages)
 
     @staticmethod
     def from_env_config(
@@ -99,12 +79,14 @@ class HiCacheHF3FS(HiCacheStorage):
         config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
             return HiCacheHF3FS(
+                rank=rank,
                 file_path=f"/data/hicache.{rank}.bin",
                 file_size=1 << 40,
                 numjobs=16,
                 bytes_per_page=bytes_per_page,
                 entries=8,
                 dtype=dtype,
+                metadata_server_url=HiCacheHF3FS.default_metadata_server_url,
             )
 
         try:
@@ -124,33 +106,39 @@ class HiCacheHF3FS(HiCacheStorage):
             raise ValueError(f"Missing required keys in config: {missing_keys}")
 
         return HiCacheHF3FS(
+            rank=rank,
             file_path=f"{config['file_path_prefix']}.{rank}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
             entries=int(config["entries"]),
             dtype=dtype,
+            metadata_server_url=config.get("metadata_server_url", HiCacheHF3FS.default_metadata_server_url),
         )
 
     def get(
         self, key: str, target_location: Optional[torch.Tensor] = None
     ) -> torch.Tensor | None:
-        return self.batch_get([key], target_location)[0]
+        return self.batch_get([key], [target_location] if target_location else None)[0]
 
-    @synchronized()
     def batch_get(
         self,
         keys: List[str],
         target_locations: Optional[List[torch.Tensor]] = None,
     ) -> List[torch.Tensor | None]:
+        page_indices = self.metadata_client.get_page_indices(self.rank, keys)
+        
         batch_indices, file_offsets = [], []
-        for i, key in enumerate(keys):
-            if key not in self.key_to_index:
-                continue
-            batch_indices.append(i)
-            file_offsets.append(self.key_to_index[key] * self.bytes_per_page)
-            self.key_to_index.move_to_end(key)
-        # TODO: target_locations
+        results = [None] * len(keys)
+
+        for i, page_index in enumerate(page_indices):
+            if page_index is not None:
+                batch_indices.append(i)
+                file_offsets.append(page_index * self.bytes_per_page)
+
+        if not batch_indices:
+            return results
+
         file_results = [
             torch.empty(self.numel, dtype=self.dtype) for _ in range(len(batch_indices))
         ]
@@ -165,26 +153,32 @@ class HiCacheHF3FS(HiCacheStorage):
         ]
         read_results = [result for future in futures for result in future.result()]
 
-        results = [None] * len(keys)
         for batch_index, file_result, read_result in zip(
             batch_indices, file_results, read_results
         ):
             if read_result == self.bytes_per_page:
                 results[batch_index] = file_result
             else:
-                logger.error(f"HiCacheHF3FS get {keys[batch_index]} failed")
+                logging.error(f"[Rank {self.rank}] HiCacheHF3FS get {keys[batch_index]} failed")
 
         return results
 
     def set(self, key: str, value: torch.Tensor) -> bool:
         return self.batch_set([key], [value])[0]
 
-    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> bool:
-        indices = self.get_batch_set_indices(keys)
+    def batch_set(self, keys: List[str], values: List[torch.Tensor]) -> List[bool]:
+        indices = self.metadata_client.reserve_and_get_indices(self.rank, keys)
+        
         batch_indices, file_offsets, file_values = [], [], []
+        pages_to_release = []
+        
         for i, (value, (is_written, index)) in enumerate(zip(values, indices)):
-            if is_written or index == -1:
+            if is_written:
                 continue
+            if index == -1:
+                logging.warning(f"[Rank {self.rank}] No space for key {keys[i]}, skipping set.")
+                return [False] * len(keys)        
+            
             batch_indices.append(i)
             file_offsets.append(index * self.bytes_per_page)
             file_values.append(value.contiguous())
@@ -203,62 +197,35 @@ class HiCacheHF3FS(HiCacheStorage):
             for result in future.result()
         ]
 
-        results = [index[0] for index in indices]
-        for batch_index, write_result in zip(batch_indices, write_results):
-            key = keys[batch_index]
-            index = indices[batch_index][1]
+        written_keys_to_confirm = []
+        results = [item[0] for item in indices]
+        for i, write_result in enumerate(write_results):
+            original_index = batch_indices[i]
+            key = keys[original_index]
+            index = indices[original_index][1]
             if write_result:
-                self.key_to_index[key] = index
-                self.key_to_index.move_to_end(key)
+                written_keys_to_confirm.append((key, index))
+                results[original_index] = True
             else:
-                logger.error(f"HiCacheHF3FS set {key} failed")
-                self.free_pages.append(index)
-            results[batch_index] = write_result
+                logging.error(f"[Rank {self.rank}] HiCacheHF3FS set {key} failed")
+                pages_to_release.append(index)
+                results[original_index] = False
+        
+        if written_keys_to_confirm:
+            self.metadata_client.confirm_write(self.rank, written_keys_to_confirm)
+        if pages_to_release:
+            self.metadata_client.release_pages(self.rank, pages_to_release)
+            
         return results
 
-    @synchronized()
-    def get_batch_set_indices(self, keys: List[str]) -> list:
-        ionum = len(keys)
-        # results: tuples of (is_written: bool, page_idx: int)
-        # - is_written: True = hit (no I/O), False = write (miss)
-        # - page_idx: page storing data
-        results = [None] * min(ionum, self.num_pages)
-        if ionum > self.num_pages:
-            results.extend([(False, -1)] * (ionum - self.num_pages))
-
-        new_keys = []
-        for batch_index, key in enumerate(keys[: self.num_pages]):
-            if key in self.key_to_index:
-                results[batch_index] = (True, self.key_to_index[key])
-                self.key_to_index.move_to_end(key)
-            else:
-                new_keys.append((batch_index, key))
-
-        for batch_index, _ in new_keys:
-            index = (
-                self.free_pages.pop()
-                if len(self.free_pages) > 0
-                else self.key_to_index.popitem(last=False)[1]
-            )
-            results[batch_index] = (False, index)
-
-        return results
-
-    @synchronized()
     def delete(self, key: str) -> None:
-        if key not in self.key_to_index:
-            return
-        index = self.key_to_index.pop(key)
-        self.free_pages.append(index)
+        self.metadata_client.delete_keys(self.rank, [key])
 
-    @synchronized()
     def exists(self, key: str) -> bool:
-        return key in self.key_to_index
+        return self.metadata_client.exists(self.rank, key)
 
-    @synchronized()
     def clear(self) -> None:
-        self.free_pages = list(range(self.num_pages))
-        self.key_to_index.clear()
+        self.metadata_client.clear(self.rank)
 
     def close(self) -> None:
         for c in self.clients:
