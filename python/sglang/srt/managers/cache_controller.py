@@ -804,7 +804,7 @@ class HiCacheController:
                     # free the pre-allocated memory for pages that are not hit
                     self.mem_pool_host.free(operation.host_indices[storage_hit_count:])
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
+                    logger.info(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
