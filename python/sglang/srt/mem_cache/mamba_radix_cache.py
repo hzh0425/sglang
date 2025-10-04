@@ -444,33 +444,25 @@ class MambaRadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # insert the token_ids and kv_indices into the radix tree
         # Note: the insert function already frees the overlapped kv_indices
-        mamba_value = self.req_to_token_pool.get_mamba_indices(
-            req.req_pool_idx
-        ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
-        # if alloc mamba cache failed, do evict and alloc again
-        if mamba_value_forked is None:
-            self.evict_mamba(1)
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+        mamba_value = (
+            self.req_to_token_pool.get_mamba_indices(req.req_pool_idx)
+            .unsqueeze(-1)
+            .clone()
+        )
 
         new_prefix_len, mamba_exist = self.insert(
             RadixKey(token_ids[:page_aligned_len], req.extra_key),
             page_aligned_kv_indices,
-            mamba_value_forked,
+            mamba_value,
         )
 
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
 
-        self.req_to_token_pool.free(req.req_pool_idx)
-        # there is a mamba cache in radix cache, release it
-        if mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+        # If mamba_exist=True, radix cache already has mamba state, so free it;
+        # If mamba_exist=False, radix cache took ownership of mamba state, don't free it
+        self.req_to_token_pool.free(req.req_pool_idx, free_mamba_cache=mamba_exist)
         self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
