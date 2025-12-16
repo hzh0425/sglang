@@ -103,4 +103,5 @@ class KnormPageAlgorithm(BaseSparseAlgorithmImpl):
         phys_pages_clamped = phys_pages.clamp(
             0, self.page_scores[layer_id].shape[0] - 1
         )
+        
         return self.page_scores[layer_id][phys_pages_clamped].squeeze(-1)

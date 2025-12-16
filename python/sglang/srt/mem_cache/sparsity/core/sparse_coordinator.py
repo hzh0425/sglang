@@ -258,7 +258,6 @@ class SparseCoordinator:
         """Handle attention begin."""
         if layer.layer_id == self.start_layer:
             self.backend_adaptor.save_original_metadata(attn_metadata)
-
         return self._handle_sparse_retrieve(
             query, layer, forward_batch, attn_metadata, **kwargs
         )
@@ -310,7 +309,7 @@ class SparseCoordinator:
             attn_metadata=attn_metadata,
             **kwargs,
         )
-
+        
         # Adapt Attention Metadata
         return self.backend_adaptor.adapt_for_attn_metadata(
             selected_indices=selected_indices,
@@ -328,7 +327,9 @@ class SparseCoordinator:
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
-
-        if not isinstance(self.algorithm, DeepSeekNSAAlgorithm):
-            mask &= self.states.repr_constructed[req_pool_indices]
+        # print("====================== Sparse Mask Computation ==================")
+        # print(self.states.prompt_lens[req_pool_indices])
+        # print("min_sparse_prompt_len:", self.config.min_sparse_prompt_len)
+        # if not isinstance(self.algorithm, DeepSeekNSAAlgorithm):
+        #     mask &= self.states.repr_constructed[req_pool_indices]
         return mask

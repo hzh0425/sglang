@@ -27,6 +27,8 @@ class DeepSeekNSAAlgorithm(BaseSparseAlgorithmImpl):
         attn_metadata: Optional[Any],
         **kwargs,
     ) -> tuple:
+        print("====================== DeepSeek NSA Top-K Retrieval ==================")
+        print(queries.shape, layer_id, req_pool_indices.shape, sparse_mask.shape, attn_metadata)
         indexer, forward_batch, x, q_lora, positions = (
             kwargs.get("indexer"),
             kwargs.get("forward_batch"),
