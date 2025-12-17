@@ -80,8 +80,8 @@ def create_sparse_coordinator(
     **kwargs,
 ) -> SparseCoordinator:
     # config = SparseConfig(page_size=page_size, algorithm="deepseek_nsa")
-    # config = SparseConfig(page_size=page_size, algorithm="knorm_page", min_sparse_prompt_len=200)
-    config = SparseConfig(page_size=page_size, algorithm="quest", min_sparse_prompt_len=200)
+    config = SparseConfig(page_size=page_size, algorithm="knorm_page", min_sparse_prompt_len=200)
+    # config = SparseConfig(page_size=page_size, algorithm="quest", min_sparse_prompt_len=200)
 
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
 

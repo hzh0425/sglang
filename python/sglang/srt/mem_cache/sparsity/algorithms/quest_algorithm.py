@@ -135,7 +135,6 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 		k_min = self.page_k_min[layer_id][phys_pages_clamped]
 		k_max = self.page_k_max[layer_id][phys_pages_clamped]
 		valid_mask = self.page_valid[layer_id][phys_pages_clamped]
-
 		# Align query shape to KV heads.
 		head_dim = k_min.shape[-1]
 		if queries.dim() == 2:
@@ -170,6 +169,3 @@ class QuestAlgorithm(BaseSparseAlgorithmImpl):
 		)
 
 		return criticality
-
-	# Quest relies on query-aware scoring; the default TopK flow is sufficient.
-	# Override retrieve_topk only if later optimizations are needed.
