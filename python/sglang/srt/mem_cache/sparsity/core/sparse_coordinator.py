@@ -327,9 +327,6 @@ class SparseCoordinator:
             self.states.prompt_lens[req_pool_indices]
             >= self.config.min_sparse_prompt_len
         )
-        # print("====================== Sparse Mask Computation ==================")
-        # print(self.states.prompt_lens[req_pool_indices])
-        # print("min_sparse_prompt_len:", self.config.min_sparse_prompt_len)
-        # if not isinstance(self.algorithm, DeepSeekNSAAlgorithm):
-        #     mask &= self.states.repr_constructed[req_pool_indices]
+        if not isinstance(self.algorithm, DeepSeekNSAAlgorithm):
+            mask &= self.states.repr_constructed[req_pool_indices]
         return mask
