@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.sparsity.algorithms.deepseek_nsa import DeepSeekNSAAlgorithm
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import BaseSparseAlgorithm
 from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
@@ -110,6 +111,21 @@ class RequestTrackers:
         self._reset_state(idx)
         return host_indices
 
+    def init_topk_indices(self, req_pool_idx: int, req_to_token_pool) -> None:
+        # Store device indices
+        num_pages = self.device_buffer_cnt // self.page_size
+        page_starts = (
+            torch.arange(num_pages, device=self.device) * self.page_size
+        )
+        page_indices = (
+            req_to_token_pool.req_to_token[req_pool_idx, page_starts]
+            // self.page_size
+        )
+        self.last_device_indices[req_pool_idx] = page_indices
+        self.last_top_k_result[req_pool_idx] = torch.arange(
+            num_pages, device=self.device
+        )
+        self.hierarchical_sparse_enabled[req_pool_idx] = True
 
 @dataclass
 class SparseConfig:
@@ -173,7 +189,7 @@ class SparseCoordinator:
         self.end_layer = end_layer
         self.device = device
         self.page_size = config.page_size
-
+        
         self.states = RequestTrackers(
             req_to_token_pool.req_to_token.shape[0],
             device,
@@ -181,7 +197,7 @@ class SparseCoordinator:
             self.config.topk_tokens_cnt,
             self.config.device_buffer_cnt,
             self.req_to_token_pool.max_context_len,
-            self.page_size,
+            1 if isinstance(self.algorithm, DeepSeekNSAAlgorithm) else self.page_size,
         )
         self.sparse_kv_cache_manager.req_states = self.states
 
@@ -239,19 +255,8 @@ class SparseCoordinator:
 
             if req.hierarchical_sparse_enabled:
                 # Store device indices
-                num_pages = self.states.device_buffer_cnt // self.page_size
-                page_starts = (
-                    torch.arange(num_pages, device=self.device) * self.page_size
-                )
-                page_indices = (
-                    self.req_to_token_pool.req_to_token[req.req_pool_idx, page_starts]
-                    // self.page_size
-                )
-                self.states.last_device_indices[req.req_pool_idx] = page_indices
-                self.states.last_top_k_result[req.req_pool_idx] = torch.arange(
-                    num_pages, device=self.device
-                )
-                self.states.hierarchical_sparse_enabled[req.req_pool_idx] = True
+                self.states.init_topk_indices(req.req_pool_idx, self.req_to_token_pool)
+
             logger.info(f"Request {req.rid} async offload prompt cache done.")
         return reqs
 
@@ -334,9 +339,6 @@ class SparseCoordinator:
         Identify important KV entries via sparse algorithm, load offloaded KVCache if needed,
         and adapt attention metadata for the attention backend.
         """
-        if attn_metadata is None:
-            return
-
         if layer.layer_id == self.start_layer:
             self.backend_adaptor.save_original_metadata(attn_metadata)
 
@@ -410,7 +412,7 @@ class SparseCoordinator:
 
     def _compute_sparse_mask(self, req_pool_indices):
         mask = self.states.hierarchical_sparse_enabled[req_pool_indices]
-        mask = mask & self.states.repr_constructed[req_pool_indices]
+        # mask = mask & self.states.repr_constructed[req_pool_indices]
         return mask
 
     def _maybe_truncate_kv_cache_after_prompt_offloaded(
