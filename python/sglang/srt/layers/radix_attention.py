@@ -122,7 +122,7 @@ class RadixAttention(nn.Module):
             )
             return output
         else:
-            attention_begin_hook(q, k, v, self, forward_batch)
+            #attention_begin_hook(q, k, v, self, forward_batch)
 
             # Call backend attention
             output = forward_batch.attn_backend.forward(
@@ -135,7 +135,7 @@ class RadixAttention(nn.Module):
                 **kwargs,
             )
 
-            attention_end_hook(output, self, forward_batch)
+            #attention_end_hook(output, self, forward_batch)
             return output
 
 

@@ -162,7 +162,7 @@ def page_wise_diff_triton_kernel(
 
 
 @triton.jit
-def token_wise_diff_triton_kernel(
+def nsa_sparse_diff_triton_kernel(
     prev_topk_ptr,
     curr_topk_ptr,
     prev_dev_idx_ptr,
@@ -302,6 +302,57 @@ def token_wise_diff_triton_kernel(
     tl.store(load_host_base + fill_pos, host_vals_all, mask=empty_slots)
     tl.store(load_host_base + offset_lru, -1, mask=offset_lru >= fill_count)
 
+def invoke_nsa_sparse_diff_kernel(
+    prev_top_k_result_pool: torch.Tensor,
+    curr_top_k_result: torch.Tensor,
+    prev_device_indices_pool: torch.Tensor,
+    curr_device_indices: torch.Tensor,
+    bitmap: torch.Tensor,
+    full_host_indices: torch.Tensor,
+    should_load_device_indices: torch.Tensor,
+    should_load_host_indices: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    sparse_mask: torch.Tensor,
+    page_table: torch.Tensor,
+    layer_id: int,
+    page_size: int,
+    lru_len: int,
+):
+    bs = curr_top_k_result.shape[0]
+    top_k = curr_top_k_result.shape[1]
+    grid = (bs,)
+    assert page_size == 1
+    nsa_sparse_diff_triton_kernel[grid](
+        prev_top_k_result_pool,
+        curr_top_k_result,
+        prev_device_indices_pool,
+        curr_device_indices,
+        bitmap,
+        full_host_indices,
+        should_load_device_indices,
+        should_load_host_indices,
+        out_cache_loc,
+        seq_lens,
+        req_pool_indices,
+        sparse_mask,
+        page_table,
+        prev_top_k_result_pool.stride(0),
+        prev_top_k_result_pool.stride(1),
+        curr_top_k_result.stride(0),
+        prev_device_indices_pool.stride(0),
+        prev_device_indices_pool.stride(1),
+        curr_device_indices.stride(0),
+        bitmap.stride(0),
+        full_host_indices.stride(0),
+        should_load_device_indices.stride(0),
+        should_load_host_indices.stride(0),
+        page_table.stride(0),
+        layer_id,
+        top_k,
+        lru_len,
+    )
 
 def invoke_sparse_diff_kernel(
     last_top_k_idx: torch.Tensor,
@@ -355,6 +406,8 @@ def invoke_sparse_diff_kernel(
         hot_buffer_len // page_size,
         page_size,
     )
+
+
 
 
 if __name__ == "__main__":

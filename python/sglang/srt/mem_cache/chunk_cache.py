@@ -113,3 +113,29 @@ class SWAChunkCache(ChunkCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()
+
+class NSAChunkCache(ChunkCache):
+    """ChunkCache with NSA decode hybrid pool support."""
+
+    def __init__(self, params: CacheInitParams):
+        super().__init__(params)
+
+        from sglang.srt.mem_cache.common import enable_nsa_hybrid_indexer_pool
+
+        assert enable_nsa_hybrid_indexer_pool(
+            params.token_to_kv_pool_allocator, params.req_to_token_pool
+        ), "NSAChunkCache requires NSA decode hybrid pool"
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        kv_committed_len = req.pop_committed_kv_cache()
+        index_k_free_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
+        ]
+        index_k_indices = self.req_to_token_pool.req_to_nsa_index_k[
+            req.req_pool_idx, :index_k_free_len
+        ]
+        self.token_to_kv_pool_allocator.free((kv_indices, index_k_indices))
+        self.req_to_token_pool.free(req.req_pool_idx)
+        self.protected_size_ -= len(req.prefix_indices)
+        logger.info(f"Cache finished req {req.req_pool_idx} with {kv_committed_len=} and {index_k_free_len=}")

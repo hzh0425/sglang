@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
-from sglang.srt.mem_cache.sparsity.kernel.diff_kernel import invoke_sparse_diff_kernel
+from sglang.srt.mem_cache.sparsity.kernel.diff_kernel import invoke_nsa_sparse_diff_kernel, invoke_sparse_diff_kernel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_device_module
 
@@ -113,9 +113,8 @@ class SparseKVCacheManager:
         Returns:
             Device indices of the selected pages/tokens
         """
-        batch_size = sparse_mask.shape[0]
-
-        invoke_sparse_diff_kernel(
+        bs = sparse_mask.shape[0]
+        invoke_nsa_sparse_diff_kernel(
             self.req_states.last_top_k_result,
             top_k_result,
             self.req_states.last_device_indices,
@@ -124,41 +123,81 @@ class SparseKVCacheManager:
             self.req_states.req_to_tokens_host,
             self.req_states.should_load_device_indices,
             self.req_states.should_load_host_indices,
+            out_cache_loc,
             seq_lens,
             req_pool_indices,
             sparse_mask,
             page_table,
             layer_id,
-            self.req_states.topk_tokens_cnt,
-            self.req_states.device_buffer_cnt,
             page_size,
+            self.req_states.device_buffer_cnt,
         )
+
         swap_target_device_slots = self.req_states.should_load_device_indices[
-            :batch_size, : self.req_states.topk_tokens_cnt
+            :bs, : self.req_states.topk_tokens_cnt
         ]
         swap_source_host_slots = self.req_states.should_load_host_indices[
-            :batch_size, : self.req_states.topk_tokens_cnt
+            :bs, : self.req_states.topk_tokens_cnt
         ]
         swap_target_device_slots = swap_target_device_slots[
             swap_target_device_slots != -1
         ]
         swap_source_host_slots = swap_source_host_slots[swap_source_host_slots != -1]
-        assert (
-            swap_target_device_slots.numel() == swap_source_host_slots.numel()
-        ), "Swap target device slots and source host slots must have the same number of elements"
+
+        # load cache from cpu
+        self.host_mem_pool.load_to_device_per_layer(
+            self.host_mem_pool.device_pool,
+            swap_source_host_slots.flatten(),
+            swap_target_device_slots.flatten(),
+            layer_id,
+            "kernel",
+        )
+
+        # Page wise kernel
+        # invoke_sparse_diff_kernel(
+        #     self.req_states.last_top_k_result,
+        #     top_k_result,
+        #     self.req_states.last_device_indices,
+        #     self.req_states.curr_device_indices,
+        #     self.bitmap,
+        #     self.req_states.req_to_tokens_host,
+        #     self.req_states.should_load_device_indices,
+        #     self.req_states.should_load_host_indices,
+        #     seq_lens,
+        #     req_pool_indices,
+        #     sparse_mask,
+        #     page_table,
+        #     layer_id,
+        #     self.req_states.topk_tokens_cnt,
+        #     self.req_states.device_buffer_cnt,
+        #     page_size,
+        # )
+        # swap_target_device_slots = self.req_states.should_load_device_indices[
+        #     :batch_size, : self.req_states.topk_tokens_cnt
+        # ]
+        # swap_source_host_slots = self.req_states.should_load_host_indices[
+        #     :batch_size, : self.req_states.topk_tokens_cnt
+        # ]
+        # swap_target_device_slots = swap_target_device_slots[
+        #     swap_target_device_slots != -1
+        # ]
+        # swap_source_host_slots = swap_source_host_slots[swap_source_host_slots != -1]
+        # assert (
+        #     swap_target_device_slots.numel() == swap_source_host_slots.numel()
+        # ), "Swap target device slots and source host slots must have the same number of elements"
 
         # Load cache from host to device
-        if swap_target_device_slots.numel() > 0:
-            self.mem_pool_host.load_to_device_per_layer(
-                self.mem_pool_device,
-                swap_source_host_slots.flatten(),
-                swap_target_device_slots.flatten(),
-                layer_id,
-                "kernel",
-            )
+        #if swap_target_device_slots.numel() > 0:
+            # self.mem_pool_host.load_to_device_per_layer(
+            #     self.mem_pool_device,
+            #     swap_source_host_slots.flatten(),
+            #     swap_target_device_slots.flatten(),
+            #     layer_id,
+            #     "kernel",
+            # )
 
         return self.req_states.curr_device_indices[
-            :batch_size, : self.req_states.topk_tokens_cnt // page_size
+            :bs, : self.req_states.topk_tokens_cnt // page_size
         ]
 
     def offload_decode_token_kvcache(
