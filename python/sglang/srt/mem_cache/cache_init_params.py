@@ -36,3 +36,8 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    hybrid_enabled: bool = False
+    hybrid_components: Optional[list[str]] = None
+    hybrid_primary_component: str = "full"
+    hybrid_swa_window_size: Optional[int] = None

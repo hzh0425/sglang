@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import (
     TYPE_CHECKING,
     Any,
+    Dict,
     NamedTuple,
     Optional,
     Protocol,
@@ -77,6 +78,7 @@ class EvictParams:
     num_tokens: int
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    component_requests: Optional[Dict[str, int]] = None
 
 
 @dataclasses.dataclass
@@ -86,6 +88,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    component_num_evicted: Optional[Dict[str, int]] = None
 
 
 class MatchResult(NamedTuple):
