@@ -217,6 +217,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 host_indices=full_host_indices,
                 node_id=last_hit_node.id,
             )
+        logger.info(f"Trigger loading back {len(full_host_indices)} tokens for node {last_hit_node.id}")
         self.dec_lock_ref(ancestor_node)
         if full_device_indices is None:
             # no sufficient GPU memory to load back KV caches
