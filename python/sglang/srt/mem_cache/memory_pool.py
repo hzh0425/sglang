@@ -311,7 +311,8 @@ class MambaPool:
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                     f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
                     f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB "
-                )
+                    f"spec size: {spec_state_size}"
+            )
             else:
                 self.mamba_cache = self.State(conv=conv_state, temporal=temporal_state)
                 logger.info(
