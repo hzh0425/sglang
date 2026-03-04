@@ -3,12 +3,17 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
+import numpy as np
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.host_pool_base import HostPoolBase
+    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.transfer_view import TransferView
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +77,18 @@ class HiCacheStorage(ABC):
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
-    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+    def register_mem_pool_host(self, mem_pool_host: "HostKVCache"):
         self.mem_pool_host = mem_pool_host
+
+    def register_host_pool(self, host_pool: "HostPoolBase"):
+        """Register a host pool (can be any HostPoolBase implementation, not just HostKVCache)."""
+        self.mem_pool_host = host_pool
 
     def batch_get_v1(
         self,
         keys: List[str],
         host_indices: torch.Tensor,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
     ) -> List[bool]:
         """
         Retrieve values for multiple keys.
@@ -91,13 +100,91 @@ class HiCacheStorage(ABC):
         self,
         keys: List[str],
         host_indices: torch.Tensor,
-        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
     ) -> List[bool]:
         """
         Store multiple key-value pairs.
         Returns a list of booleans indicating success for each key.
         """
         pass
+
+    # ==================== V2 Interface (TransferView-based) ====================
+
+    def supports_transfer_view(self) -> bool:
+        """
+        Check if this storage backend supports TransferView-based operations.
+
+        Backends that support TransferView should override this to return True
+        and implement batch_get_v2 and batch_set_v2.
+
+        Returns:
+            False by default. Override to return True if v2 interface is supported.
+        """
+        return False
+
+    def batch_get_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys into TransferView-specified locations.
+
+        This is the new interface that works with any HostPoolBase implementation.
+        The TransferView describes where to write the data in host memory.
+
+        Args:
+            keys: List of hash keys to retrieve.
+            transfer_view: Describes the target memory layout for retrieved data.
+            extra_info: Optional extra information for the operation.
+
+        Returns:
+            List of booleans indicating success for each key.
+
+        Note:
+            Default implementation falls back to v1 interface if the pool is HostKVCache.
+            Override this method for backends that want to support arbitrary pool types.
+        """
+        # Default: fall back to v1 if available
+        if hasattr(self, "mem_pool_host") and transfer_view.offsets is not None:
+            return self.batch_get_v1(keys, transfer_view.offsets, extra_info)
+        raise NotImplementedError(
+            "batch_get_v2 is not implemented. "
+            "Override supports_transfer_view() to return True and implement this method."
+        )
+
+    def batch_set_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Store values from TransferView-specified locations for multiple keys.
+
+        This is the new interface that works with any HostPoolBase implementation.
+        The TransferView describes where to read the data from host memory.
+
+        Args:
+            keys: List of hash keys to store.
+            transfer_view: Describes the source memory layout for data to store.
+            extra_info: Optional extra information for the operation.
+
+        Returns:
+            List of booleans indicating success for each key.
+
+        Note:
+            Default implementation falls back to v1 interface if the pool is HostKVCache.
+            Override this method for backends that want to support arbitrary pool types.
+        """
+        # Default: fall back to v1 if available
+        if hasattr(self, "mem_pool_host") and transfer_view.offsets is not None:
+            return self.batch_set_v1(keys, transfer_view.offsets, extra_info)
+        raise NotImplementedError(
+            "batch_set_v2 is not implemented. "
+            "Override supports_transfer_view() to return True and implement this method."
+        )
 
     @abstractmethod
     def get(
@@ -290,3 +377,187 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    # ==================== V2 Interface (TransferView-based) ====================
+
+    def supports_transfer_view(self) -> bool:
+        """HiCacheFile supports TransferView-based operations."""
+        return True
+
+    def batch_get_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys into TransferView-specified locations.
+
+        This implementation supports any pool type by working directly with
+        the tensors provided in the TransferView.
+
+        For pools with multiple tensors (e.g., KV cache with K and V), we store
+        each tensor's data sequentially and read them back in the same order.
+
+        Args:
+            keys: List of hash keys to retrieve (one per page).
+            transfer_view: Describes the target memory layout.
+            extra_info: Optional extra information (unused for file backend).
+
+        Returns:
+            List of booleans indicating success for each key.
+        """
+        if transfer_view.tensors is None or len(transfer_view.tensors) == 0:
+            logger.warning("TransferView has no tensors to read into")
+            return [False] * len(keys)
+
+        if transfer_view.offsets is None:
+            logger.warning("TransferView has no offsets specified")
+            return [False] * len(keys)
+
+        offsets = transfer_view.offsets
+        page_size = transfer_view.page_size or 1
+        tensors = transfer_view.tensors
+
+        results = []
+
+        for i, key in enumerate(keys):
+            key_suffixed = self._get_suffixed_key(key)
+            tensor_path = os.path.join(self.file_path, f"{key_suffixed}.bin")
+
+            if not os.path.exists(tensor_path):
+                results.append(False)
+                continue
+
+            try:
+                # Get the starting offset index for this page
+                offset_idx = i * page_size
+                if offset_idx >= len(offsets):
+                    results.append(False)
+                    continue
+
+                start_offset = offsets[offset_idx].item()
+
+                # Calculate total expected bytes per page
+                total_bytes = 0
+                bytes_per_tensor = []
+                for tensor in tensors:
+                    # Get the slice for this page: tensor[start_offset:start_offset+page_size]
+                    # The number of elements in this slice is page_size * product(shape[1:])
+                    slice_numel = page_size
+                    for dim in tensor.shape[1:]:
+                        slice_numel *= dim
+                    b = slice_numel * tensor.element_size()
+                    bytes_per_tensor.append(b)
+                    total_bytes += b
+
+                # Read the file
+                with open(tensor_path, "rb") as f:
+                    file_data = f.read()
+
+                if len(file_data) != total_bytes:
+                    logger.warning(
+                        f"File size mismatch for key {key}: "
+                        f"expected {total_bytes}, got {len(file_data)}"
+                    )
+                    results.append(False)
+                    continue
+
+                # Copy data into each tensor
+                data_offset = 0
+                for tensor_idx, tensor in enumerate(tensors):
+                    b = bytes_per_tensor[tensor_idx]
+                    page_data = file_data[data_offset : data_offset + b]
+
+                    # Get the slice and copy data
+                    page_slice = tensor[start_offset : start_offset + page_size]
+                    # Use numpy for efficient byte copy
+                    page_slice_flat = page_slice.flatten()
+                    np_array = page_slice_flat.numpy()
+                    np_view = np_array.view(dtype=np.uint8)
+                    np_view[:] = np.frombuffer(page_data, dtype=np.uint8)
+
+                    data_offset += b
+
+                results.append(True)
+
+            except Exception as e:
+                logger.error(f"Failed to read key {key}: {e}")
+                results.append(False)
+
+        return results
+
+    def batch_set_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Store values from TransferView-specified locations for multiple keys.
+
+        This implementation supports any pool type by working directly with
+        the tensors provided in the TransferView.
+
+        For pools with multiple tensors (e.g., KV cache with K and V), we store
+        all tensors' data concatenated in each file.
+
+        Args:
+            keys: List of hash keys to store (one per page).
+            transfer_view: Describes the source memory layout.
+            extra_info: Optional extra information (unused for file backend).
+
+        Returns:
+            List of booleans indicating success for each key.
+        """
+        if transfer_view.tensors is None or len(transfer_view.tensors) == 0:
+            logger.warning("TransferView has no tensors to store")
+            return [False] * len(keys)
+
+        if transfer_view.offsets is None:
+            logger.warning("TransferView has no offsets specified")
+            return [False] * len(keys)
+
+        offsets = transfer_view.offsets
+        page_size = transfer_view.page_size or 1
+        tensors = transfer_view.tensors
+
+        results = []
+
+        for i, key in enumerate(keys):
+            # Check if already exists
+            if self.exists(key):
+                results.append(True)
+                continue
+
+            key_suffixed = self._get_suffixed_key(key)
+            tensor_path = os.path.join(self.file_path, f"{key_suffixed}.bin")
+
+            try:
+                offset_idx = i * page_size
+                if offset_idx >= len(offsets):
+                    results.append(False)
+                    continue
+
+                start_offset = offsets[offset_idx].item()
+
+                # Collect data from all tensors
+                all_data = bytearray()
+                for tensor in tensors:
+                    page_slice = tensor[start_offset : start_offset + page_size]
+                    # Flatten and convert to bytes
+                    all_data.extend(
+                        page_slice.flatten().numpy().tobytes()
+                    )
+
+                # Write to file
+                with open(tensor_path, "wb") as f:
+                    f.write(all_data)
+
+                results.append(True)
+
+            except Exception as e:
+                logger.error(f"Failed to store key {key}: {e}")
+                results.append(False)
+
+        return results
