@@ -1674,21 +1674,23 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             if (
-                req.last_host_node.backuped
-                or req.last_host_node is self.tree_cache.root_node
+                req.last_host_backup_node.backuped
+                or req.last_host_backup_node is self.tree_cache.root_node
             ):
-                last_hash = req.last_host_node.get_last_hash_value()
+                last_hash = req.last_host_backup_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
-                    req.last_host_node.get_prefix_hash_values(req.last_host_node.parent)
+                    req.last_host_backup_node.get_prefix_hash_values(
+                        req.last_host_backup_node.parent
+                    )
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
-                    req.last_host_node,
+                    req.last_host_backup_node,
                     new_input_tokens,
                     last_hash,
                     prefix_keys,
