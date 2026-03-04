@@ -744,6 +744,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                last_host_backup_node=self.root_node,
                 host_hit_length=0,
             )
 
@@ -751,13 +752,13 @@ class HiMambaRadixCache(MambaRadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, best_last_node, best_value_len = self._match_prefix_helper(key)
-        return self._match_post_processor(params, value, best_last_node, best_value_len)
+        value, best_last_node, best_value_len, deepest_node = self._match_prefix_helper(key)
+        return self._match_post_processor(params, value, best_last_node, best_value_len, deepest_node)
 
     def _match_prefix_helper(
         self, key: RadixKey
-    ) -> Tuple[List[torch.Tensor], TreeNode, int]:
-        """Walk tree through evicted nodes but only collect device values."""
+    ) -> Tuple[List[torch.Tensor], TreeNode, int, TreeNode]:
+        """Walk tree to find best_last_node (mamba boundary) and deepest node."""
         node = self.root_node
         child_key = self.get_child_key_fn(key)
 
@@ -794,27 +795,29 @@ class HiMambaRadixCache(MambaRadixCache):
             best_value_len = len(value)
             best_last_node = node
 
-        return value, best_last_node, best_value_len
+        deepest_node = node
+        return value, best_last_node, best_value_len, deepest_node
 
     def _match_post_processor(
         self,
         params: MatchPrefixParams,
         value: List[torch.Tensor],
-        last_node: TreeNode,
+        best_last_node: TreeNode,
         best_value_len: int,
+        deepest_node: TreeNode,
     ) -> MatchResult:
         cow_mamba = params.cow_mamba
         req = params.req
 
         # Full LRU: skip evicted nodes for full_lru_list
-        lru_node = last_node
+        lru_node = best_last_node
         while lru_node != self.root_node and lru_node.evicted:
             lru_node = lru_node.parent
         self.full_lru_list.reset_node_and_parents_mru(lru_node, self.root_node)
-        self.mamba_lru_list.reset_node_and_parents_mru(last_node, self.root_node)
+        self.mamba_lru_list.reset_node_and_parents_mru(best_last_node, self.root_node)
 
         cur_time = get_last_access_time()
-        node_update = last_node
+        node_update = best_last_node
         while node_update:
             node_update.last_access_time = cur_time
             cur_time -= 0.00001
@@ -835,26 +838,22 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             mamba_branching_seqlen = None
 
-        # TODO: last_node is best_last_node (deepest node with mamba_value), but
-        # there may be evicted+backuped nodes beyond it in the tree. L3 prefetch
-        # uses last_host_node to compute new_input_tokens, so tokens already on
-        # host beyond the mamba boundary will be redundantly fetched from storage.
-        # To fix, _match_prefix_helper should also return the actual deepest
-        # traversed node for L3 prefetch purposes.
         host_hit_length = 0
-        last_host_node = last_node
-        last_device_node = last_node
+        last_device_node = best_last_node
         while last_device_node.evicted:
             host_hit_length += len(last_device_node.host_value)
             last_device_node = last_device_node.parent
-        if last_host_node is not last_device_node:
-            while not last_host_node.backuped:
-                last_host_node = last_host_node.parent
-        else:
-            last_host_node = last_device_node
+
+        last_host_node = best_last_node
+
+        last_host_backup_node = deepest_node
+        while last_host_backup_node and not last_host_backup_node.backuped:
+            last_host_backup_node = last_host_backup_node.parent
+        if not last_host_backup_node:
+            last_host_backup_node = self.root_node
 
         # CoW mamba state
-        mamba_node = last_host_node
+        mamba_node = best_last_node
         if cow_mamba and mamba_node.mamba_value is not None:
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
@@ -882,6 +881,7 @@ class HiMambaRadixCache(MambaRadixCache):
             device_indices=value,
             last_device_node=last_device_node,
             last_host_node=last_host_node,
+            last_host_backup_node=last_host_backup_node,
             host_hit_length=host_hit_length,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
