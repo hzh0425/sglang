@@ -3,7 +3,7 @@ import logging
 import threading
 from collections import defaultdict
 from functools import wraps
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import psutil
 import torch
@@ -17,6 +17,7 @@ from sglang.jit_kernel.hicache import (
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
 )
+from sglang.srt.mem_cache.host_pool_base import HostPoolBase
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
@@ -24,6 +25,9 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_npu, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.transfer_view import TransferView
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -133,7 +137,7 @@ ALLOC_MEMORY_FUNCS = defaultdict(
 )
 
 
-class HostKVCache(abc.ABC):
+class HostKVCache(HostPoolBase):
 
     def __init__(
         self,
@@ -193,6 +197,122 @@ class HostKVCache(abc.ABC):
         self.lock = threading.RLock()
         self.clear()
 
+    def size(self) -> int:
+        """Total capacity of the host pool."""
+        return self.size
+
+    def available_size(self) -> int:
+        """Number of available slots in the host pool."""
+        return len(self.free_slots)
+
+    def page_size(self) -> int:
+        """Number of elements per page (unit of storage transfer)."""
+        return self.page_size
+
+    def dtype(self) -> torch.dtype:
+        """Data type of elements in the pool."""
+        return self.dtype
+
+    def device(self) -> str:
+        """Device where the pool resides."""
+        return self.device
+
+    # ==================== HostPoolBase Abstract Methods ====================
+
+    def get_transfer_view(self, indices: torch.Tensor) -> "TransferView":
+        """
+        Generate a TransferView for the given indices.
+
+        The TransferView describes the memory layout of the specified slots,
+        enabling storage backends to perform zero-copy operations.
+
+        Args:
+            indices: Tensor of indices to create a view for.
+
+        Returns:
+            TransferView describing the memory layout.
+        """
+        from sglang.srt.mem_cache.transfer_view import TransferView
+
+        # Get data pointers based on layout
+        if self.layout == "layer_first":
+            # For layer_first, we have separate K and V buffers per layer
+            # Use data pointers if available (for zero-copy)
+            pool_ptrs = []
+            if hasattr(self, "k_data_ptrs"):
+                pool_ptrs.extend(self.k_data_ptrs)
+            if hasattr(self, "v_data_ptrs"):
+                pool_ptrs.extend(self.v_data_ptrs)
+
+            return TransferView(
+                pool_ptrs=pool_ptrs,
+                offsets=indices,
+                element_size_bytes=self.size_per_token,
+                tensors=(
+                    [self.k_buffer, self.v_buffer]
+                    if hasattr(self, "k_buffer")
+                    else None
+                ),
+                element_shape=None,
+                dtype=self.dtype,
+                device=self.device,
+                layout=self.layout,
+                page_size=self.page_size,
+                num_layers=self.layer_num if hasattr(self, "layer_num") else None,
+            )
+        elif self.layout in ["page_first", "page_head", "page_first_direct"]:
+            # For page-based layouts, provide the buffer tensors directly
+            tensors = []
+            if hasattr(self, "k_buffer"):
+                tensors.append(self.k_buffer)
+            if hasattr(self, "v_buffer"):
+                tensors.append(self.v_buffer)
+
+            return TransferView(
+                pool_ptrs=[],
+                offsets=indices,
+                element_size_bytes=self.size_per_token,
+                tensors=tensors if tensors else None,
+                element_shape=None,
+                dtype=self.dtype,
+                device=self.device,
+                layout=self.layout,
+                page_size=self.page_size,
+                num_layers=self.layer_num if hasattr(self, "layer_num") else None,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def load_from_device(
+        self,
+        device_pool,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        """Load data from device pool to host pool."""
+        # Map to the existing interface
+        io_backend = kwargs.get("io_backend", "kernel")
+        layer_id = kwargs.get("layer_id", 0)
+        return self.load_to_device_per_layer(
+            device_pool, host_indices, device_indices, layer_id, io_backend
+        )
+
+    def backup_to_device(
+        self,
+        device_pool,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        **kwargs,
+    ) -> None:
+        """Backup data from host pool to device pool."""
+        io_backend = kwargs.get("io_backend", "kernel")
+        return self.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    # ==================== Original Abstract Methods ====================
+
     @abc.abstractmethod
     def get_size_per_token(self):
         raise NotImplementedError()
@@ -248,9 +368,6 @@ class HostKVCache(abc.ABC):
             (self.size,), dtype=torch.uint8, device=self.device
         )
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
-
-    def available_size(self):
-        return len(self.free_slots)
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:

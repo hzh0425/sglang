@@ -3,12 +3,16 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.host_pool_base import HostPoolBase
+    from sglang.srt.mem_cache.transfer_view import TransferView
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +79,10 @@ class HiCacheStorage(ABC):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
 
+    def register_host_pool(self, host_pool: "HostPoolBase"):
+        """Register a host pool (can be any HostPoolBase implementation, not just HostKVCache)."""
+        self.mem_pool_host = host_pool
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -98,6 +106,78 @@ class HiCacheStorage(ABC):
         Returns a list of booleans indicating success for each key.
         """
         pass
+
+    # ==================== V2 Interface (TransferView-based) ====================
+
+    def supports_transfer_view(self) -> bool:
+        """
+        Check if this storage backend supports TransferView-based operations.
+        """
+        return False
+
+    def batch_get_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys into TransferView-specified locations.
+
+        This is the new interface that works with any HostPoolBase implementation.
+        The TransferView describes where to write the data in host memory.
+
+        Args:
+            keys: List of hash keys to retrieve.
+            transfer_view: Describes the target memory layout for retrieved data.
+            extra_info: Optional extra information for the operation.
+
+        Returns:
+            List of booleans indicating success for each key.
+
+        Note:
+            Default implementation falls back to v1 interface if the pool is HostKVCache.
+            Override this method for backends that want to support arbitrary pool types.
+        """
+        # Default: fall back to v1 if available
+        if hasattr(self, "mem_pool_host") and transfer_view.offsets is not None:
+            return self.batch_get_v1(keys, transfer_view.offsets, extra_info)
+        raise NotImplementedError(
+            "batch_get_v2 is not implemented. "
+            "Override supports_transfer_view() to return True and implement this method."
+        )
+
+    def batch_set_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Store values from TransferView-specified locations for multiple keys.
+
+        This is the new interface that works with any HostPoolBase implementation.
+        The TransferView describes where to read the data from host memory.
+
+        Args:
+            keys: List of hash keys to store.
+            transfer_view: Describes the source memory layout for data to store.
+            extra_info: Optional extra information for the operation.
+
+        Returns:
+            List of booleans indicating success for each key.
+
+        Note:
+            Default implementation falls back to v1 interface if the pool is HostKVCache.
+            Override this method for backends that want to support arbitrary pool types.
+        """
+        # Default: fall back to v1 if available
+        if hasattr(self, "mem_pool_host") and transfer_view.offsets is not None:
+            return self.batch_set_v1(keys, transfer_view.offsets, extra_info)
+        raise NotImplementedError(
+            "batch_set_v2 is not implemented. "
+            "Override supports_transfer_view() to return True and implement this method."
+        )
 
     @abstractmethod
     def get(
@@ -290,3 +370,113 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    # ==================== V2 Interface (TransferView-based) ====================
+
+    def supports_transfer_view(self) -> bool:
+        """HiCacheFile supports TransferView-based operations."""
+        return True
+
+    def _validate_transfer_view(
+        self, keys: List[str], transfer_view: "TransferView"
+    ) -> Optional[str]:
+        """Validate TransferView parameters. Returns error message if invalid, None if valid."""
+        if not hasattr(self, "mem_pool_host"):
+            return "No host pool registered"
+        if transfer_view.offsets is None:
+            return "No offsets specified in TransferView"
+        page_size = transfer_view.page_size or 1
+        if len(transfer_view.offsets) != len(keys) * page_size:
+            return f"Offsets length mismatch: expected {len(keys) * page_size}, got {len(transfer_view.offsets)}"
+        return None
+
+    def batch_get_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """Retrieve values for multiple keys into host pool via TransferView."""
+        error = self._validate_transfer_view(keys, transfer_view)
+        if error:
+            logger.error(f"batch_get_v2 validation failed: {error}")
+            return [False] * len(keys)
+
+        offsets = transfer_view.offsets
+        page_size = transfer_view.page_size or 1
+        dummy_page = self.mem_pool_host.get_dummy_flat_data_page()
+        expected_bytes = dummy_page.numel() * dummy_page.element_size()
+
+        results = []
+        for i, key in enumerate(keys):
+            key_suffixed = self._get_suffixed_key(key)
+            tensor_path = os.path.join(self.file_path, f"{key_suffixed}.bin")
+
+            if not os.path.exists(tensor_path):
+                results.append(False)
+                continue
+
+            try:
+                page_start_offset = offsets[i * page_size].item()
+
+                with open(tensor_path, "rb", buffering=0) as f:
+                    file_data = f.read()
+
+                if len(file_data) != expected_bytes:
+                    logger.warning(
+                        f"File size mismatch for {key}: expected {expected_bytes}, got {len(file_data)}"
+                    )
+                    results.append(False)
+                    continue
+
+                data_page = torch.frombuffer(
+                    file_data, dtype=dummy_page.dtype, count=dummy_page.numel()
+                ).reshape(dummy_page.shape)
+                self.mem_pool_host.set_from_flat_data_page(page_start_offset, data_page)
+                results.append(True)
+
+            except Exception as e:
+                logger.error(f"Failed to read key {key}: {e}")
+                results.append(False)
+
+        return results
+
+    def batch_set_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """Store values from host pool to storage via TransferView."""
+        error = self._validate_transfer_view(keys, transfer_view)
+        if error:
+            logger.error(f"batch_set_v2 validation failed: {error}")
+            return [False] * len(keys)
+
+        offsets = transfer_view.offsets
+        page_size = transfer_view.page_size or 1
+
+        results = []
+        for i, key in enumerate(keys):
+            if self.exists(key):
+                results.append(True)
+                continue
+
+            key_suffixed = self._get_suffixed_key(key)
+            tensor_path = os.path.join(self.file_path, f"{key_suffixed}.bin")
+
+            try:
+                page_start_offset = offsets[i * page_size].item()
+                data_page = self.mem_pool_host.get_data_page(
+                    page_start_offset, flat=True
+                )
+                data_page.contiguous().view(dtype=torch.uint8).numpy().tofile(
+                    tensor_path
+                )
+                results.append(True)
+
+            except Exception as e:
+                logger.error(f"Failed to store key {key}: {e}")
+                results.append(False)
+
+        return results

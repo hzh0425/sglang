@@ -472,7 +472,14 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            # Check if backend supports TransferView-based v2 interface
+            if self.storage_backend.supports_transfer_view():
+                self.page_get_func = self._page_get_v2
+                self.page_set_func = self._page_set_v2
+                logger.info("Using TransferView v2 interface for storage operations")
+            elif (
+                self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -817,6 +824,25 @@ class HiCacheController:
             inc += self.page_size
         operation.increment(inc)
 
+    def _page_get_v2(self, operation, hash_values, host_indices, extra_info=None):
+        """Use TransferView-based v2 interface for prefetch."""
+        # Get TransferView from host pool
+        transfer_view = self.mem_pool_host.get_transfer_view(host_indices)
+
+        # Use v2 interface
+        results = self.storage_backend.batch_get_v2(
+            hash_values, transfer_view, extra_info
+        )
+        inc = 0
+        for i in range(len(hash_values)):
+            if not results[i]:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                )
+                break
+            inc += self.page_size
+        operation.increment(inc)
+
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
         dummy_page_dst = [
@@ -952,7 +978,7 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
+                    logger.info(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
@@ -964,7 +990,7 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
+                    logger.info(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
@@ -1000,6 +1026,17 @@ class HiCacheController:
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
+
+    def _page_set_v2(self, hash_values, host_indices, extra_info=None) -> bool:
+        """Use TransferView-based v2 interface for backup."""
+        # Get TransferView from host pool
+        transfer_view = self.mem_pool_host.get_transfer_view(host_indices)
+
+        # Use v2 interface
+        results = self.storage_backend.batch_set_v2(
+            hash_values, transfer_view, extra_info
+        )
+        return all(results)
 
     # Backup batch by batch
     def _page_backup(self, operation):
