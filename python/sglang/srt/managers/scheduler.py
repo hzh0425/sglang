@@ -711,20 +711,24 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif self.is_hybrid_swa:
+            elif self.is_hybrid_swa or self.is_hybrid_ssm:
                 from sglang.srt.mem_cache.hybrid_radix_cache import (
-                    HybridSWARadixCache,
+                    create_hybrid_radix_cache,
                 )
 
-                logger.info("Using HybridSWARadixCache implementation.")
-                self.tree_cache = HybridSWARadixCache(params=params)
-            elif self.is_hybrid_ssm:
-                from sglang.srt.mem_cache.hybrid_radix_cache import (
-                    HybridMambaRadixCache,
-                )
+                component_names = []
+                if self.is_hybrid_swa:
+                    component_names.append("swa")
+                if self.is_hybrid_ssm:
+                    component_names.append("mamba")
 
-                logger.info("Using HybridMambaRadixCache implementation.")
-                self.tree_cache = HybridMambaRadixCache(params)
+                logger.info(
+                    "Using HybridRadixCache implementation with components=%s.",
+                    component_names,
+                )
+                self.tree_cache = create_hybrid_radix_cache(
+                    params=params, component_names=tuple(component_names)
+                )
             elif server_args.enable_lmcache:
                 from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
                     LMCRadixCache,
