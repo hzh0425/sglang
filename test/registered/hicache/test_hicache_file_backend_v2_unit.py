@@ -264,7 +264,7 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
             )
         )
 
-    def test_batch_exists_honors_auxiliary_hit_policy(self):
+    def test_batch_exists_v2_finds_longest_common_prefix(self):
         kv_pool = FakeHostPool(page_bytes=4)
         mamba_pool = FakeHostPool(page_bytes=8)
         kv_pool.pages[0] = torch.tensor([1, 2, 3, 4], dtype=torch.uint8)
@@ -315,20 +315,17 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
             self.storage.batch_set_v2(["page0", "page1"], transfer_view), [True, True]
         )
 
-        last_page_info = HiCacheStorageExtraInfo(
-            extra_info={
-                "auxiliary_hit_requirements": [
-                    {"name": "mamba", "policy": "last_page", "page_ordinals": [1]}
-                ]
-            }
+        self.assertEqual(
+            self.storage.batch_exists_v2(
+                ["page0", "page1"],
+                [{"name": "mamba", "policy": "trailing_pages", "trailing_pages": 1}],
+            ),
+            2,
         )
-        self.assertEqual(self.storage.batch_exists(["page0", "page1"], last_page_info), 2)
-
-        all_pages_info = HiCacheStorageExtraInfo(
-            extra_info={
-                "auxiliary_hit_requirements": [
-                    {"name": "mamba", "policy": "all_pages"}
-                ]
-            }
+        self.assertEqual(
+            self.storage.batch_exists_v2(
+                ["page0", "page1"],
+                [{"name": "mamba", "policy": "all_pages"}],
+            ),
+            0,
         )
-        self.assertEqual(self.storage.batch_exists(["page0", "page1"], all_pages_info), 0)

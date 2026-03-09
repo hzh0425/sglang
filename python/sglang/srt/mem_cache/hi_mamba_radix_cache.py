@@ -339,7 +339,8 @@ class HiMambaRadixCache(MambaRadixCache):
                         name="mamba",
                         host_indices=node.mamba_host_value,
                         page_ordinals=[len(node.host_value) // self.page_size - 1],
-                        hit_policy="last_page",
+                        hit_policy="trailing_pages",
+                        trailing_pages=1,
                     )
                 ]
                 if node.mamba_host_value is not None and len(node.host_value) > 0
@@ -1829,7 +1830,8 @@ class HiMambaRadixCache(MambaRadixCache):
                     name="mamba",
                     host_indices=mamba_host_index,
                     page_ordinals=[prefetch_length // self.page_size - 1],
-                    hit_policy="last_page",
+                    hit_policy="trailing_pages",
+                    trailing_pages=1,
                 )
             ]
             logger.info(
@@ -2012,7 +2014,8 @@ class HiMambaRadixCache(MambaRadixCache):
                     name="mamba",
                     host_indices=final_mamba_node.mamba_host_value,
                     page_ordinals=[len(final_mamba_node.host_value) // self.page_size - 1],
-                    hit_policy="last_page",
+                    hit_policy="trailing_pages",
+                    trailing_pages=1,
                 )
             ]
             if not self.mamba_host_lru_list.in_list(final_mamba_node):

@@ -261,31 +261,51 @@ class HiCacheStorage(ABC):
         return the number of consecutive existing keys from the start.
         Can be overridden by subclasses for more efficient implementation.
         """
-        auxiliary_requirements = []
-        if extra_info is not None and extra_info.extra_info is not None:
-            auxiliary_requirements = extra_info.extra_info.get(
-                "auxiliary_hit_requirements", []
-            )
-
-        def auxiliary_hit_satisfied(key: str, page_ordinal: int) -> bool:
-            for requirement in auxiliary_requirements:
-                name = requirement["name"]
-                policy = requirement.get("policy", "all_pages")
-                if policy == "all_pages":
-                    if not self.exists(f"{key}.{name}"):
-                        return False
-                elif policy in ("last_page", "explicit_pages"):
-                    required_pages = {int(x) for x in requirement.get("page_ordinals", [])}
-                    if page_ordinal in required_pages and not self.exists(f"{key}.{name}"):
-                        return False
-                else:
-                    raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
-            return True
-
         for i in range(len(keys)):
-            if not self.exists(keys[i]) or not auxiliary_hit_satisfied(keys[i], i):
+            if not self.exists(keys[i]):
                 return i
         return len(keys)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        auxiliary_constraints: List[dict[str, Any]],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> int:
+        full_hit_page_num = self.batch_exists(keys, extra_info)
+        if full_hit_page_num == 0 or not auxiliary_constraints:
+            return full_hit_page_num
+
+        def component_exists(page_idx: int, component_name: str) -> bool:
+            return self.exists(f"{keys[page_idx]}.{component_name}")
+
+        final_hit_page_num = full_hit_page_num
+        for constraint in auxiliary_constraints:
+            name = constraint["name"]
+            policy = constraint.get("policy", "all_pages")
+            boundary = 0
+
+            if policy == "all_pages":
+                while (
+                    boundary < full_hit_page_num
+                    and component_exists(boundary, name)
+                ):
+                    boundary += 1
+            elif policy == "trailing_pages":
+                trailing_pages = max(1, int(constraint.get("trailing_pages", 1)))
+                for prefix_len in range(full_hit_page_num, 0, -1):
+                    start = max(0, prefix_len - trailing_pages)
+                    if all(component_exists(page_idx, name) for page_idx in range(start, prefix_len)):
+                        boundary = prefix_len
+                        break
+            else:
+                raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
+
+            final_hit_page_num = min(final_hit_page_num, boundary)
+            if final_hit_page_num == 0:
+                break
+
+        return final_hit_page_num
 
     def clear(self) -> None:
         pass
