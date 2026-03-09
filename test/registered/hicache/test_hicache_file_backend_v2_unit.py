@@ -32,7 +32,10 @@ class FakeHostPool(HostPoolBase):
     def free(self, indices: torch.Tensor) -> int:
         return indices.numel()
 
-    def get_transfer_view(self, indices: torch.Tensor) -> TransferView:
+    def get_transfer_view(
+        self, indices: torch.Tensor, transfer_ctx=None
+    ) -> TransferView:
+        del transfer_ctx
         return TransferView(
             offsets=indices.cpu(),
             element_size_bytes=self.page_bytes,
@@ -49,23 +52,41 @@ class FakeHostPool(HostPoolBase):
         pass
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id: int, io_backend: str
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id: int,
+        io_backend: str,
+        transfer_ctx=None,
     ) -> None:
+        del transfer_ctx
         pass
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend: str
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend: str,
+        transfer_ctx=None,
     ) -> None:
+        del transfer_ctx
         pass
 
-    def get_data_page(self, index: int, flat: bool = True):
+    def get_data_page(self, index: int, flat: bool = True, transfer_ctx=None):
+        del transfer_ctx
         page = self.pages[index].clone()
         return page.flatten() if flat else page
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self, index: int, data_page: torch.Tensor, transfer_ctx=None
+    ) -> None:
+        del transfer_ctx
         self.pages[index] = data_page.contiguous().view(torch.uint8).clone()
 
-    def get_dummy_flat_data_page(self):
+    def get_dummy_flat_data_page(self, transfer_ctx=None):
+        del transfer_ctx
         return torch.zeros(self.page_bytes, dtype=torch.uint8)
 
 
@@ -87,7 +108,10 @@ class FakeTypedHostPool(HostPoolBase):
     def free(self, indices: torch.Tensor) -> int:
         return indices.numel()
 
-    def get_transfer_view(self, indices: torch.Tensor) -> TransferView:
+    def get_transfer_view(
+        self, indices: torch.Tensor, transfer_ctx=None
+    ) -> TransferView:
+        del transfer_ctx
         return TransferView(
             offsets=indices.cpu(),
             element_size_bytes=self.get_dummy_flat_data_page().numel()
@@ -105,23 +129,41 @@ class FakeTypedHostPool(HostPoolBase):
         pass
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id: int, io_backend: str
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id: int,
+        io_backend: str,
+        transfer_ctx=None,
     ) -> None:
+        del transfer_ctx
         pass
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend: str
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend: str,
+        transfer_ctx=None,
     ) -> None:
+        del transfer_ctx
         pass
 
-    def get_data_page(self, index: int, flat: bool = True):
+    def get_data_page(self, index: int, flat: bool = True, transfer_ctx=None):
+        del transfer_ctx
         page = self.pages[index].clone()
         return page.flatten() if flat else page
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self, index: int, data_page: torch.Tensor, transfer_ctx=None
+    ) -> None:
+        del transfer_ctx
         self.pages[index] = data_page.reshape(self.shape).clone()
 
-    def get_dummy_flat_data_page(self):
+    def get_dummy_flat_data_page(self, transfer_ctx=None):
+        del transfer_ctx
         return torch.zeros(self.shape, dtype=self.dtype).flatten()
 
 
@@ -224,17 +266,17 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "entries": {
-                    "kv": {"host_indices": torch.tensor([0], dtype=torch.int64)},
-                    "mamba": {"host_indices": torch.tensor([5], dtype=torch.int64)},
-                }
+        transfer_ctx = {
+            "entries": {
+                "kv": {"host_indices": torch.tensor([0], dtype=torch.int64)},
+                "mamba": {"host_indices": torch.tensor([5], dtype=torch.int64)},
             }
-        )
+        }
         self.storage.register_host_pool(group)
 
-        transfer_view = group.get_transfer_view(torch.tensor([0], dtype=torch.int64))
+        transfer_view = group.get_transfer_view(
+            torch.tensor([0], dtype=torch.int64), transfer_ctx=transfer_ctx
+        )
         result = self.storage.batch_set_v2(["group-key"], transfer_view)
         self.assertEqual(result, [True])
 
@@ -284,20 +326,20 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "entries": {
-                    "kv": {"host_indices": torch.tensor([0, 1], dtype=torch.int64)},
-                    "mamba": {
-                        "host_indices": torch.tensor([5], dtype=torch.int64),
-                        "page_ordinals": [1],
-                    },
-                }
+        transfer_ctx = {
+            "entries": {
+                "kv": {"host_indices": torch.tensor([0, 1], dtype=torch.int64)},
+                "mamba": {
+                    "host_indices": torch.tensor([5], dtype=torch.int64),
+                    "page_ordinals": [1],
+                },
             }
-        )
+        }
         self.storage.register_host_pool(group)
 
-        transfer_view = group.get_transfer_view(torch.tensor([0, 1], dtype=torch.int64))
+        transfer_view = group.get_transfer_view(
+            torch.tensor([0, 1], dtype=torch.int64), transfer_ctx=transfer_ctx
+        )
         result = self.storage.batch_set_v2(["page0", "page1"], transfer_view)
         self.assertEqual(result, [True, True])
 
@@ -354,19 +396,19 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "entries": {
-                    "kv": {"host_indices": torch.tensor([0, 1], dtype=torch.int64)},
-                    "mamba": {
-                        "host_indices": torch.tensor([5], dtype=torch.int64),
-                        "page_ordinals": [1],
-                    },
-                }
+        transfer_ctx = {
+            "entries": {
+                "kv": {"host_indices": torch.tensor([0, 1], dtype=torch.int64)},
+                "mamba": {
+                    "host_indices": torch.tensor([5], dtype=torch.int64),
+                    "page_ordinals": [1],
+                },
             }
-        )
+        }
         self.storage.register_host_pool(group)
-        transfer_view = group.get_transfer_view(torch.tensor([0, 1], dtype=torch.int64))
+        transfer_view = group.get_transfer_view(
+            torch.tensor([0, 1], dtype=torch.int64), transfer_ctx=transfer_ctx
+        )
         self.assertEqual(
             self.storage.batch_set_v2(["page0", "page1"], transfer_view), [True, True]
         )
@@ -429,20 +471,20 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "anchor_host_indices": torch.tensor([0, 1], dtype=torch.int64),
-                "entries": {
-                    "mamba": {
-                        "host_indices": torch.tensor([5], dtype=torch.int64),
-                        "page_ordinals": [1],
-                    },
+        transfer_ctx = {
+            "anchor_host_indices": torch.tensor([0, 1], dtype=torch.int64),
+            "entries": {
+                "mamba": {
+                    "host_indices": torch.tensor([5], dtype=torch.int64),
+                    "page_ordinals": [1],
                 },
-            }
-        )
+            },
+        }
         self.storage.register_host_pool(group)
 
-        transfer_view = group.get_transfer_view(torch.tensor([0, 1], dtype=torch.int64))
+        transfer_view = group.get_transfer_view(
+            torch.tensor([0, 1], dtype=torch.int64), transfer_ctx=transfer_ctx
+        )
         self.assertEqual(
             self.storage.batch_set_v2(["page0", "page1"], transfer_view), [True, True]
         )
@@ -480,22 +522,20 @@ class TestHiCacheFileTransferViewV2(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "anchor_host_indices": torch.tensor([0], dtype=torch.int64),
-                "entries": {
-                    "mamba": {
-                        "host_indices": torch.tensor([5], dtype=torch.int64),
-                        "page_ordinals": [0],
-                    }
-                },
-            }
-        )
-        components = group.get_page_components(0)
+        transfer_ctx = {
+            "anchor_host_indices": torch.tensor([0], dtype=torch.int64),
+            "entries": {
+                "mamba": {
+                    "host_indices": torch.tensor([5], dtype=torch.int64),
+                    "page_ordinals": [0],
+                }
+            },
+        }
+        components = group.get_page_components(0, transfer_ctx=transfer_ctx)
         assert components is not None
         kv_pool.pages[0].zero_()
         mamba_pool.pages[5].zero_()
-        group.set_from_page_components(0, components)
+        group.set_from_page_components(0, components, transfer_ctx=transfer_ctx)
         self.assertTrue(
             torch.equal(
                 kv_pool.pages[0],

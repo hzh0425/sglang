@@ -885,17 +885,14 @@ class HiCacheController:
                 device_indices,
                 op.auxiliary_transfers,
             )
-            self.mem_pool_host.set_transfer_context(transfer_ctx)
-            try:
-                self.mem_pool_host.backup_from_device_all_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
-                )
-                finish_event.record()
-            finally:
-                self.mem_pool_host.clear_transfer_context()
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_indices,
+                self.io_backend,
+                transfer_ctx=transfer_ctx,
+            )
+            finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
@@ -969,19 +966,16 @@ class HiCacheController:
                 device_indices,
                 op.auxiliary_transfers,
             )
-            self.mem_pool_host.set_transfer_context(transfer_ctx)
-            try:
-                for i in range(self.transfer_layer_num):
-                    self.mem_pool_host.load_to_device_per_layer(
-                        self.mem_pool_device,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                    producer_event.complete(i)
-            finally:
-                self.mem_pool_host.clear_transfer_context()
+            for i in range(self.transfer_layer_num):
+                self.mem_pool_host.load_to_device_per_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    i,
+                    self.io_backend,
+                    transfer_ctx=transfer_ctx,
+                )
+                producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -1078,22 +1072,20 @@ class HiCacheController:
             host_indices=host_indices,
             auxiliary_transfers=auxiliary_transfers,
         )
-        self.mem_pool_host.set_transfer_context(transfer_ctx)
-        try:
-            transfer_view = self.mem_pool_host.get_transfer_view(host_indices)
-            if extra_info is not None:
-                if extra_info.extra_info is None:
-                    extra_info.extra_info = {}
-                extra_info.extra_info.setdefault("page_entry_names", [])
-            results = self.storage_backend.batch_get_v2(
-                hash_values, transfer_view, extra_info
+        transfer_view = self.mem_pool_host.get_transfer_view(
+            host_indices, transfer_ctx=transfer_ctx
+        )
+        if extra_info is not None:
+            if extra_info.extra_info is None:
+                extra_info.extra_info = {}
+            extra_info.extra_info.setdefault("page_entry_names", [])
+        results = self.storage_backend.batch_get_v2(
+            hash_values, transfer_view, extra_info
+        )
+        if extra_info is not None and extra_info.extra_info is not None:
+            operation.page_entry_names.extend(
+                extra_info.extra_info.get("page_entry_names", [])
             )
-            if extra_info is not None and extra_info.extra_info is not None:
-                operation.page_entry_names.extend(
-                    extra_info.extra_info.get("page_entry_names", [])
-                )
-        finally:
-            self.mem_pool_host.clear_transfer_context()
         inc = 0
         for i in range(len(hash_values)):
             if not results[i]:
@@ -1113,8 +1105,13 @@ class HiCacheController:
         extra_info=None,
         auxiliary_transfers=None,
     ):
+        transfer_ctx = self._build_transfer_context(
+            host_indices=host_indices,
+            auxiliary_transfers=auxiliary_transfers,
+        )
         dummy_page_dst = [
-            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+            self.mem_pool_host.get_dummy_flat_data_page(transfer_ctx=transfer_ctx)
+            for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
@@ -1130,6 +1127,7 @@ class HiCacheController:
             self.mem_pool_host.set_from_flat_data_page(
                 host_indices[i * self.page_size],
                 page_data[i],
+                transfer_ctx=transfer_ctx,
             )
             if not operation.increment(self.page_size):
                 break  # Operation terminated by controller
@@ -1311,8 +1309,14 @@ class HiCacheController:
     def _generic_page_set(
         self, hash_values, host_indices, extra_info=None, auxiliary_transfers=None
     ) -> bool:
+        transfer_ctx = self._build_transfer_context(
+            host_indices=host_indices,
+            auxiliary_transfers=auxiliary_transfers,
+        )
         data = [
-            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+            self.mem_pool_host.get_data_page(
+                host_indices[i * self.page_size], transfer_ctx=transfer_ctx
+            )
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
@@ -1336,14 +1340,12 @@ class HiCacheController:
             host_indices=host_indices,
             auxiliary_transfers=auxiliary_transfers,
         )
-        self.mem_pool_host.set_transfer_context(transfer_ctx)
-        try:
-            transfer_view = self.mem_pool_host.get_transfer_view(host_indices)
-            results = self.storage_backend.batch_set_v2(
-                hash_values, transfer_view, extra_info
-            )
-        finally:
-            self.mem_pool_host.clear_transfer_context()
+        transfer_view = self.mem_pool_host.get_transfer_view(
+            host_indices, transfer_ctx=transfer_ctx
+        )
+        results = self.storage_backend.batch_set_v2(
+            hash_values, transfer_view, extra_info
+        )
         return all(results)
 
     # Backup batch by batch

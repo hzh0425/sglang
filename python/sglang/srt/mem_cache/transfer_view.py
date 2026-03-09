@@ -9,7 +9,7 @@ without knowing specific memory layouts.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -34,6 +34,7 @@ class TransferView:
     layer_id: Optional[int] = None
     num_layers: Optional[int] = None
     subviews: Optional[Dict[str, "TransferView"]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.offsets is not None and not isinstance(self.offsets, torch.Tensor):
@@ -87,6 +88,8 @@ class TransferView:
             page_size=self.page_size,
             layer_id=self.layer_id,
             num_layers=self.num_layers,
+            subviews=self.subviews,
+            metadata=self.metadata,
         )
 
     def is_compatible_with(self, other: "TransferView") -> bool:
@@ -114,6 +117,7 @@ class TransferView:
             "num_pool_ptrs": len(self.pool_ptrs),
             "num_tensors": len(self.tensors) if self.tensors else 0,
             "num_subviews": len(self.subviews) if self.subviews else 0,
+            "metadata_keys": sorted(self.metadata.keys()) if self.metadata else [],
         }
 
     @classmethod

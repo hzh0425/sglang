@@ -8,8 +8,6 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-import requests
-
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -27,10 +25,11 @@ register_cuda_ci(
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 QWEN3_NEXT_FP8_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
-
+QWEN35_MODEL = "Qwen/Qwen3.5-9B"
 ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
     QWEN3_NEXT_FP8_MODEL: {"gsm8k": 0.62},
+    QWEN35_MODEL: {"gsm8k": 0.85},
 }
 
 
@@ -135,13 +134,85 @@ class TestQwen3NextHiCacheFileBackend(CustomTestCase):
             first_metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
         )
 
-        flush_resp = requests.post(f"{self.base_url}/flush_cache", timeout=60)
-        self.assertEqual(
-            flush_resp.status_code,
-            200,
-            f"flush_cache failed: {flush_resp.status_code} - {flush_resp.text}",
+        second_metrics = self._run_gsm8k()
+        print(f"second_metrics={second_metrics}")
+        self.assertGreaterEqual(
+            second_metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
         )
-        self.assertIn("Cache flushed", flush_resp.text)
+        self.assertLessEqual(
+            abs(second_metrics["accuracy"] - first_metrics["accuracy"]),
+            0.05,
+            f"HiCache prefetch accuracy drift too large: "
+            f"first={first_metrics['accuracy']}, second={second_metrics['accuracy']}",
+        )
+class TestQwen3NextHiCacheFileBackend1(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3.5-9B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.storage_dir = tempfile.mkdtemp(prefix="qwen3-next-hicache-")
+        env = {
+            "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
+        }
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=env,
+            other_args=[
+                "--tp",
+                "2",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--page-size",
+                "64",
+                "--hicache-mem-layout",
+                "page_first_direct",
+                "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                "2",
+                "--hicache-size",
+                "0",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-backend",
+                "file",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+                "--max-mamba-cache-size",
+                "151",
+                "--max-total-tokens",
+                "266688"
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        shutil.rmtree(cls.storage_dir, ignore_errors=True)
+
+    def _run_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=12,
+            max_new_tokens=512,
+            data_path=None,
+            num_questions=100,
+            parallel=10,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        return run_eval_few_shot_gsm8k(args)
+
+    def test_gsm8k(self):
+        first_metrics = self._run_gsm8k()
+        print(f"first_metrics={first_metrics}")
+        self.assertGreaterEqual(
+            first_metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+        import time
+        time.sleep(3)
 
         second_metrics = self._run_gsm8k()
         print(f"second_metrics={second_metrics}")

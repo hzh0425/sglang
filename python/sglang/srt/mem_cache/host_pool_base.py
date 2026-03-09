@@ -63,7 +63,9 @@ class HostPoolBase(ABC):
         pass
 
     @abstractmethod
-    def get_transfer_view(self, indices: torch.Tensor) -> "TransferView":
+    def get_transfer_view(
+        self, indices: torch.Tensor, transfer_ctx: Optional[dict] = None
+    ) -> "TransferView":
         """
         Generate a TransferView for the given indices.
 
@@ -76,6 +78,7 @@ class HostPoolBase(ABC):
         Returns:
             TransferView describing the memory layout.
         """
+        del transfer_ctx
         pass
 
     @abstractmethod
@@ -124,8 +127,10 @@ class HostPoolBase(ABC):
         device_indices: torch.Tensor,
         layer_id: int,
         io_backend: str,
+        transfer_ctx: Optional[dict] = None,
     ) -> None:
         """Load one logical model layer from host to device."""
+        del transfer_ctx
         pass
 
     @abstractmethod
@@ -135,21 +140,18 @@ class HostPoolBase(ABC):
         host_indices: torch.Tensor,
         device_indices: torch.Tensor,
         io_backend: str,
+        transfer_ctx: Optional[dict] = None,
     ) -> None:
         """Back up all logical model layers from device to host."""
+        del transfer_ctx
         pass
 
-    # Optional methods with default implementations
-
-    def set_transfer_context(self, ctx: Optional[dict]) -> None:
-        """Set per-operation transfer context. Default is a no-op."""
-        pass
-
-    def clear_transfer_context(self) -> None:
-        """Clear any previously set transfer context. Default is a no-op."""
-        pass
-
-    def get_data_page(self, index: int, flat: bool = True) -> Optional[torch.Tensor]:
+    def get_data_page(
+        self,
+        index: int,
+        flat: bool = True,
+        transfer_ctx: Optional[dict] = None,
+    ) -> Optional[torch.Tensor]:
         """
         Get a single page of data from the pool.
 
@@ -162,9 +164,15 @@ class HostPoolBase(ABC):
         Returns:
             Tensor containing the page data, or None if not supported.
         """
+        del transfer_ctx
         return None
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
+    ) -> None:
         """
         Set a page of data from a flat tensor.
 
@@ -174,12 +182,15 @@ class HostPoolBase(ABC):
             index: Starting index to write to.
             data_page: Flat tensor containing the page data.
         """
+        del transfer_ctx
         raise NotImplementedError(
             "set_from_flat_data_page is not implemented. "
             "Use load_from_device with TransferView instead."
         )
 
-    def get_dummy_flat_data_page(self) -> Optional[torch.Tensor]:
+    def get_dummy_flat_data_page(
+        self, transfer_ctx: Optional[dict] = None
+    ) -> Optional[torch.Tensor]:
         """
         Get a dummy page for prefetching initialization.
 
@@ -188,19 +199,26 @@ class HostPoolBase(ABC):
         Returns:
             Dummy tensor for prefetching, or None if not supported.
         """
+        del transfer_ctx
         return None
 
-    def get_page_components(self, index: int) -> Optional[dict[str, torch.Tensor]]:
+    def get_page_components(
+        self, index: int, transfer_ctx: Optional[dict] = None
+    ) -> Optional[dict[str, torch.Tensor]]:
         """
         Get named page components for storage backends that support variable layouts.
 
         Returns:
             Mapping from component name to flat uint8 tensor, or None if unsupported.
         """
+        del transfer_ctx
         return None
 
     def set_from_page_components(
-        self, index: int, components: dict[str, torch.Tensor]
+        self,
+        index: int,
+        components: dict[str, torch.Tensor],
+        transfer_ctx: Optional[dict] = None,
     ) -> None:
         """
         Restore named page components written by a storage backend.
@@ -210,7 +228,7 @@ class HostPoolBase(ABC):
             raise NotImplementedError(
                 "set_from_page_components is not implemented for this host pool."
             )
-        self.set_from_flat_data_page(index, default_page)
+        self.set_from_flat_data_page(index, default_page, transfer_ctx=transfer_ctx)
 
     def clear(self) -> None:
         """

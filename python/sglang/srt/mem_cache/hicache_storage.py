@@ -611,7 +611,14 @@ class HiCacheFile(HiCacheStorage):
 
         offsets = transfer_view.offsets
         page_size = transfer_view.page_size or 1
-        dummy_page = self.mem_pool_host.get_dummy_flat_data_page()
+        transfer_ctx = (
+            transfer_view.metadata.get("transfer_ctx")
+            if transfer_view.metadata is not None
+            else None
+        )
+        dummy_page = self.mem_pool_host.get_dummy_flat_data_page(
+            transfer_ctx=transfer_ctx
+        )
         expected_bytes = dummy_page.numel() * dummy_page.element_size()
         page_entry_names = None
         if extra_info is not None:
@@ -680,12 +687,16 @@ class HiCacheFile(HiCacheStorage):
 
                 if hasattr(self.mem_pool_host, "set_from_page_components"):
                     self.mem_pool_host.set_from_page_components(
-                        page_start_offset, merged_components
+                        page_start_offset,
+                        merged_components,
+                        transfer_ctx=transfer_ctx,
                     )
                 else:
                     flat_page = torch.cat(list(merged_components.values()))
                     self.mem_pool_host.set_from_flat_data_page(
-                        page_start_offset, flat_page
+                        page_start_offset,
+                        flat_page,
+                        transfer_ctx=transfer_ctx,
                     )
                 if page_entry_names is not None:
                     page_entry_names.append(component_names or ["__default__"])
@@ -711,6 +722,11 @@ class HiCacheFile(HiCacheStorage):
 
         offsets = transfer_view.offsets
         page_size = transfer_view.page_size or 1
+        transfer_ctx = (
+            transfer_view.metadata.get("transfer_ctx")
+            if transfer_view.metadata is not None
+            else None
+        )
 
         results = []
         for i, key in enumerate(keys):
@@ -718,10 +734,12 @@ class HiCacheFile(HiCacheStorage):
                 page_start_offset = offsets[i * page_size].item()
                 components = None
                 if hasattr(self.mem_pool_host, "get_page_components"):
-                    components = self.mem_pool_host.get_page_components(page_start_offset)
+                    components = self.mem_pool_host.get_page_components(
+                        page_start_offset, transfer_ctx=transfer_ctx
+                    )
                 if components is None:
                     data_page = self.mem_pool_host.get_data_page(
-                        page_start_offset, flat=True
+                        page_start_offset, flat=True, transfer_ctx=transfer_ctx
                     )
                     components = {"__default__": data_page}
                 primary_name = self._get_primary_component_name(components)

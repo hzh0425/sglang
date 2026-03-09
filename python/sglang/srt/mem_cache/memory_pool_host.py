@@ -222,7 +222,9 @@ class HostKVCache(HostPoolBase):
 
     # ==================== HostPoolBase Abstract Methods ====================
 
-    def get_transfer_view(self, indices: torch.Tensor) -> "TransferView":
+    def get_transfer_view(
+        self, indices: torch.Tensor, transfer_ctx: Optional[dict] = None
+    ) -> "TransferView":
         """
         Generate a TransferView for the given indices.
 
@@ -235,6 +237,7 @@ class HostKVCache(HostPoolBase):
         Returns:
             TransferView describing the memory layout.
         """
+        del transfer_ctx
         from sglang.srt.mem_cache.transfer_view import TransferView
 
         # Get data pointers based on layout
@@ -326,7 +329,13 @@ class HostKVCache(HostPoolBase):
 
     @abc.abstractmethod
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        transfer_ctx=None,
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
@@ -335,7 +344,12 @@ class HostKVCache(HostPoolBase):
 
     @abc.abstractmethod
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        transfer_ctx=None,
     ) -> None:
         """
         Backup KV data from the device memory pool to the host memory pool for all layers.
@@ -343,14 +357,18 @@ class HostKVCache(HostPoolBase):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+    def get_data_page(
+        self, index, flat: bool = True, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
         """
         Get a flat data page from the host memory pool.
         """
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(
+        self, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
         """
         Get a dummy flat data page from the host memory pool.
         This is used for prefetching or initializing empty pages.
@@ -358,7 +376,12 @@ class HostKVCache(HostPoolBase):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
+    ) -> None:
         """
         Set a flat data page to the host memory pool.
         """
@@ -496,7 +519,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         device_indices,
         layer_id,
         io_backend,
+        transfer_ctx=None,
     ):
+        del transfer_ctx
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -593,8 +618,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend, transfer_ctx=None
     ):
+        del transfer_ctx
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
@@ -684,7 +710,10 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+    def get_data_page(
+        self, index, flat: bool = True, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
+        del transfer_ctx
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -698,7 +727,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = data_page.flatten()
         return data_page
 
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(
+        self, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
+        del transfer_ctx
         return torch.zeros(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),
             dtype=self.dtype,
@@ -706,7 +738,13 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         ).flatten()
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
+    ) -> None:
+        del transfer_ctx
         if self.layout == "layer_first":
             self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
                 data_page.reshape(
@@ -971,8 +1009,15 @@ class MLATokenToKVPoolHost(HostKVCache):
         return buffer
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        transfer_ctx=None,
     ):
+        del transfer_ctx
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
@@ -1036,8 +1081,9 @@ class MLATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend, transfer_ctx=None
     ):
+        del transfer_ctx
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 transfer_kv_all_layer_mla(
@@ -1098,7 +1144,10 @@ class MLATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+    def get_data_page(
+        self, index, flat: bool = True, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
+        del transfer_ctx
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -1112,7 +1161,10 @@ class MLATokenToKVPoolHost(HostKVCache):
             data_page = data_page.flatten()
         return data_page
 
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(
+        self, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
+        del transfer_ctx
         return torch.zeros(
             (
                 self.layer_num,
@@ -1125,7 +1177,13 @@ class MLATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
         ).flatten()
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
+    ) -> None:
+        del transfer_ctx
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -1249,7 +1307,10 @@ class MambaPoolHost(HostPoolBase):
         self.lock = threading.RLock()
         self.clear()
 
-    def get_transfer_view(self, indices: torch.Tensor) -> "TransferView":
+    def get_transfer_view(
+        self, indices: torch.Tensor, transfer_ctx: Optional[dict] = None
+    ) -> "TransferView":
+        del transfer_ctx
         from sglang.srt.mem_cache.transfer_view import TransferView
 
         return TransferView(
@@ -1394,8 +1455,15 @@ class MambaPoolHost(HostPoolBase):
         dst.index_copy_(0, dst_indices.to(dst.device), src_take.to(dst.device))
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend="kernel"
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend="kernel",
+        transfer_ctx=None,
     ):
+        del transfer_ctx
         for conv_idx, host_conv_state in enumerate(self.conv_buffer):
             self._copy_tensor(
                 host_conv_state[layer_id],
@@ -1413,8 +1481,9 @@ class MambaPoolHost(HostPoolBase):
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend="kernel"
+        self, device_pool, host_indices, device_indices, io_backend="kernel", transfer_ctx=None
     ):
+        del transfer_ctx
         for layer_id in range(self.num_mamba_layers):
             for conv_idx, host_conv_state in enumerate(self.conv_buffer):
                 self._copy_tensor(
@@ -1432,7 +1501,10 @@ class MambaPoolHost(HostPoolBase):
                 io_backend,
             )
 
-    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+    def get_data_page(
+        self, index, flat: bool = True, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
+        del transfer_ctx
         data_page = torch.cat(
             [
                 self._flatten_tensor_bytes(tensor)
@@ -1441,7 +1513,10 @@ class MambaPoolHost(HostPoolBase):
         )
         return data_page.flatten() if flat else data_page
 
-    def get_dummy_flat_data_page(self) -> torch.Tensor:
+    def get_dummy_flat_data_page(
+        self, transfer_ctx: Optional[dict] = None
+    ) -> torch.Tensor:
+        del transfer_ctx
         return torch.zeros(
             self.page_size * self.size_per_token,
             dtype=torch.uint8,
@@ -1449,7 +1524,13 @@ class MambaPoolHost(HostPoolBase):
             pin_memory=self.pin_memory,
         )
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
+    ) -> None:
+        del transfer_ctx
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
         expected_num_bytes = self.page_size * self.size_per_token
         if flat_bytes.numel() != expected_num_bytes:
@@ -1492,18 +1573,6 @@ class HostPoolGroup(HostPoolBase):
         self.device = getattr(self.anchor_entry.host_pool, "device", "cpu")
         self.dtype = getattr(self.anchor_entry.host_pool, "dtype", None)
         self.size = getattr(self.anchor_entry.host_pool, "size", 0)
-        self._transfer_context: Optional[dict] = None
-
-    def _get_entry_ctx(self, entry: PoolEntry) -> dict:
-        if not self._transfer_context:
-            return {}
-        return self._transfer_context.get("entries", {}).get(entry.name, {})
-
-    def set_transfer_context(self, ctx: Optional[dict]) -> None:
-        self._transfer_context = ctx
-
-    def clear_transfer_context(self) -> None:
-        self._transfer_context = None
 
     def clear(self) -> None:
         for entry in self.entries:
@@ -1515,18 +1584,26 @@ class HostPoolGroup(HostPoolBase):
     def free(self, indices: torch.Tensor) -> int:
         return self.anchor_entry.host_pool.free(indices)
 
-    def get_transfer_view(self, indices: torch.Tensor) -> "TransferView":
+    def get_transfer_view(
+        self, indices: torch.Tensor, transfer_ctx: Optional[dict] = None
+    ) -> "TransferView":
         from sglang.srt.mem_cache.transfer_view import TransferView
 
-        anchor_view = self.anchor_entry.host_pool.get_transfer_view(indices)
+        anchor_view = self.anchor_entry.host_pool.get_transfer_view(
+            indices, transfer_ctx=transfer_ctx
+        )
         subviews = {}
         for entry in self.entries:
             entry_indices = indices
             if entry is not self.anchor_entry:
-                resolved = self._resolve_entry_host_indices_for_page(entry, int(indices[0]))
+                resolved = self._resolve_entry_host_indices_for_page(
+                    entry, int(indices[0]), transfer_ctx
+                )
                 if resolved is not None:
                     entry_indices = resolved
-            subviews[entry.name] = entry.host_pool.get_transfer_view(entry_indices)
+            subviews[entry.name] = entry.host_pool.get_transfer_view(
+                entry_indices, transfer_ctx=transfer_ctx
+            )
         return TransferView(
             pool_ptrs=anchor_view.pool_ptrs,
             offsets=anchor_view.offsets,
@@ -1540,38 +1617,42 @@ class HostPoolGroup(HostPoolBase):
             layer_id=anchor_view.layer_id,
             num_layers=anchor_view.num_layers,
             subviews=subviews,
+            metadata={"transfer_ctx": transfer_ctx} if transfer_ctx else None,
         )
 
-    def _anchor_host_indices(self) -> Optional[torch.Tensor]:
-        if not self._transfer_context:
+    def _anchor_host_indices(self, transfer_ctx: Optional[dict]) -> Optional[torch.Tensor]:
+        if not transfer_ctx:
             return None
-        host_indices = self._transfer_context.get("anchor_host_indices")
+        host_indices = transfer_ctx.get("anchor_host_indices")
         if host_indices is not None:
             return host_indices
-        anchor_entry_ctx = self._get_entry_ctx(self.anchor_entry)
+        anchor_entry_ctx = transfer_ctx.get("entries", {}).get(self.anchor_entry.name, {})
         host_indices = anchor_entry_ctx.get("host_indices")
         if host_indices is not None:
             return host_indices
-        resolved = self.anchor_entry.index_resolver(self._transfer_context)
+        resolved = self.anchor_entry.index_resolver(transfer_ctx)
         if resolved is None:
             return None
         return resolved[0]
 
     def _resolve_entry_host_indices_for_page(
-        self, entry: PoolEntry, page_start_index: int
+        self,
+        entry: PoolEntry,
+        page_start_index: int,
+        transfer_ctx: Optional[dict],
     ) -> Optional[torch.Tensor]:
         if entry is self.anchor_entry:
             return torch.arange(
                 page_start_index, page_start_index + self.page_size, dtype=torch.int64
             )
-        if not self._transfer_context:
+        if not transfer_ctx:
             return None
-        resolved = entry.index_resolver(self._transfer_context)
+        resolved = entry.index_resolver(transfer_ctx)
         if resolved is None:
             return None
         entry_host_indices, _ = resolved
-        entry_ctx = self._get_entry_ctx(entry)
-        anchor_host_indices = self._anchor_host_indices()
+        entry_ctx = transfer_ctx.get("entries", {}).get(entry.name, {})
+        anchor_host_indices = self._anchor_host_indices(transfer_ctx)
         if anchor_host_indices is None or anchor_host_indices.numel() == 0:
             return None
         anchor_matches = (anchor_host_indices == page_start_index).nonzero(as_tuple=False)
@@ -1596,16 +1677,22 @@ class HostPoolGroup(HostPoolBase):
             return entry_host_indices[page_ordinal : page_ordinal + 1]
         return None
 
-    def get_data_page(self, index, flat: bool = True) -> Optional[torch.Tensor]:
+    def get_data_page(
+        self, index, flat: bool = True, transfer_ctx: Optional[dict] = None
+    ) -> Optional[torch.Tensor]:
         pages = []
         for entry in self.entries:
             entry_index = index
             if entry is not self.anchor_entry:
-                resolved = self._resolve_entry_host_indices_for_page(entry, int(index))
+                resolved = self._resolve_entry_host_indices_for_page(
+                    entry, int(index), transfer_ctx
+                )
                 if resolved is None or resolved.numel() == 0:
                     continue
                 entry_index = int(resolved[0].item())
-            page = entry.host_pool.get_data_page(entry_index, flat=True)
+            page = entry.host_pool.get_data_page(
+                entry_index, flat=True, transfer_ctx=transfer_ctx
+            )
             if page is not None:
                 pages.append(page.contiguous().view(torch.uint8).reshape(-1))
         if not pages:
@@ -1613,36 +1700,51 @@ class HostPoolGroup(HostPoolBase):
         data_page = torch.cat(pages)
         return data_page.flatten() if flat else data_page
 
-    def get_page_components(self, index: int) -> Optional[dict[str, torch.Tensor]]:
+    def get_page_components(
+        self, index: int, transfer_ctx: Optional[dict] = None
+    ) -> Optional[dict[str, torch.Tensor]]:
         components = {}
         for entry in self.entries:
             entry_index = index
             if entry is not self.anchor_entry:
-                resolved = self._resolve_entry_host_indices_for_page(entry, int(index))
+                resolved = self._resolve_entry_host_indices_for_page(
+                    entry, int(index), transfer_ctx
+                )
                 if resolved is None or resolved.numel() == 0:
                     continue
                 entry_index = int(resolved[0].item())
-            page = entry.host_pool.get_data_page(entry_index, flat=True)
+            page = entry.host_pool.get_data_page(
+                entry_index, flat=True, transfer_ctx=transfer_ctx
+            )
             if page is None:
                 continue
             components[entry.name] = page.contiguous().view(torch.uint8).reshape(-1)
         return components or None
 
-    def get_dummy_flat_data_page(self) -> Optional[torch.Tensor]:
+    def get_dummy_flat_data_page(
+        self, transfer_ctx: Optional[dict] = None
+    ) -> Optional[torch.Tensor]:
         pages = []
         for entry in self.entries:
-            page = entry.host_pool.get_dummy_flat_data_page()
+            page = entry.host_pool.get_dummy_flat_data_page(transfer_ctx=transfer_ctx)
             if page is not None:
                 pages.append(page.contiguous().view(torch.uint8).reshape(-1))
         if not pages:
             return None
         return torch.cat(pages).flatten()
 
-    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+    def set_from_flat_data_page(
+        self,
+        index: int,
+        data_page: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
+    ) -> None:
         flat_bytes = data_page.contiguous().view(torch.uint8).reshape(-1)
         start = 0
         for entry in self.entries:
-            dummy_page = entry.host_pool.get_dummy_flat_data_page()
+            dummy_page = entry.host_pool.get_dummy_flat_data_page(
+                transfer_ctx=transfer_ctx
+            )
             if dummy_page is None:
                 continue
             page_num_bytes = dummy_page.contiguous().view(torch.uint8).numel()
@@ -1651,12 +1753,16 @@ class HostPoolGroup(HostPoolBase):
                 entry_page = entry_page.view(dtype=dummy_page.dtype)
             entry_index = index
             if entry is not self.anchor_entry:
-                resolved = self._resolve_entry_host_indices_for_page(entry, int(index))
+                resolved = self._resolve_entry_host_indices_for_page(
+                    entry, int(index), transfer_ctx
+                )
                 if resolved is None or resolved.numel() == 0:
                     start += page_num_bytes
                     continue
                 entry_index = int(resolved[0].item())
-            entry.host_pool.set_from_flat_data_page(entry_index, entry_page)
+            entry.host_pool.set_from_flat_data_page(
+                entry_index, entry_page, transfer_ctx=transfer_ctx
+            )
             start += page_num_bytes
         if start != flat_bytes.numel():
             raise ValueError(
@@ -1665,24 +1771,33 @@ class HostPoolGroup(HostPoolBase):
             )
 
     def set_from_page_components(
-        self, index: int, components: dict[str, torch.Tensor]
+        self,
+        index: int,
+        components: dict[str, torch.Tensor],
+        transfer_ctx: Optional[dict] = None,
     ) -> None:
         for entry in self.entries:
             entry_page = components.get(entry.name)
             if entry_page is None:
                 continue
-            dummy_page = entry.host_pool.get_dummy_flat_data_page()
+            dummy_page = entry.host_pool.get_dummy_flat_data_page(
+                transfer_ctx=transfer_ctx
+            )
             if dummy_page is not None and dummy_page.dtype != torch.uint8:
                 entry_page = entry_page.contiguous().view(torch.uint8).view(
                     dtype=dummy_page.dtype
                 )
             entry_index = index
             if entry is not self.anchor_entry:
-                resolved = self._resolve_entry_host_indices_for_page(entry, int(index))
+                resolved = self._resolve_entry_host_indices_for_page(
+                    entry, int(index), transfer_ctx
+                )
                 if resolved is None or resolved.numel() == 0:
                     continue
                 entry_index = int(resolved[0].item())
-            entry.host_pool.set_from_flat_data_page(entry_index, entry_page)
+            entry.host_pool.set_from_flat_data_page(
+                entry_index, entry_page, transfer_ctx=transfer_ctx
+            )
 
     def load_from_device(
         self,
@@ -1714,9 +1829,12 @@ class HostPoolGroup(HostPoolBase):
         )
 
     def _compose_transfer_context(
-        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        transfer_ctx: Optional[dict] = None,
     ) -> dict:
-        base_ctx = dict(self._transfer_context or {})
+        base_ctx = dict(transfer_ctx or {})
         entries_ctx = {
             name: dict(value)
             for name, value in (base_ctx.get("entries", {}) or {}).items()
@@ -1733,9 +1851,17 @@ class HostPoolGroup(HostPoolBase):
         return base_ctx
 
     def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        transfer_ctx: Optional[dict] = None,
     ) -> None:
-        ctx = self._compose_transfer_context(host_indices, device_indices)
+        ctx = self._compose_transfer_context(
+            host_indices, device_indices, transfer_ctx=transfer_ctx
+        )
         for entry in self.entries:
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
@@ -1750,12 +1876,20 @@ class HostPoolGroup(HostPoolBase):
                 entry_device_indices,
                 local_layer_id,
                 io_backend,
+                transfer_ctx=ctx,
             )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+        transfer_ctx: Optional[dict] = None,
     ) -> None:
-        ctx = self._compose_transfer_context(host_indices, device_indices)
+        ctx = self._compose_transfer_context(
+            host_indices, device_indices, transfer_ctx=transfer_ctx
+        )
         for entry in self.entries:
             resolved = entry.index_resolver(ctx)
             if resolved is None:
@@ -1766,6 +1900,7 @@ class HostPoolGroup(HostPoolBase):
                 entry_host_indices,
                 entry_device_indices,
                 io_backend,
+                transfer_ctx=ctx,
             )
 
 
@@ -1915,7 +2050,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         device_indices,
         layer_id,
         io_backend,
+        transfer_ctx=None,
     ):
+        del transfer_ctx
         super().load_to_device_per_layer(
             device_pool, host_indices, device_indices, layer_id, io_backend
         )
@@ -1924,8 +2061,9 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
         )
 
     def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
+        self, device_pool, host_indices, device_indices, io_backend, transfer_ctx=None
     ):
+        del transfer_ctx
         super().backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )

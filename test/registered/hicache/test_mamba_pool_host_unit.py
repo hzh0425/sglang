@@ -290,27 +290,23 @@ class TestHostPoolGroupLayerDispatch(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "entries": {
-                    "mamba": {
-                        "host_indices": mamba_host_indices,
-                        "device_indices": mamba_device_indices,
-                    }
+        transfer_ctx = {
+            "entries": {
+                "mamba": {
+                    "host_indices": mamba_host_indices,
+                    "device_indices": mamba_device_indices,
                 }
             }
-        )
-        try:
-            for layer_id in range(len(model_layer_ids)):
-                group.load_to_device_per_layer(
-                    kv_device_pool,
-                    kv_host_indices,
-                    kv_device_indices,
-                    layer_id,
-                    "direct",
-                )
-        finally:
-            group.clear_transfer_context()
+        }
+        for layer_id in range(len(model_layer_ids)):
+            group.load_to_device_per_layer(
+                kv_device_pool,
+                kv_host_indices,
+                kv_device_indices,
+                layer_id,
+                "direct",
+                transfer_ctx=transfer_ctx,
+            )
 
         self.assertTrue(
             torch.equal(
@@ -396,18 +392,18 @@ class TestHostPoolGroupLayerDispatch(unittest.TestCase):
                 ),
             ]
         )
-        group.set_transfer_context(
-            {
-                "entries": {
-                    "kv": {"host_indices": torch.tensor([0], dtype=torch.int64)},
-                    "mamba": {"host_indices": torch.tensor([0], dtype=torch.int64)},
-                }
+        transfer_ctx = {
+            "entries": {
+                "kv": {"host_indices": torch.tensor([0], dtype=torch.int64)},
+                "mamba": {"host_indices": torch.tensor([0], dtype=torch.int64)},
             }
-        )
+        }
 
-        serialized_page = group.get_data_page(0, flat=True)
-        dummy_page = group.get_dummy_flat_data_page()
-        transfer_view = group.get_transfer_view(torch.tensor([0], dtype=torch.int64))
+        serialized_page = group.get_data_page(0, flat=True, transfer_ctx=transfer_ctx)
+        dummy_page = group.get_dummy_flat_data_page(transfer_ctx=transfer_ctx)
+        transfer_view = group.get_transfer_view(
+            torch.tensor([0], dtype=torch.int64), transfer_ctx=transfer_ctx
+        )
         self.assertEqual(serialized_page.dtype, torch.uint8)
         self.assertEqual(serialized_page.numel(), dummy_page.numel())
         self.assertIn("kv", transfer_view.subviews)
@@ -419,7 +415,7 @@ class TestHostPoolGroupLayerDispatch(unittest.TestCase):
         for conv_buffer in mamba_host_pool.conv_buffer:
             conv_buffer[:, 0] = 0
 
-        group.set_from_flat_data_page(0, serialized_page)
+        group.set_from_flat_data_page(0, serialized_page, transfer_ctx=transfer_ctx)
         self.assertTrue(
             torch.equal(
                 kv_host_pool.k_buffer[0][0],
