@@ -418,7 +418,7 @@ class HiMambaRadixCache(MambaRadixCache):
         return len(host_indices)
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self, node: TreeNode, mem_quota: Optional[int] = None, req=None
     ) -> Optional[torch.Tensor]:
         """Load full KV back from host."""
         last_hit_node = node
@@ -431,13 +431,28 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             ancestor_node = node
 
+        mamba_restore_nodes = list(nodes_to_load)
+        if (
+            last_hit_node not in mamba_restore_nodes
+            and last_hit_node.mamba_host_value is not None
+            and last_hit_node.mamba_value is None
+        ):
+            mamba_restore_nodes.append(last_hit_node)
+
         delta = self.inc_lock_ref(ancestor_node)
 
-        full_host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if (len(full_host_indices) < self.load_back_threshold) or (
-            len(full_host_indices) > mem_quota + delta
-            if mem_quota is not None
-            else False
+        if nodes_to_load:
+            full_host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        else:
+            full_host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
+
+        if len(full_host_indices) > 0 and (
+            (len(full_host_indices) < self.load_back_threshold)
+            or (
+                len(full_host_indices) > mem_quota + delta
+                if mem_quota is not None
+                else False
+            )
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancestor_node)
@@ -447,7 +462,7 @@ class HiMambaRadixCache(MambaRadixCache):
             del _device_indices
             mamba_host_indices = []
             mamba_device_indices = []
-            for load_node in nodes_to_load:
+            for load_node in mamba_restore_nodes:
                 if load_node.mamba_host_value is None:
                     continue
                 need_host_load = load_node.mamba_value is None
@@ -484,6 +499,26 @@ class HiMambaRadixCache(MambaRadixCache):
                 if need_host_load:
                     mamba_host_indices.append(load_node.mamba_host_value)
                     mamba_device_indices.append(load_node.mamba_value)
+                    if req is not None and load_node is last_hit_node:
+                        if req.mamba_pool_idx is None:
+                            req_mamba = self.req_to_token_pool.mamba_pool.alloc(
+                                len(load_node.mamba_host_value)
+                            )
+                            if req_mamba is None:
+                                self.inc_lock_ref(load_node)
+                                self.evict_mamba(len(load_node.mamba_host_value))
+                                req_mamba = self.req_to_token_pool.mamba_pool.alloc(
+                                    len(load_node.mamba_host_value)
+                                )
+                                self.dec_lock_ref(load_node)
+                                if req_mamba is None:
+                                    raise RuntimeError(
+                                        "Can not alloc request mamba cache for host load back"
+                                    )
+                            req.mamba_pool_idx = req_mamba[0]
+                        req_mamba_indices = req.mamba_pool_idx.unsqueeze(0)
+                        mamba_host_indices.append(load_node.mamba_host_value)
+                        mamba_device_indices.append(req_mamba_indices)
             if not mamba_host_indices:
                 return None
             return [
@@ -541,16 +576,28 @@ class HiMambaRadixCache(MambaRadixCache):
         last_node: TreeNode,
         host_hit_length: int,
         mem_quota: Optional[int] = None,
+        req=None,
     ):
-        if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+        if last_node.evicted or (
+            last_node.mamba_value is None and last_node.mamba_host_value is not None
+        ):
+            loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
                 return loading_values, last_node
 
-            while last_node.evicted:
+            while (
+                last_node is not self.root_node
+                and (
+                    last_node.evicted
+                    or (
+                        last_node.mamba_value is None
+                        and last_node.mamba_host_value is not None
+                    )
+                )
+            ):
                 last_node = last_node.parent
 
         return (
@@ -1182,11 +1229,23 @@ class HiMambaRadixCache(MambaRadixCache):
         else:
             mamba_branching_seqlen = None
 
-        # last_device_node & host_hit_length: from best_last_node (mamba boundary)
+        # last_device_node & host_hit_length:
+        # last_device_node is the last node whose full and mamba states can both
+        # be directly used on device. host_hit_length remains full-KV-only.
         host_hit_length = 0
         last_device_node = best_last_node
-        while last_device_node.evicted:
-            host_hit_length += len(last_device_node.host_value)
+        while (
+            last_device_node is not self.root_node
+            and (
+                last_device_node.evicted
+                or (
+                    last_device_node.mamba_value is None
+                    and last_device_node.mamba_host_value is not None
+                )
+            )
+        ):
+            if last_device_node.evicted:
+                host_hit_length += len(last_device_node.host_value)
             last_device_node = last_device_node.parent
 
         last_host_node = best_last_node
