@@ -284,6 +284,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._flush_pending_storage_backups_before_reset()
         self.cache_controller.reset()
         self.full_kv_pool_host.clear()
+        self.mamba_pool_host.clear()
         self.ongoing_write_through = {}
         self.ongoing_load_back = {}
         self.ongoing_prefetch = {}
@@ -292,6 +293,11 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_device_leaves.clear()
         self.evictable_full_host_leaves.clear()
         self.mamba_host_lru_list = HostLRUList()
+        logger.info(
+            "HiMambaRadixCache reset completed: host_kv_available=%s host_mamba_available=%s",
+            self.full_kv_pool_host.available_size(),
+            self.mamba_pool_host.available_size(),
+        )
         super().reset()
 
     def _flush_pending_storage_backups_before_reset(self) -> None:
