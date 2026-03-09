@@ -151,12 +151,17 @@ class HiMambaRadixCache(MambaRadixCache):
             host_indices = ctx.get("anchor_host_indices")
             device_indices = ctx.get("anchor_device_indices")
             if host_indices is None:
+                kv_entry = ctx.get("entries", {}).get("kv", {})
+                host_indices = kv_entry.get("host_indices")
+                device_indices = kv_entry.get("device_indices")
+            if host_indices is None:
                 return None
             return host_indices, device_indices
 
         def mamba_index_resolver(ctx: dict):
-            host_indices = ctx.get("mamba_host_indices")
-            device_indices = ctx.get("mamba_device_indices")
+            entry = ctx.get("entries", {}).get("mamba", {})
+            host_indices = entry.get("host_indices", ctx.get("mamba_host_indices"))
+            device_indices = entry.get("device_indices", ctx.get("mamba_device_indices"))
             if host_indices is None:
                 return None
             return host_indices, device_indices
@@ -276,6 +281,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
     def reset(self) -> None:
         TreeNode.counter = 0
+        self._flush_pending_storage_backups_before_reset()
         self.cache_controller.reset()
         self.full_kv_pool_host.clear()
         self.ongoing_write_through = {}
@@ -287,6 +293,48 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_host_leaves.clear()
         self.mamba_host_lru_list = HostLRUList()
         super().reset()
+
+    def _flush_pending_storage_backups_before_reset(self) -> None:
+        if not self.enable_storage:
+            return
+
+        self.writing_check(write_back=True)
+        deadline = time.monotonic() + 30.0
+        last_log_time = 0.0
+        while time.monotonic() < deadline:
+            self.drain_storage_control_queues()
+            backup_qsize = self.cache_controller.backup_queue.qsize()
+            ack_backup_qsize = self.cache_controller.ack_backup_queue.qsize()
+            ongoing_backup = len(self.ongoing_backup)
+            ongoing_write = len(self.ongoing_write_through)
+            if (
+                backup_qsize == 0
+                and ack_backup_qsize == 0
+                and ongoing_backup == 0
+                and ongoing_write == 0
+            ):
+                return
+            now = time.monotonic()
+            if now - last_log_time > 1.0:
+                logger.info(
+                    "Waiting for HiCache storage backups to drain before reset: "
+                    "ongoing_write=%s ongoing_backup=%s backup_queue=%s ack_backup_queue=%s",
+                    ongoing_write,
+                    ongoing_backup,
+                    backup_qsize,
+                    ack_backup_qsize,
+                )
+                last_log_time = now
+            time.sleep(0.05)
+
+        logger.warning(
+            "Timed out waiting for HiCache storage backups to drain before reset: "
+            "ongoing_write=%s ongoing_backup=%s backup_queue=%s ack_backup_queue=%s",
+            len(self.ongoing_write_through),
+            len(self.ongoing_backup),
+            self.cache_controller.backup_queue.qsize(),
+            self.cache_controller.ack_backup_queue.qsize(),
+        )
 
     def _ensure_node_mamba_host_value(self, node: TreeNode) -> bool:
         if node.mamba_value is None:
@@ -1778,13 +1826,29 @@ class HiMambaRadixCache(MambaRadixCache):
             if self.hicache_storage_pass_prefix_keys
             else None
         )
+        auxiliary_transfers = getattr(node, "host_auxiliary_transfers", None)
+        if auxiliary_transfers:
+            logger.info(
+                "Scheduling HiCache storage backup for node %s with auxiliary=%s",
+                node.id,
+                [
+                    {
+                        "name": transfer.name,
+                        "page_ordinals": transfer.page_ordinals,
+                        "host_indices": None
+                        if transfer.host_indices is None
+                        else transfer.host_indices.tolist(),
+                    }
+                    for transfer in auxiliary_transfers
+                ],
+            )
 
         operation_id = self.cache_controller.write_storage(
             node.host_value,
             node.key,
             node.hash_value,
             prefix_keys,
-            auxiliary_transfers=getattr(node, "host_auxiliary_transfers", None),
+            auxiliary_transfers=auxiliary_transfers,
         )
         self.ongoing_backup[operation_id] = node
         self._protect_host_node(node)

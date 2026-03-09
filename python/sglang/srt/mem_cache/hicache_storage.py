@@ -4,7 +4,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional, Set
 
 import torch
 
@@ -272,40 +272,9 @@ class HiCacheStorage(ABC):
         auxiliary_constraints: List[dict[str, Any]],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> int:
-        full_hit_page_num = self.batch_exists(keys, extra_info)
-        if full_hit_page_num == 0 or not auxiliary_constraints:
-            return full_hit_page_num
-
-        def component_exists(page_idx: int, component_name: str) -> bool:
-            return self.exists(f"{keys[page_idx]}.{component_name}")
-
-        final_hit_page_num = full_hit_page_num
-        for constraint in auxiliary_constraints:
-            name = constraint["name"]
-            policy = constraint.get("policy", "all_pages")
-            boundary = 0
-
-            if policy == "all_pages":
-                while (
-                    boundary < full_hit_page_num
-                    and component_exists(boundary, name)
-                ):
-                    boundary += 1
-            elif policy == "trailing_pages":
-                trailing_pages = max(1, int(constraint.get("trailing_pages", 1)))
-                for prefix_len in range(full_hit_page_num, 0, -1):
-                    start = max(0, prefix_len - trailing_pages)
-                    if all(component_exists(page_idx, name) for page_idx in range(start, prefix_len)):
-                        boundary = prefix_len
-                        break
-            else:
-                raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
-
-            final_hit_page_num = min(final_hit_page_num, boundary)
-            if final_hit_page_num == 0:
-                break
-
-        return final_hit_page_num
+        raise NotImplementedError(
+            "batch_exists_v2 must be implemented by each storage backend."
+        )
 
     def clear(self) -> None:
         pass
@@ -515,6 +484,88 @@ class HiCacheFile(HiCacheStorage):
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
 
+    def _collect_existing_component_keys(
+        self, keys: List[str], auxiliary_constraints: Optional[List[dict[str, Any]]] = None
+    ) -> Set[str]:
+        target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
+        for constraint in auxiliary_constraints or []:
+            component_name = constraint["name"]
+            for key in keys:
+                target_files.add(f"{self._get_component_key(key, component_name)}.bin")
+
+        existing_files = set()
+        with os.scandir(self.file_path) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name in target_files:
+                    existing_files.add(entry.name)
+        return existing_files
+
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        existing_files = self._collect_existing_component_keys(keys)
+        for i, key in enumerate(keys):
+            if f"{self._get_component_key(key)}.bin" not in existing_files:
+                return i
+        return len(keys)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        auxiliary_constraints: List[dict[str, Any]],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> int:
+        existing_files = self._collect_existing_component_keys(keys, auxiliary_constraints)
+
+        def has_component(page_idx: int, component_name: str) -> bool:
+            return (
+                f"{self._get_component_key(keys[page_idx], component_name)}.bin"
+                in existing_files
+            )
+
+        full_hit_page_num = 0
+        while full_hit_page_num < len(keys):
+            if f"{self._get_component_key(keys[full_hit_page_num])}.bin" not in existing_files:
+                break
+            full_hit_page_num += 1
+
+        final_hit_page_num = full_hit_page_num
+        auxiliary_boundaries: dict[str, int] = {}
+        for constraint in auxiliary_constraints:
+            name = constraint["name"]
+            policy = constraint.get("policy", "all_pages")
+            boundary = 0
+
+            if policy == "all_pages":
+                while boundary < full_hit_page_num and has_component(boundary, name):
+                    boundary += 1
+            elif policy == "trailing_pages":
+                trailing_pages = max(1, int(constraint.get("trailing_pages", 1)))
+                for prefix_len in range(full_hit_page_num, 0, -1):
+                    start = max(0, prefix_len - trailing_pages)
+                    if all(has_component(page_idx, name) for page_idx in range(start, prefix_len)):
+                        boundary = prefix_len
+                        break
+            else:
+                raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
+
+            auxiliary_boundaries[name] = boundary
+            final_hit_page_num = min(final_hit_page_num, boundary)
+            if final_hit_page_num == 0:
+                break
+
+        if auxiliary_constraints:
+            logger.info(
+                "HiCacheFile batch_exists_v2: full_hit_pages=%s final_hit_pages=%s aux_boundaries=%s first_key=%s last_key=%s",
+                full_hit_page_num,
+                final_hit_page_num,
+                auxiliary_boundaries,
+                keys[0] if keys else None,
+                keys[min(final_hit_page_num, len(keys)) - 1] if final_hit_page_num > 0 else None,
+            )
+
+        return final_hit_page_num
+
     def clear(self) -> bool:
         try:
             for filename in os.listdir(self.file_path):
@@ -710,6 +761,12 @@ class HiCacheFile(HiCacheStorage):
                         )
                     with open(component_path, "wb", buffering=0) as f:
                         f.write(encoded_payload)
+                    if component_name != primary_name:
+                        logger.info(
+                            "HiCacheFile wrote auxiliary component %s for key %s",
+                            component_name,
+                            key,
+                        )
 
                 for component_name in self._get_aux_component_names():
                     if component_name in payloads:

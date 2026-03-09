@@ -1671,6 +1671,11 @@ class HostPoolGroup(HostPoolBase):
             entry_page = components.get(entry.name)
             if entry_page is None:
                 continue
+            dummy_page = entry.host_pool.get_dummy_flat_data_page()
+            if dummy_page is not None and dummy_page.dtype != torch.uint8:
+                entry_page = entry_page.contiguous().view(torch.uint8).view(
+                    dtype=dummy_page.dtype
+                )
             entry_index = index
             if entry is not self.anchor_entry:
                 resolved = self._resolve_entry_host_indices_for_page(entry, int(index))

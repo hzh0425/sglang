@@ -778,6 +778,44 @@ class HiCacheController:
                 ctx["entries"] = entries
         return ctx or None
 
+    def _slice_auxiliary_transfers_for_batch(
+        self,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]],
+        batch_page_start: int,
+        batch_page_count: int,
+    ) -> Optional[list[AuxiliaryTransfer]]:
+        if not auxiliary_transfers:
+            return None
+
+        batch_transfers: list[AuxiliaryTransfer] = []
+        batch_page_end = batch_page_start + batch_page_count
+        for transfer in auxiliary_transfers:
+            page_ordinals = transfer.page_ordinals
+            if page_ordinals is None:
+                batch_transfers.append(transfer)
+                continue
+
+            local_page_ordinals = [
+                int(page_ordinal) - batch_page_start
+                for page_ordinal in page_ordinals
+                if batch_page_start <= int(page_ordinal) < batch_page_end
+            ]
+            if not local_page_ordinals:
+                continue
+
+            batch_transfers.append(
+                AuxiliaryTransfer(
+                    name=transfer.name,
+                    host_indices=transfer.host_indices,
+                    device_indices=transfer.device_indices,
+                    page_ordinals=local_page_ordinals,
+                    hit_policy=transfer.hit_policy,
+                    trailing_pages=transfer.trailing_pages,
+                )
+            )
+
+        return batch_transfers or None
+
     def _build_auxiliary_hit_constraints(
         self,
         auxiliary_transfers: Optional[list[AuxiliaryTransfer]],
@@ -1099,9 +1137,16 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+            batch_page_start = i
+            batch_page_count = len(batch_hashes)
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                i * self.page_size : (i + batch_page_count) * self.page_size
             ]
+            batch_auxiliary_transfers = self._slice_auxiliary_transfers_for_batch(
+                operation.auxiliary_transfers,
+                batch_page_start=batch_page_start,
+                batch_page_count=batch_page_count,
+            )
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1110,7 +1155,7 @@ class HiCacheController:
                 batch_hashes,
                 batch_host_indices,
                 extra_info,
-                operation.auxiliary_transfers,
+                batch_auxiliary_transfers,
             )
             # Check termination
             if (
@@ -1305,9 +1350,16 @@ class HiCacheController:
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), self.storage_batch_size):
             batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+            batch_page_start = i
+            batch_page_count = len(batch_hashes)
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                i * self.page_size : (i + batch_page_count) * self.page_size
             ]
+            batch_auxiliary_transfers = self._slice_auxiliary_transfers_for_batch(
+                operation.auxiliary_transfers,
+                batch_page_start=batch_page_start,
+                batch_page_count=batch_page_count,
+            )
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1315,7 +1367,7 @@ class HiCacheController:
                 batch_hashes,
                 batch_host_indices,
                 extra_info,
-                operation.auxiliary_transfers,
+                batch_auxiliary_transfers,
             )
             if not success:
                 logger.warning(
