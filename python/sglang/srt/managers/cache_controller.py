@@ -1200,37 +1200,26 @@ class HiCacheController:
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
-        storage_query_count = 0
         hash_value = []
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
-        ):
-            end = min(
-                start + self.page_size * self.storage_batch_size, len(tokens_to_fetch)
+        for start in range(0, len(tokens_to_fetch), self.page_size):
+            last_hash = self.get_hash_str(
+                tokens_to_fetch[start : start + self.page_size], last_hash
             )
-            batch_tokens = tokens_to_fetch[start:end]
-            batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
-                batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            auxiliary_constraints = self._build_auxiliary_hit_constraints(
-                operation.auxiliary_transfers
+            hash_value.append(last_hash)
+
+        extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+        auxiliary_constraints = self._build_auxiliary_hit_constraints(
+            operation.auxiliary_transfers
+        )
+        if auxiliary_constraints:
+            hit_page_num = self.storage_backend.batch_exists_v2(
+                hash_value, auxiliary_constraints, extra_info
             )
-            if auxiliary_constraints:
-                hit_page_num = self.storage_backend.batch_exists_v2(
-                    batch_hashes, auxiliary_constraints, extra_info
-                )
-            else:
-                hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
-            hash_value.extend(batch_hashes[:hit_page_num])
-            storage_query_count += hit_page_num * self.page_size
-            if hit_page_num < len(batch_hashes):
-                break
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+        else:
+            hit_page_num = self.storage_backend.batch_exists(hash_value, extra_info)
+
+        storage_query_count = hit_page_num * self.page_size
+        hash_value = hash_value[:hit_page_num]
 
         return hash_value, storage_query_count
 
