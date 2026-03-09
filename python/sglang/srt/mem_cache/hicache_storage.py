@@ -1,16 +1,23 @@
 import hashlib
+import json
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.host_pool_base import HostPoolBase
+    from sglang.srt.mem_cache.transfer_view import TransferView
+
 logger = logging.getLogger(__name__)
+
+FILE_V2_MAGIC = b"HCF2"
 
 
 def get_hash_str(token_ids: List[int], prior_hash: str = None) -> str:
@@ -72,8 +79,18 @@ class HiCacheStorage(ABC):
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
 
+    def _set_registered_host_pool(self, host_pool: "HostPoolBase"):
+        self.mem_pool_host = host_pool
+        on_registered = getattr(self, "_on_host_pool_registered", None)
+        if callable(on_registered):
+            on_registered(host_pool)
+
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
-        self.mem_pool_host = mem_pool_host
+        self._set_registered_host_pool(mem_pool_host)
+
+    def register_host_pool(self, host_pool: "HostPoolBase"):
+        """Register a host pool (can be any HostPoolBase implementation, not just HostKVCache)."""
+        self._set_registered_host_pool(host_pool)
 
     def batch_get_v1(
         self,
@@ -98,6 +115,78 @@ class HiCacheStorage(ABC):
         Returns a list of booleans indicating success for each key.
         """
         pass
+
+    # ==================== V2 Interface (TransferView-based) ====================
+
+    def supports_transfer_view(self) -> bool:
+        """
+        Check if this storage backend supports TransferView-based operations.
+        """
+        return False
+
+    def batch_get_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Retrieve values for multiple keys into TransferView-specified locations.
+
+        This is the new interface that works with any HostPoolBase implementation.
+        The TransferView describes where to write the data in host memory.
+
+        Args:
+            keys: List of hash keys to retrieve.
+            transfer_view: Describes the target memory layout for retrieved data.
+            extra_info: Optional extra information for the operation.
+
+        Returns:
+            List of booleans indicating success for each key.
+
+        Note:
+            Default implementation falls back to v1 interface if the pool is HostKVCache.
+            Override this method for backends that want to support arbitrary pool types.
+        """
+        # Default: fall back to v1 if available
+        if hasattr(self, "mem_pool_host") and transfer_view.offsets is not None:
+            return self.batch_get_v1(keys, transfer_view.offsets, extra_info)
+        raise NotImplementedError(
+            "batch_get_v2 is not implemented. "
+            "Override supports_transfer_view() to return True and implement this method."
+        )
+
+    def batch_set_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """
+        Store values from TransferView-specified locations for multiple keys.
+
+        This is the new interface that works with any HostPoolBase implementation.
+        The TransferView describes where to read the data from host memory.
+
+        Args:
+            keys: List of hash keys to store.
+            transfer_view: Describes the source memory layout for data to store.
+            extra_info: Optional extra information for the operation.
+
+        Returns:
+            List of booleans indicating success for each key.
+
+        Note:
+            Default implementation falls back to v1 interface if the pool is HostKVCache.
+            Override this method for backends that want to support arbitrary pool types.
+        """
+        # Default: fall back to v1 if available
+        if hasattr(self, "mem_pool_host") and transfer_view.offsets is not None:
+            return self.batch_set_v1(keys, transfer_view.offsets, extra_info)
+        raise NotImplementedError(
+            "batch_set_v2 is not implemented. "
+            "Override supports_transfer_view() to return True and implement this method."
+        )
 
     @abstractmethod
     def get(
@@ -202,13 +291,119 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix = f"_{model_name}"
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
+        self.transfer_suffix = ""
 
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+    def _on_host_pool_registered(self, host_pool: "HostPoolBase"):
+        dummy_page = host_pool.get_dummy_flat_data_page()
+        page_num_bytes = 0
+        dummy_dtype = None
+        if dummy_page is not None:
+            page_num_bytes = int(dummy_page.contiguous().view(torch.uint8).numel())
+            dummy_dtype = str(dummy_page.dtype)
+
+        pool_descriptor = {
+            "host_pool_type": type(host_pool).__name__,
+            "page_num_bytes": page_num_bytes,
+            "page_size": getattr(host_pool, "page_size", None),
+            "layout": getattr(host_pool, "layout", None),
+            "dtype": dummy_dtype,
+        }
+        if hasattr(host_pool, "entries"):
+            pool_descriptor["entries"] = [
+                {
+                    "name": entry.name,
+                    "host_pool_type": type(entry.host_pool).__name__,
+                    "page_num_bytes": int(
+                        entry.host_pool.get_dummy_flat_data_page()
+                        .contiguous()
+                        .view(torch.uint8)
+                        .numel()
+                    )
+                    if entry.host_pool.get_dummy_flat_data_page() is not None
+                    else 0,
+                }
+                for entry in host_pool.entries
+            ]
+
+        signature_json = json.dumps(pool_descriptor, sort_keys=True)
+        signature_hash = hashlib.sha1(signature_json.encode("utf-8")).hexdigest()[:12]
+        self.transfer_suffix = f"_tv2_{signature_hash}"
+
     def _get_suffixed_key(self, key: str) -> str:
-        return key + self.config_suffix
+        return key + self.config_suffix + self.transfer_suffix
+
+    def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
+        if component_name is None or component_name in ("__default__", "kv"):
+            return self._get_suffixed_key(key)
+        return self._get_suffixed_key(f"{key}.{component_name}")
+
+    def _get_component_path(self, key: str, component_name: Optional[str] = None) -> str:
+        return os.path.join(
+            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
+        )
+
+    def _get_aux_component_names(self) -> list[str]:
+        host_pool = getattr(self, "mem_pool_host", None)
+        if host_pool is None or not hasattr(host_pool, "entries"):
+            return []
+        return [
+            entry.name
+            for entry in host_pool.entries
+            if not getattr(entry, "is_primary_index_anchor", False)
+        ]
+
+    @staticmethod
+    def _get_primary_component_name(components: dict[str, torch.Tensor]) -> str:
+        if "__default__" in components:
+            return "__default__"
+        if "kv" in components:
+            return "kv"
+        return next(iter(components))
+
+    @staticmethod
+    def _encode_v2_payload(components: dict[str, torch.Tensor]) -> bytes:
+        encoded_components = []
+        payload_parts = []
+        for name, tensor in components.items():
+            flat_bytes = tensor.contiguous().view(torch.uint8).reshape(-1).cpu()
+            encoded_components.append({"name": name, "num_bytes": int(flat_bytes.numel())})
+            payload_parts.append(flat_bytes.numpy().tobytes())
+        header = json.dumps({"components": encoded_components}, sort_keys=True).encode(
+            "utf-8"
+        )
+        return (
+            FILE_V2_MAGIC
+            + len(header).to_bytes(8, byteorder="little", signed=False)
+            + header
+            + b"".join(payload_parts)
+        )
+
+    @staticmethod
+    def _decode_v2_payload(file_data: bytes) -> tuple[dict[str, bytes], list[str]] | None:
+        if not file_data.startswith(FILE_V2_MAGIC) or len(file_data) < 12:
+            return None
+        header_len = int.from_bytes(file_data[4:12], byteorder="little", signed=False)
+        header_start = 12
+        header_end = header_start + header_len
+        if len(file_data) < header_end:
+            raise ValueError("Corrupted HiCacheFile v2 header.")
+        header = json.loads(file_data[header_start:header_end].decode("utf-8"))
+        cursor = header_end
+        components = {}
+        names = []
+        for entry in header.get("components", []):
+            name = entry["name"]
+            num_bytes = int(entry["num_bytes"])
+            components[name] = file_data[cursor : cursor + num_bytes]
+            names.append(name)
+            cursor += num_bytes
+        if cursor != len(file_data):
+            raise ValueError("Corrupted HiCacheFile v2 payload size.")
+        return components, names
 
     def get(
         self,
@@ -290,3 +485,201 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+    # ==================== V2 Interface (TransferView-based) ====================
+
+    def supports_transfer_view(self) -> bool:
+        """HiCacheFile supports TransferView-based operations."""
+        return True
+
+    def _validate_transfer_view(
+        self, keys: List[str], transfer_view: "TransferView"
+    ) -> Optional[str]:
+        """Validate TransferView parameters. Returns error message if invalid, None if valid."""
+        if not hasattr(self, "mem_pool_host"):
+            return "No host pool registered"
+        if transfer_view.offsets is None:
+            return "No offsets specified in TransferView"
+        page_size = transfer_view.page_size or 1
+        if len(transfer_view.offsets) != len(keys) * page_size:
+            return f"Offsets length mismatch: expected {len(keys) * page_size}, got {len(transfer_view.offsets)}"
+        return None
+
+    def batch_get_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """Retrieve values for multiple keys into host pool via TransferView."""
+        error = self._validate_transfer_view(keys, transfer_view)
+        if error:
+            logger.error(f"batch_get_v2 validation failed: {error}")
+            return [False] * len(keys)
+
+        offsets = transfer_view.offsets
+        page_size = transfer_view.page_size or 1
+        dummy_page = self.mem_pool_host.get_dummy_flat_data_page()
+        expected_bytes = dummy_page.numel() * dummy_page.element_size()
+        page_entry_names = None
+        if extra_info is not None:
+            if extra_info.extra_info is None:
+                extra_info.extra_info = {}
+            page_entry_names = extra_info.extra_info.setdefault("page_entry_names", [])
+
+        results = []
+        for i, key in enumerate(keys):
+            tensor_path = self._get_component_path(key)
+
+            if not os.path.exists(tensor_path):
+                results.append(False)
+                continue
+
+            try:
+                page_start_offset = offsets[i * page_size].item()
+
+                with open(tensor_path, "rb", buffering=0) as f:
+                    file_data = f.read()
+
+                decoded = self._decode_v2_payload(file_data)
+                merged_components: dict[str, torch.Tensor] = {}
+                component_names: list[str] = []
+                if decoded is None:
+                    if len(file_data) != expected_bytes:
+                        logger.warning(
+                            f"File size mismatch for {key}: expected {expected_bytes}, got {len(file_data)}"
+                        )
+                        results.append(False)
+                        continue
+                    merged_components["__default__"] = torch.frombuffer(
+                        file_data, dtype=dummy_page.dtype, count=dummy_page.numel()
+                    ).reshape(dummy_page.shape)
+                    if page_entry_names is not None:
+                        component_names.append("__default__")
+                else:
+                    components_bytes, component_names = decoded
+                    merged_components = {
+                        name: torch.frombuffer(component_bytes, dtype=torch.uint8).clone()
+                        for name, component_bytes in components_bytes.items()
+                    }
+                for component_name in self._get_aux_component_names():
+                    aux_path = self._get_component_path(key, component_name)
+                    if not os.path.exists(aux_path):
+                        continue
+                    with open(aux_path, "rb", buffering=0) as f:
+                        aux_data = f.read()
+                    aux_decoded = self._decode_v2_payload(aux_data)
+                    if aux_decoded is None:
+                        raise ValueError(
+                            f"Auxiliary payload for {key}.{component_name} is not v2 encoded."
+                        )
+                    aux_components_bytes, aux_component_names = aux_decoded
+                    for name, component_bytes in aux_components_bytes.items():
+                        merged_components[name] = torch.frombuffer(
+                            component_bytes, dtype=torch.uint8
+                        ).clone()
+                    component_names.extend(aux_component_names)
+                if "mamba" in component_names:
+                    logger.info(
+                        "HiCache mamba prefetch restored for key %s: components=%s",
+                        key,
+                        ",".join(component_names),
+                    )
+
+                if hasattr(self.mem_pool_host, "set_from_page_components"):
+                    self.mem_pool_host.set_from_page_components(
+                        page_start_offset, merged_components
+                    )
+                else:
+                    flat_page = torch.cat(list(merged_components.values()))
+                    self.mem_pool_host.set_from_flat_data_page(
+                        page_start_offset, flat_page
+                    )
+                if page_entry_names is not None:
+                    page_entry_names.append(component_names or ["__default__"])
+                results.append(True)
+
+            except Exception as e:
+                logger.error(f"Failed to read key {key}: {e}")
+                results.append(False)
+
+        return results
+
+    def batch_set_v2(
+        self,
+        keys: List[str],
+        transfer_view: "TransferView",
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        """Store values from host pool to storage via TransferView."""
+        error = self._validate_transfer_view(keys, transfer_view)
+        if error:
+            logger.error(f"batch_set_v2 validation failed: {error}")
+            return [False] * len(keys)
+
+        offsets = transfer_view.offsets
+        page_size = transfer_view.page_size or 1
+
+        results = []
+        for i, key in enumerate(keys):
+            try:
+                page_start_offset = offsets[i * page_size].item()
+                components = None
+                if hasattr(self.mem_pool_host, "get_page_components"):
+                    components = self.mem_pool_host.get_page_components(page_start_offset)
+                if components is None:
+                    data_page = self.mem_pool_host.get_data_page(
+                        page_start_offset, flat=True
+                    )
+                    components = {"__default__": data_page}
+                primary_name = self._get_primary_component_name(components)
+                payloads = {
+                    primary_name: self._encode_v2_payload(
+                        {primary_name: components[primary_name]}
+                    )
+                }
+                for component_name, component_value in components.items():
+                    if component_name == primary_name:
+                        continue
+                    payloads[component_name] = self._encode_v2_payload(
+                        {component_name: component_value}
+                    )
+
+                for component_name, encoded_payload in payloads.items():
+                    component_path = self._get_component_path(
+                        key, None if component_name == primary_name else component_name
+                    )
+                    if os.path.exists(component_path):
+                        with open(component_path, "rb", buffering=0) as f:
+                            existing_data = f.read()
+                        if existing_data == encoded_payload:
+                            continue
+                        if len(existing_data) == len(encoded_payload):
+                            logger.debug(
+                                "Reusing existing storage entry for %s without rewrite.",
+                                key
+                                if component_name == primary_name
+                                else f"{key}.{component_name}",
+                            )
+                            continue
+                        logger.warning(
+                            f"Overwriting stale storage entry for "
+                            f"{key if component_name == primary_name else f'{key}.{component_name}'}: "
+                            f"expected {len(encoded_payload)} bytes, got {len(existing_data)}"
+                        )
+                    with open(component_path, "wb", buffering=0) as f:
+                        f.write(encoded_payload)
+
+                for component_name in self._get_aux_component_names():
+                    if component_name in payloads:
+                        continue
+                    component_path = self._get_component_path(key, component_name)
+                    if os.path.exists(component_path):
+                        os.remove(component_path)
+                results.append(True)
+
+            except Exception as e:
+                logger.error(f"Failed to store key {key}: {e}")
+                results.append(False)
+
+        return results

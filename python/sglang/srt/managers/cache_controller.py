@@ -16,8 +16,9 @@ limitations under the License.
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
 
 import torch
 
@@ -28,7 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.host_pool_base import HostPoolBase
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
@@ -97,6 +98,14 @@ class LayerDoneCounter:
         self.consumer_index = -1
 
 
+@dataclass
+class AuxiliaryTransfer:
+    name: str
+    host_indices: Optional[torch.Tensor] = None
+    device_indices: Optional[torch.Tensor] = None
+    page_ordinals: Optional[list[int]] = None
+
+
 class CacheOperation:
 
     counter = 0
@@ -107,11 +116,13 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.auxiliary_transfers = auxiliary_transfers
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -128,11 +139,66 @@ class CacheOperation:
         device_indices = torch.cat([op.device_indices for op in ops])
         node_ids = []
         priority = min(op.priority for op in ops)
+        auxiliary_transfers = CacheOperation.merge_auxiliary_transfers(ops)
         for op in ops:
             node_ids.extend(op.node_ids)
-        merged_op = CacheOperation(host_indices, device_indices, -1, priority)
+        merged_op = CacheOperation(
+            host_indices,
+            device_indices,
+            -1,
+            priority,
+            auxiliary_transfers=auxiliary_transfers,
+        )
         merged_op.node_ids = node_ids
         return merged_op
+
+    @staticmethod
+    def merge_auxiliary_transfers(
+        ops: List["CacheOperation"],
+    ) -> Optional[list[AuxiliaryTransfer]]:
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for op in ops:
+            for transfer in op.auxiliary_transfers or []:
+                merged = grouped.setdefault(
+                    transfer.name,
+                    {
+                        "host_indices": [],
+                        "device_indices": [],
+                        "page_ordinals": [],
+                        "has_page_ordinals": False,
+                    },
+                )
+                if transfer.host_indices is not None:
+                    merged["host_indices"].append(transfer.host_indices)
+                if transfer.device_indices is not None:
+                    merged["device_indices"].append(transfer.device_indices)
+                if transfer.page_ordinals is not None:
+                    merged["page_ordinals"].extend(int(x) for x in transfer.page_ordinals)
+                    merged["has_page_ordinals"] = True
+        if not grouped:
+            return None
+
+        merged_transfers = []
+        for name, merged in grouped.items():
+            merged_transfers.append(
+                AuxiliaryTransfer(
+                    name=name,
+                    host_indices=(
+                        torch.cat(merged["host_indices"])
+                        if merged["host_indices"]
+                        else None
+                    ),
+                    device_indices=(
+                        torch.cat(merged["device_indices"])
+                        if merged["device_indices"]
+                        else None
+                    ),
+                    page_ordinals=(
+                        merged["page_ordinals"] if merged["has_page_ordinals"] else None
+                    ),
+                )
+            )
+        return merged_transfers
 
     def __lt__(self, other: CacheOperation):
         return self.priority < other.priority
@@ -197,6 +263,7 @@ class StorageOperation:
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
     ):
         self.host_indices = host_indices
         self.token_ids = token_ids
@@ -204,6 +271,8 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.auxiliary_transfers = auxiliary_transfers
+        self.page_entry_names: List[List[str]] = []
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -220,6 +289,7 @@ class PrefetchOperation(StorageOperation):
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
     ):
         self.request_id = request_id
 
@@ -227,7 +297,13 @@ class PrefetchOperation(StorageOperation):
         self._terminated_flag = False
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
+        super().__init__(
+            host_indices,
+            token_ids,
+            last_hash,
+            prefix_keys=prefix_keys,
+            auxiliary_transfers=auxiliary_transfers,
+        )
 
     def increment(self, num_tokens: int):
         with self._lock:
@@ -249,7 +325,7 @@ class HiCacheController:
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
-        mem_pool_host: HostKVCache,
+        mem_pool_host: "HostPoolBase",
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event,
@@ -261,6 +337,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        transfer_layer_num: Optional[int] = None,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
@@ -292,7 +369,10 @@ class HiCacheController:
 
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
-        self.layer_done_counter = LayerDoneCounter(self.layer_num)
+        self.transfer_layer_num = (
+            transfer_layer_num if transfer_layer_num is not None else self.layer_num
+        )
+        self.layer_done_counter = LayerDoneCounter(self.transfer_layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -477,7 +557,14 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            # Check if backend supports TransferView-based v2 interface
+            if self.storage_backend.supports_transfer_view():
+                self.page_get_func = self._page_get_v2
+                self.page_set_func = self._page_set_v2
+                logger.info("Using TransferView v2 interface for storage operations")
+            elif (
+                self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -648,11 +735,39 @@ class HiCacheController:
             self.prefetch_thread.start()
             self.backup_thread.start()
 
+    def _build_transfer_context(
+        self,
+        host_indices: Optional[torch.Tensor] = None,
+        device_indices: Optional[torch.Tensor] = None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
+    ) -> Optional[dict]:
+        ctx = {}
+        if host_indices is not None:
+            ctx["anchor_host_indices"] = host_indices
+        if device_indices is not None:
+            ctx["anchor_device_indices"] = device_indices
+        if auxiliary_transfers:
+            entries = {}
+            for transfer in auxiliary_transfers:
+                entry = {}
+                if transfer.host_indices is not None:
+                    entry["host_indices"] = transfer.host_indices
+                if transfer.device_indices is not None:
+                    entry["device_indices"] = transfer.device_indices
+                if transfer.page_ordinals is not None:
+                    entry["page_ordinals"] = list(transfer.page_ordinals)
+                if entry:
+                    entries[transfer.name] = entry
+            if entries:
+                ctx["entries"] = entries
+        return ctx or None
+
     def write(
         self,
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
@@ -661,7 +776,13 @@ class HiCacheController:
         if host_indices is None:
             return None
         self.write_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                auxiliary_transfers=auxiliary_transfers,
+            )
         )
         self.start_writing()
         return host_indices
@@ -680,10 +801,22 @@ class HiCacheController:
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+            transfer_ctx = self._build_transfer_context(
+                host_indices,
+                device_indices,
+                op.auxiliary_transfers,
             )
-            finish_event.record()
+            self.mem_pool_host.set_transfer_context(transfer_ctx)
+            try:
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
+                finish_event.record()
+            finally:
+                self.mem_pool_host.clear_transfer_context()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
@@ -699,6 +832,7 @@ class HiCacheController:
         host_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        auxiliary_transfers: Optional[Any] = None,
     ) -> Optional[torch.Tensor]:
         """
         Load KV caches from host memory to device memory.
@@ -706,8 +840,16 @@ class HiCacheController:
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
             return None
+        if callable(auxiliary_transfers):
+            auxiliary_transfers = auxiliary_transfers(device_indices)
         self.load_queue.append(
-            CacheOperation(host_indices, device_indices, node_id, priority)
+            CacheOperation(
+                host_indices,
+                device_indices,
+                node_id,
+                priority,
+                auxiliary_transfers=auxiliary_transfers,
+            )
         )
         return device_indices
 
@@ -743,15 +885,24 @@ class HiCacheController:
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                producer_event.complete(i)
+            transfer_ctx = self._build_transfer_context(
+                host_indices,
+                device_indices,
+                op.auxiliary_transfers,
+            )
+            self.mem_pool_host.set_transfer_context(transfer_ctx)
+            try:
+                for i in range(self.transfer_layer_num):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
+                    producer_event.complete(i)
+            finally:
+                self.mem_pool_host.clear_transfer_context()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
@@ -787,12 +938,18 @@ class HiCacheController:
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
     ) -> PrefetchOperation:
         """
         Prefetch KV caches from storage backend to host memory.
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id,
+            host_indices,
+            new_input_tokens,
+            last_hash,
+            prefix_keys,
+            auxiliary_transfers=auxiliary_transfers,
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -809,7 +966,12 @@ class HiCacheController:
             self.host_mem_release_queue.put(page)
 
     def _page_get_zero_copy(
-        self, operation, hash_values, host_indices, extra_info=None
+        self,
+        operation,
+        hash_values,
+        host_indices,
+        extra_info=None,
+        auxiliary_transfers=None,
     ):
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
@@ -824,8 +986,54 @@ class HiCacheController:
             inc += self.page_size
         operation.increment(inc)
 
+    def _page_get_v2(
+        self,
+        operation,
+        hash_values,
+        host_indices,
+        extra_info=None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
+    ):
+        """Use TransferView-based v2 interface for prefetch."""
+        transfer_ctx = self._build_transfer_context(
+            host_indices=host_indices,
+            auxiliary_transfers=auxiliary_transfers,
+        )
+        self.mem_pool_host.set_transfer_context(transfer_ctx)
+        try:
+            transfer_view = self.mem_pool_host.get_transfer_view(host_indices)
+            if extra_info is not None:
+                if extra_info.extra_info is None:
+                    extra_info.extra_info = {}
+                extra_info.extra_info.setdefault("page_entry_names", [])
+            results = self.storage_backend.batch_get_v2(
+                hash_values, transfer_view, extra_info
+            )
+            if extra_info is not None and extra_info.extra_info is not None:
+                operation.page_entry_names.extend(
+                    extra_info.extra_info.get("page_entry_names", [])
+                )
+        finally:
+            self.mem_pool_host.clear_transfer_context()
+        inc = 0
+        for i in range(len(hash_values)):
+            if not results[i]:
+                logger.warning(
+                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                )
+                break
+            inc += self.page_size
+        operation.increment(inc)
+
     # todo: deprecate
-    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+    def _generic_page_get(
+        self,
+        operation,
+        hash_values,
+        host_indices,
+        extra_info=None,
+        auxiliary_transfers=None,
+    ):
         dummy_page_dst = [
             self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
         ]
@@ -858,7 +1066,13 @@ class HiCacheController:
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            self.page_get_func(
+                operation,
+                batch_hashes,
+                batch_host_indices,
+                extra_info,
+                operation.auxiliary_transfers,
+            )
             # Check termination
             if (
                 operation.completed_tokens
@@ -959,7 +1173,7 @@ class HiCacheController:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
+                    logger.info(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
@@ -971,7 +1185,7 @@ class HiCacheController:
                         operation.host_indices[storage_hit_count:]
                     )
                     operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
+                    logger.info(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
                     self.prefetch_buffer.put(operation)
@@ -985,28 +1199,59 @@ class HiCacheController:
         token_ids: List[int],
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
     ) -> int:
         """
         Write KV caches from host memory to storage backend.
         """
         operation = StorageOperation(
-            host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
+            host_indices,
+            token_ids,
+            hash_value=hash_value,
+            prefix_keys=prefix_keys,
+            auxiliary_transfers=auxiliary_transfers,
         )
         self.backup_queue.put(operation)
         return operation.id
 
     # todo: deprecate
-    def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
+    def _generic_page_set(
+        self, hash_values, host_indices, extra_info=None, auxiliary_transfers=None
+    ) -> bool:
         data = [
             self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
-    def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
+    def _page_set_zero_copy(
+        self, hash_values, host_indices, extra_info=None, auxiliary_transfers=None
+    ) -> bool:
         return all(
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
+
+    def _page_set_v2(
+        self,
+        hash_values,
+        host_indices,
+        extra_info=None,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]] = None,
+    ) -> bool:
+        """Use TransferView-based v2 interface for backup."""
+        transfer_ctx = self._build_transfer_context(
+            host_indices=host_indices,
+            auxiliary_transfers=auxiliary_transfers,
+        )
+        self.mem_pool_host.set_transfer_context(transfer_ctx)
+        try:
+            transfer_view = self.mem_pool_host.get_transfer_view(host_indices)
+            results = self.storage_backend.batch_set_v2(
+                hash_values, transfer_view, extra_info
+            )
+        finally:
+            self.mem_pool_host.clear_transfer_context()
+        return all(results)
 
     # Backup batch by batch
     def _page_backup(self, operation):
@@ -1020,7 +1265,12 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = self.page_set_func(
+                batch_hashes,
+                batch_host_indices,
+                extra_info,
+                operation.auxiliary_transfers,
+            )
             if not success:
                 logger.warning(
                     f"Write page to storage: {len(batch_hashes)} pages failed."
