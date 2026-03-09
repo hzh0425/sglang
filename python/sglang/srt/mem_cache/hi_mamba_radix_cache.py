@@ -450,6 +450,7 @@ class HiMambaRadixCache(MambaRadixCache):
             for load_node in nodes_to_load:
                 if load_node.mamba_host_value is None:
                     continue
+                need_host_load = load_node.mamba_value is None
                 if load_node.mamba_value is None:
                     needed = len(load_node.mamba_host_value)
                     if self.req_to_token_pool.mamba_pool.available_size() < needed:
@@ -466,8 +467,23 @@ class HiMambaRadixCache(MambaRadixCache):
                     self.mamba_lru_list.reset_node_mru(load_node)
                 if self.mamba_host_lru_list.in_list(load_node):
                     self.mamba_host_lru_list.reset_node_mru(load_node)
-                mamba_host_indices.append(load_node.mamba_host_value)
-                mamba_device_indices.append(load_node.mamba_value)
+                if load_node.mamba_value is None:
+                    raise RuntimeError(
+                        f"Missing mamba device index when loading host node {load_node.id}"
+                    )
+                # Only restore host-side mamba state for nodes that do not already
+                # have a live device-side mamba slot. If the slot is already on
+                # device, the state remains authoritative there and should not be
+                # reloaded through the controller.
+                if len(load_node.mamba_value) != len(load_node.mamba_host_value):
+                    raise RuntimeError(
+                        "Mamba load-back index length mismatch for node "
+                        f"{load_node.id}: host={len(load_node.mamba_host_value)} "
+                        f"device={len(load_node.mamba_value)}"
+                    )
+                if need_host_load:
+                    mamba_host_indices.append(load_node.mamba_host_value)
+                    mamba_device_indices.append(load_node.mamba_value)
             if not mamba_host_indices:
                 return None
             return [
