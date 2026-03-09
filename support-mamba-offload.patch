@@ -1,0 +1,601 @@
+diff --git a/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py b/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
+index 235dc8c900..6234eea9eb 100644
+--- a/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/hi_mamba_radix_cache.py
+@@ -20,12 +20,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
+     MatchResult,
+ )
+ from sglang.srt.mem_cache.mamba_radix_cache import (
++    LRUList,
+     MambaRadixCache,
+     TreeNode,
+     get_last_access_time,
+ )
+ from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
++from sglang.srt.mem_cache.memory_pool_host import MambaPoolHost, MHATokenToKVPoolHost
+ from sglang.srt.mem_cache.radix_cache import (
+     RadixKey,
+     compute_node_hash_values,
+@@ -40,6 +41,66 @@ if TYPE_CHECKING:
+ 
+ logger = logging.getLogger(__name__)
+ 
++class HostLRUList(LRUList):
++    def __init__(self, mamba: bool = True):
++        self.mamba = mamba
++        if self.mamba:
++            self.prv = "host_mamba_prev"
++            self.nxt = "host_mamba_next"
++            self.lock_ref = "host_mamba_lock_ref"
++        else:
++            self.prv = "host_prev"
++            self.nxt = "host_next"
++            self.lock_ref = "host_full_lock_ref"
++        self.head = TreeNode()
++        self.tail = TreeNode()
++        setattr(self.head, self.nxt, self.tail)
++        setattr(self.tail, self.prv, self.head)
++        self.cache = {}
++    def reset_node_mru(self, node):
++        assert node.id in self.cache, f"Resetting node {node.id=} not in lru list"
++        assert (
++            not self.mamba or node.mamba_host_value is not None
++        ), f"Resetting mamba tombstone node in mamba lru list: {node.id=}"
++        self._remove_node(node)
++        self._add_node(node)
++    def reset_node_and_parents_mru(self, node, root_node):
++        prev_node = self.head
++        while node != root_node:
++            if not self.mamba or node.mamba_host_value is not None:
++                assert (
++                    node.id in self.cache
++                ), f"Resetting node {node.id=} not in lru list when resetting node and parents mru"
++                self._remove_node(node)
++                self._add_node_after(prev_node, node)
++                prev_node = node
++            node = node.parent
++    def insert_mru(self, node):
++        assert (
++            not self.mamba or node.mamba_host_value is not None
++        ), f"Inserting mamba tombstone node in mamba lru list: {node.id=}"
++        assert (
++            node.id not in self.cache
++        ), f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
++        self.cache[node.id] = node
++        self._add_node(node)
++    def remove_node(self, node: TreeNode):
++        assert node.id in self.cache, f"Removing node {node.id=} not in lru list"
++        assert (
++            not self.mamba or node.mamba_host_value is not None
++        ), f"Removing mamba tombstone node from mamba lru list: {node.id=}"
++        del self.cache[node.id]
++        self._remove_node(node)
++    def sanity_check_evictable_size(self):
++        node = self.get_lru_no_lock()
++        evictable_size = 0
++        while self.in_list(node):
++            evictable_size += (
++                len(node.value) if not self.mamba else len(node.mamba_host_value)
++            )
++            node = self.get_prev_no_lock(node)
++        return evictable_size
++
+ 
+ class HiMambaRadixCache(MambaRadixCache):
+     """Hierarchical cache for hybrid Mamba models.
+@@ -71,12 +132,19 @@ class HiMambaRadixCache(MambaRadixCache):
+         self.full_kv_pool_host = MHATokenToKVPoolHost(
+             self.kvcache,
+             server_args.hicache_ratio,
+-            server_args.hicache_size,
++            server_args.hicache_size/2,
+             params.page_size,
+             server_args.hicache_mem_layout,
+             allocator_type=server_args.hicache_storage_backend,
+         )
+ 
++        self.mamba_pool_host = MambaPoolHost(
++            params.req_to_token_pool.mamba_pool,
++            server_args.hicache_ratio,
++            server_args.hicache_size / 2,
++            allocator_type=server_args.hicache_storage_backend,
++        )
++
+         self.tp_group = params.tp_cache_group
+         self.tp_world_size = (
+             1
+@@ -143,6 +211,9 @@ class HiMambaRadixCache(MambaRadixCache):
+         self.evictable_full_device_leaves: set[TreeNode] = set()
+         self.evictable_full_host_leaves: set[TreeNode] = set()
+ 
++        # Initialize mamba host LRU list to track nodes with mamba_host_value
++        self.mamba_host_lru_list = HostLRUList(mamba=True)
++
+         # Detach storage backend automatically on process shutdown
+         atexit.register(self.shutdown)
+ 
+@@ -156,9 +227,11 @@ class HiMambaRadixCache(MambaRadixCache):
+         self.ongoing_load_back = {}
+         self.ongoing_prefetch = {}
+         self.ongoing_backup = {}
++        self.mamba_pool_host.clear()
+         self.prefetch_loaded_tokens_by_reqid.clear()
+         self.evictable_full_device_leaves.clear()
+         self.evictable_full_host_leaves.clear()
++        self.mamba_host_lru_list = HostLRUList(mamba=True)
+         super().reset()
+ 
+     def write_backup(self, node: TreeNode, write_back=False):
+@@ -414,6 +487,7 @@ class HiMambaRadixCache(MambaRadixCache):
+     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
+         """Remove a tombstone leaf from the tree and free HiCache resources."""
+         assert node.mamba_value is None, f"node has mamba value, {node.id=}"
++        assert node.mamba_host_value is None, f"node has mamba host value, {node.id=}"
+         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
+         parent = node.parent
+         key = self.get_child_key_fn(node.key)
+@@ -444,6 +518,8 @@ class HiMambaRadixCache(MambaRadixCache):
+                 break
+             if node.parent.full_lock_ref > 0 or node.parent.mamba_lock_ref > 0:
+                 break
++            if node.parent.mamba_host_value is not None:
++                break
+ 
+             parent = node.parent
+ 
+@@ -534,6 +610,12 @@ class HiMambaRadixCache(MambaRadixCache):
+                 self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                 x.mamba_value = None
+ 
++            if x.mamba_host_value is not None:
++                assert self.mamba_host_lru_list.in_list(x)
++                self.mamba_host_lru_list.remove_node(x)
++                self.mamba_pool_host.free(x.mamba_host_value)
++                x.mamba_host_value = None
++
+             self.evictable_full_host_leaves.discard(x)
+ 
+             parent = x.parent
+@@ -545,6 +627,25 @@ class HiMambaRadixCache(MambaRadixCache):
+             if parent in self.evictable_full_host_leaves:
+                 heapq.heappush(heap, (parent.last_access_time, parent))
+ 
++    def evict_mamba_host(self, num_mamba_hosts: int) -> int:
++        if self.disable or num_mamba_hosts <= 0:
++            return 0
++        x = self.mamba_host_lru_list.get_lru_no_lock()
++        num_evicted = 0
++        while num_evicted < num_mamba_hosts and self.mamba_host_lru_list.in_list(x):
++            if x.host_ref_counter > 0:
++                continue
++            assert x.mamba_host_value is not None
++            x_next = self.mamba_host_lru_list.get_prev_no_lock(x)
++            assert self.mamba_host_lru_list.in_list(x)
++            self.mamba_host_lru_list.remove_node(x)
++            self.mamba_pool_host.free(x.mamba_host_value)
++            x.mamba_host_value = None
++            num_evicted += 1
++            # TODO: _iteratively_delete_tombstone_leaf
++            x = x_next
++        return num_evicted
++
+     def evict_mamba(self, mamba_num: int) -> int:
+         if self.disable or mamba_num <= 0:
+             return 0
+@@ -556,7 +657,26 @@ class HiMambaRadixCache(MambaRadixCache):
+             assert x != self.root_node, f"root node is not evictable, {x.id=}"
+             assert x.mamba_lock_ref == 0, f"node is in use, {x.id=}"
+ 
++            # Store mamba to host
++            start_time = time.monotonic()
++            if self.mamba_pool_host.available_size() < 1:
++                self.evict_mamba_host(1)
++            if x.mamba_host_value is None and self.mamba_pool_host.available_size() > 0:
++                assert len(x.mamba_value) == 1
++                host_indices = self.mamba_pool_host.alloc(1)
++                assert host_indices is not None
++                self.mamba_pool_host.backup_from_device_all_layer(
++                    self.req_to_token_pool.mamba_pool,
++                    host_indices,
++                    x.mamba_value,
++                )
++                x.mamba_host_value = host_indices
++                assert not self.mamba_host_lru_list.in_list(x)
++                self.mamba_host_lru_list.insert_mru(x)
++                logger.info(f"store mamba to device {time.monotonic() - start_time}")
++
+             if x.evicted:
++                assert x.backuped
+                 self.req_to_token_pool.mamba_pool.free(x.mamba_value)
+                 mamba_num_evicted += len(x.mamba_value)
+                 x_next = self.mamba_lru_list.get_prev_no_lock(x)
+@@ -564,7 +684,7 @@ class HiMambaRadixCache(MambaRadixCache):
+                 self.mamba_evictable_size_ -= len(x.mamba_value)
+                 x.mamba_value = None
+ 
+-                if len(x.children) == 0:
++                if len(x.children) == 0 and x.mamba_host_value is None:
+                     self._delete_tombstone_leaf(x)
+                     _, _, cascade_mamba = self._iteratively_delete_tombstone_leaf(x)
+                     mamba_num_evicted += cascade_mamba
+@@ -596,23 +716,31 @@ class HiMambaRadixCache(MambaRadixCache):
+                 self.mamba_lru_list.remove_node(x)
+                 self.mamba_evictable_size_ -= len(x.mamba_value)
+ 
+-                if x.backuped:
+-                    self.cache_controller.evict_host(x.host_value)
+-                    x.host_value = None
++                # if x.backuped:
++                #     self.cache_controller.evict_host(x.host_value)
++                #     x.host_value = None
+ 
+                 x.value = None
+                 x.mamba_value = None
+ 
+                 self._discard_from_leaf_sets(x)
+ 
+-                parent = x.parent
+-                child_key = self.get_child_key_fn(x.key)
+-                v = parent.children.pop(child_key, None)
+-                assert v == x, f"parent does not have child key, {x.id=}"
++                if not (x.backuped and x.mamba_host_value is not None):
++                    if x.backuped:
++                        self.cache_controller.evict_host(x.host_value)
++                        x.host_value = None
++                    if x.mamba_host_value is not None:
++                        self.mamba_pool_host.free(x.mamba_host_value)
++                        x.mamba_host_value = None
+ 
+-                self._update_leaf_status(parent)
+-                _, _, cascade_mamba = self._iteratively_delete_tombstone_leaf(x)
+-                mamba_num_evicted += cascade_mamba
++                    parent = x.parent
++                    child_key = self.get_child_key_fn(x.key)
++                    v = parent.children.pop(child_key, None)
++                    assert v == x, f"parent does not have child key, {x.id=}"
++
++                    self._update_leaf_status(parent)
++                    _, _, cascade_mamba = self._iteratively_delete_tombstone_leaf(x)
++                    mamba_num_evicted += cascade_mamba
+ 
+                 if not self.mamba_lru_list.in_list(x_next):
+                     x_next = self.mamba_lru_list.get_lru_no_lock()
+@@ -770,13 +898,20 @@ class HiMambaRadixCache(MambaRadixCache):
+         best_value_len = 0
+         best_last_node = node
+ 
++        mamba_available_size = (
++            self.mamba_evictable_size()
++            + self.req_to_token_pool.mamba_pool.available_size()
++        )
++
+         while len(key) > 0 and child_key in node.children.keys():
+             child = node.children[child_key]
+ 
+             if child.evicted and not child.backuped:
+                 break
+ 
+-            if node.mamba_value is not None:
++            if node.mamba_value is not None or (
++                node.mamba_host_value is not None and mamba_available_size > 0
++            ):
+                 best_value_len = len(value)
+                 best_last_node = node
+ 
+@@ -795,10 +930,34 @@ class HiMambaRadixCache(MambaRadixCache):
+                 if len(key):
+                     child_key = self.get_child_key_fn(key)
+ 
+-        if node.mamba_value is not None:
++        if node.mamba_value is not None  or (
++            node.mamba_host_value is not None and mamba_available_size > 0
++        ):
+             best_value_len = len(value)
+             best_last_node = node
+ 
++        # Load mamba to device for _match_post_processor
++        if best_last_node.mamba_value is None and best_last_node != self.root_node:
++            assert best_last_node.mamba_host_value is not None
++            assert len(best_last_node.mamba_host_value) == 1
++            assert mamba_available_size > 0
++            self.mamba_host_lru_list.reset_node_mru(best_last_node)
++            start_time = time.monotonic()
++            if self.req_to_token_pool.mamba_pool.available_size() < 1:
++                self.evict_mamba(1)
++            device_indices = self.req_to_token_pool.mamba_pool.alloc(1)
++            assert device_indices is not None
++            self.mamba_pool_host.load_to_device_all_layer(
++                self.req_to_token_pool.mamba_pool,
++                best_last_node.mamba_host_value,
++                device_indices,
++            )
++            best_last_node.mamba_value = device_indices
++            assert not self.mamba_lru_list.in_list(best_last_node)
++            self.mamba_lru_list.insert_mru(best_last_node)
++            self.mamba_evictable_size_ += len(best_last_node.mamba_value)
++            logger.info(f"load mamba to device {time.monotonic() - start_time}")
++
+         deepest_node = node
+         return value, best_last_node, best_value_len, deepest_node
+ 
+@@ -987,6 +1146,13 @@ class HiMambaRadixCache(MambaRadixCache):
+         if self.ongoing_load_back or self.ongoing_write_through:
+             return
+         super().sanity_check()
++        assert (
++            self.mamba_host_evictable_size() + self.mamba_pool_host.available_size()
++            == self.mamba_pool_host.size
++        )
++
++    def mamba_host_evictable_size(self) -> int:
++        return len(self.mamba_host_lru_list.cache)
+ 
+     def inc_lock_ref(self, node: TreeNode) -> Optional[int]:
+         if self.disable:
+diff --git a/python/sglang/srt/mem_cache/mamba_radix_cache.py b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+index 93ebd07a1a..a05ff35f39 100644
+--- a/python/sglang/srt/mem_cache/mamba_radix_cache.py
++++ b/python/sglang/srt/mem_cache/mamba_radix_cache.py
+@@ -87,7 +87,8 @@ class TreeNode:
+         self.host_value = None
+         # store hash values of each pages
+         self.hash_value: Optional[List[str]] = None
+-
++        # store the host indices of Mamba states
++        self.mamba_host_value = None
+         # for lru list, invariant:
+         # 1. prev has greater last_access_time
+         # 2. next has smaller last_access_time
+@@ -95,7 +96,8 @@ class TreeNode:
+         self.next = None
+         self.mamba_prev = None
+         self.mamba_next = None
+-
++        self.host_full_lock_ref = 0
++        self.host_mamba_lock_ref = 0
+         self.id = TreeNode.counter if id is None else id
+         TreeNode.counter += 1
+ 
+diff --git a/python/sglang/srt/mem_cache/memory_pool_host.py b/python/sglang/srt/mem_cache/memory_pool_host.py
+index 0b8199d9f7..1c9b212472 100644
+--- a/python/sglang/srt/mem_cache/memory_pool_host.py
++++ b/python/sglang/srt/mem_cache/memory_pool_host.py
+@@ -7,7 +7,7 @@ from typing import Optional
+ 
+ import psutil
+ import torch
+-
++import numpy as np
+ from sglang.jit_kernel.hicache import (
+     can_use_hicache_jit_kernel,
+ )
+@@ -18,6 +18,7 @@ from sglang.jit_kernel.hicache import (
+     transfer_hicache_one_layer as jit_transfer_hicache_one_layer,
+ )
+ from sglang.srt.mem_cache.memory_pool import (
++    MambaPool,
+     KVCache,
+     MHATokenToKVPool,
+     MLATokenToKVPool,
+@@ -1236,3 +1237,220 @@ class NSATokenToKVPoolHost(MLATokenToKVPoolHost):
+         self._backup_indexer_from_device_all_layer(
+             device_pool, host_indices, device_indices, io_backend
+         )
++
++class MambaPoolHost:
++    def __init__(
++        self,
++        device_pool: MambaPool,
++        host_to_device_ratio: float,
++        host_size: int,
++        pin_memory: bool = True,
++        device: str = "cpu",
++        allocator_type: str = "default",
++    ):
++        self.device_pool = device_pool
++        self.page_size = 1
++        self.pin_memory = pin_memory
++        self.device = device
++        self.allocator = get_allocator_from_storage(allocator_type)
++        self.num_mamba_layers = device_pool.num_mamba_layers
++        # Store the actual shape for each conv state since they may differ
++        self.conv_state_shapes = [
++            conv_state.shape[2:] for conv_state in device_pool.mamba_cache.conv
++        ]
++        self.temporal_state_shape = device_pool.mamba_cache.temporal.shape[2:]
++        self.conv_dtype = device_pool.mamba_cache.conv[0].dtype
++        self.temporal_dtype = device_pool.mamba_cache.temporal.dtype
++        self.dtype = self.conv_dtype
++        self.size_per_token = self.get_size_per_token()
++        if host_size > 0:
++            self.size = int(host_size * 1e9 // self.size_per_token)
++        else:
++            self.size = int(device_pool.size * host_to_device_ratio)
++        self.page_num = self.size // self.page_size + 1
++        self.size = self.page_num * self.page_size
++        assert (
++            self.size > device_pool.size
++        ), "The host memory should be larger than the device memory with the current protocol"
++        host_mem = psutil.virtual_memory()
++        requested_bytes = self.size * self.size_per_token
++        ten_gb = 10 * (1024**3)
++        available_bytes = host_mem.available - ten_gb
++        if requested_bytes > available_bytes:
++            raise ValueError(
++                f"Not enough host memory available. Requesting "
++                f"{requested_bytes / 1e9:.2f} GB but only have "
++                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
++                f"size of the hierarchical cache."
++            )
++        else:
++            logger.info(
++                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical Mamba cache."
++            )
++        self.init_kv_buffer()
++        self.lock = threading.RLock()
++        self.clear()
++    def init_kv_buffer(self):
++        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
++        temporal_dims = (
++            self.num_mamba_layers,
++            self.size,
++        ) + self.temporal_state_shape
++        self.temporal_buffer = alloc_func(
++            temporal_dims,
++            dtype=self.temporal_dtype,
++            device=self.device,
++            pin_memory=self.pin_memory,
++            allocator=self.allocator,
++        )
++        num_conv_states = len(self.conv_state_shapes)
++        self.conv_buffer = []
++        for i in range(num_conv_states):
++            actual_conv_shape = self.conv_state_shapes[i]
++            conv_dim_single = (self.num_mamba_layers, self.size) + actual_conv_shape
++            conv_buf = alloc_func(
++                conv_dim_single,
++                dtype=self.conv_dtype,
++                device=self.device,
++                pin_memory=self.pin_memory,
++                allocator=self.allocator,
++            )
++            self.conv_buffer.append(conv_buf)
++    @synchronized
++    def clear(self):
++        self.mem_state = torch.zeros(
++            (self.size,), dtype=torch.uint8, device=self.device
++        )
++        self.free_slots = torch.arange(self.size, dtype=torch.int64)
++    def available_size(self):
++        return len(self.free_slots)
++    @synchronized
++    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
++        assert (
++            need_size % self.page_size == 0
++        ), "The requested size should be a multiple of the page size."
++        if need_size > self.available_size():
++            return None
++        select_index = self.free_slots[:need_size]
++        self.free_slots = self.free_slots[need_size:]
++        return select_index
++    @synchronized
++    def free(self, indices: torch.Tensor) -> int:
++        self.free_slots = torch.cat([self.free_slots, indices])
++        return len(indices)
++    def get_size_per_token(self):
++        conv_total_size = 0
++        for conv_shape in self.conv_state_shapes:
++            conv_size_per_layer = np.prod(conv_shape) * self.conv_dtype.itemsize
++            conv_total_size += conv_size_per_layer
++        temporal_size_per_layer = (
++            np.prod(self.temporal_state_shape) * self.temporal_dtype.itemsize
++        )
++        size_per_layer = conv_total_size + temporal_size_per_layer
++        return size_per_layer * self.num_mamba_layers
++    def load_to_device_per_layer(
++        self, device_pool, host_indices, device_indices, layer_id, io_backend=None
++    ):
++        for conv_idx in range(len(device_pool.mamba_cache.conv)):
++            src = self.conv_buffer[conv_idx][layer_id, host_indices].to(
++                device_pool.device
++            )
++            device_pool.mamba_cache.conv[conv_idx][layer_id, device_indices] = src
++        src = self.temporal_buffer[layer_id, host_indices].to(device_pool.device)
++        device_pool.mamba_cache.temporal[layer_id, device_indices] = src
++    def load_to_device_all_layer(
++        self, device_pool, host_indices, device_indices, io_backend=None
++    ):
++        assert len(host_indices) == 1
++        assert len(device_indices) == 1
++        device_idx = device_indices[0].item()
++        host_idx = host_indices[0].item()
++        for layer_id in range(self.num_mamba_layers):
++            for conv_idx, (device_conv_state, host_conv_state) in enumerate(
++                zip(device_pool.mamba_cache.conv, self.conv_buffer)
++            ):
++                device_conv_state[layer_id, device_idx].copy_(
++                    host_conv_state[layer_id, host_idx], non_blocking=True
++                )
++            device_pool.mamba_cache.temporal[layer_id, device_idx].copy_(
++                self.temporal_buffer[layer_id, host_idx], non_blocking=True
++            )
++        torch.cuda.current_stream().synchronize()
++    def backup_from_device_all_layer(
++        self, device_pool, host_indices, device_indices, io_backend=None
++    ):
++        assert len(host_indices) == 1
++        assert len(device_indices) == 1
++        device_idx = device_indices[0].item()
++        host_idx = host_indices[0].item()
++        for layer_id in range(self.num_mamba_layers):
++            for conv_idx, (device_conv_state, host_conv_state) in enumerate(
++                zip(device_pool.mamba_cache.conv, self.conv_buffer)
++            ):
++                host_conv_state[layer_id, host_idx].copy_(
++                    device_conv_state[layer_id, device_idx], non_blocking=True
++                )
++            self.temporal_buffer[layer_id, host_idx].copy_(
++                device_pool.mamba_cache.temporal[layer_id, device_idx],
++                non_blocking=True,
++            )
++        torch.cuda.current_stream().synchronize()
++    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
++        temporal_page = self.temporal_buffer[:, index : index + self.page_size]
++        conv_pages = [
++            conv_buf[:, index : index + self.page_size] for conv_buf in self.conv_buffer
++        ]
++        flattened_tensors = [temporal_page.flatten()] + [
++            conv_page.flatten() for conv_page in conv_pages
++        ]
++        data_page = torch.cat(flattened_tensors, dim=0)
++        data_page = data_page.flatten()
++        return data_page
++    def get_dummy_flat_data_page(self) -> torch.Tensor:
++        num_conv_states = len(self.device_pool.mamba_cache.conv)
++        temporal_dummy = torch.zeros(
++            (self.num_mamba_layers, self.page_size) + self.temporal_state_shape,
++            dtype=self.temporal_dtype,
++            device=self.device,
++            pin_memory=self.pin_memory,
++        )
++        conv_dummies = [
++            torch.zeros(
++                (self.num_mamba_layers, self.page_size) + self.conv_state_shapes[i],
++                dtype=self.conv_dtype,
++                device=self.device,
++                pin_memory=self.pin_memory,
++            )
++            for i in range(num_conv_states)
++        ]
++        flattened_tensors = [temporal_dummy.flatten()] + [
++            conv_dummy.flatten() for conv_dummy in conv_dummies
++        ]
++        dummy_page = torch.cat(flattened_tensors, dim=0)
++        dummy_page = dummy_page.flatten()
++        return dummy_page
++    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
++        num_conv_states = len(self.device_pool.mamba_cache.conv)
++        temporal_elements = (
++            self.num_mamba_layers * self.page_size * np.prod(self.temporal_state_shape)
++        )
++        temporal_flat = data_page[:temporal_elements]
++        conv_flats = []
++        start_idx = temporal_elements
++        for i in range(num_conv_states):
++            conv_elements = (
++                self.num_mamba_layers
++                * self.page_size
++                * np.prod(self.conv_state_shapes[i])
++            )
++            conv_flats.append(data_page[start_idx : start_idx + conv_elements])
++            start_idx += conv_elements
++        temporal_reshaped = temporal_flat.reshape(
++            (self.num_mamba_layers, self.page_size) + self.temporal_state_shape
++        )
++        self.temporal_buffer[:, index : index + self.page_size] = temporal_reshaped
++        for i, conv_flat in enumerate(conv_flats):
++            conv_reshaped = conv_flat.reshape(
++                (self.num_mamba_layers, self.page_size) + self.conv_state_shapes[i]
++            )
++            self.conv_buffer[i][:, index : index + self.page_size] = conv_reshaped

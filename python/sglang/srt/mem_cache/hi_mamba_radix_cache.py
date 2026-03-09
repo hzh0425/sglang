@@ -339,6 +339,7 @@ class HiMambaRadixCache(MambaRadixCache):
                         name="mamba",
                         host_indices=node.mamba_host_value,
                         page_ordinals=[len(node.host_value) // self.page_size - 1],
+                        hit_policy="last_page",
                     )
                 ]
                 if node.mamba_host_value is not None and len(node.host_value) > 0
@@ -1066,24 +1067,6 @@ class HiMambaRadixCache(MambaRadixCache):
         ):
             best_value_len = len(value)
             best_last_node = node
-
-        if best_last_node.mamba_value is None and best_last_node != self.root_node:
-            assert best_last_node.mamba_host_value is not None
-            if self.req_to_token_pool.mamba_pool.available_size() < 1:
-                self.evict_mamba(1)
-            device_indices = self.req_to_token_pool.mamba_pool.alloc(1)
-            assert device_indices is not None
-            self.mamba_pool_host.load_to_device_all_layer(
-                self.req_to_token_pool.mamba_pool,
-                best_last_node.mamba_host_value,
-                device_indices,
-                self.cache_controller.io_backend,
-            )
-            best_last_node.mamba_value = device_indices
-            self.mamba_lru_list.insert_mru(best_last_node)
-            self.mamba_evictable_size_ += len(device_indices)
-            if self.mamba_host_lru_list.in_list(best_last_node):
-                self.mamba_host_lru_list.reset_node_mru(best_last_node)
 
         deepest_node = node
         return value, best_last_node, best_value_len, deepest_node
@@ -1846,6 +1829,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     name="mamba",
                     host_indices=mamba_host_index,
                     page_ordinals=[prefetch_length // self.page_size - 1],
+                    hit_policy="last_page",
                 )
             ]
             logger.info(
@@ -2028,6 +2012,7 @@ class HiMambaRadixCache(MambaRadixCache):
                     name="mamba",
                     host_indices=final_mamba_node.mamba_host_value,
                     page_ordinals=[len(final_mamba_node.host_value) // self.page_size - 1],
+                    hit_policy="last_page",
                 )
             ]
             if not self.mamba_host_lru_list.in_list(final_mamba_node):

@@ -104,6 +104,7 @@ class AuxiliaryTransfer:
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     page_ordinals: Optional[list[int]] = None
+    hit_policy: str = "all_pages"
 
 
 class CacheOperation:
@@ -166,8 +167,14 @@ class CacheOperation:
                         "device_indices": [],
                         "page_ordinals": [],
                         "has_page_ordinals": False,
+                        "hit_policy": transfer.hit_policy,
                     },
                 )
+                if merged["hit_policy"] != transfer.hit_policy:
+                    raise ValueError(
+                        f"Conflicting hit policies for auxiliary transfer {transfer.name}: "
+                        f"{merged['hit_policy']} vs {transfer.hit_policy}"
+                    )
                 if transfer.host_indices is not None:
                     merged["host_indices"].append(transfer.host_indices)
                 if transfer.device_indices is not None:
@@ -196,6 +203,7 @@ class CacheOperation:
                     page_ordinals=(
                         merged["page_ordinals"] if merged["has_page_ordinals"] else None
                     ),
+                    hit_policy=merged["hit_policy"],
                 )
             )
         return merged_transfers
@@ -762,6 +770,50 @@ class HiCacheController:
                 ctx["entries"] = entries
         return ctx or None
 
+    def _build_auxiliary_hit_requirements(
+        self,
+        auxiliary_transfers: Optional[list[AuxiliaryTransfer]],
+        batch_start_page: int,
+        batch_page_count: int,
+        total_page_count: int,
+    ) -> Optional[list[dict[str, Any]]]:
+        if not auxiliary_transfers:
+            return None
+
+        requirements = []
+        batch_end_page = batch_start_page + batch_page_count
+        for transfer in auxiliary_transfers:
+            policy = transfer.hit_policy
+            entry: dict[str, Any] = {"name": transfer.name, "policy": policy}
+            if policy == "all_pages":
+                requirements.append(entry)
+                continue
+
+            if policy == "last_page":
+                absolute_pages = (
+                    [int(x) for x in transfer.page_ordinals]
+                    if transfer.page_ordinals is not None
+                    else [total_page_count - 1]
+                )
+            elif policy == "explicit_pages":
+                if transfer.page_ordinals is None:
+                    continue
+                absolute_pages = [int(x) for x in transfer.page_ordinals]
+            else:
+                raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
+
+            local_pages = [
+                page - batch_start_page
+                for page in absolute_pages
+                if batch_start_page <= page < batch_end_page
+            ]
+            if not local_pages:
+                continue
+            entry["page_ordinals"] = local_pages
+            requirements.append(entry)
+
+        return requirements or None
+
     def write(
         self,
         device_indices: torch.Tensor,
@@ -1118,6 +1170,7 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
+        total_page_count = len(tokens_to_fetch) // self.page_size
 
         for start in range(
             0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
@@ -1132,7 +1185,16 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            batch_start_page = start // self.page_size
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys, extra_info={})
+            auxiliary_requirements = self._build_auxiliary_hit_requirements(
+                operation.auxiliary_transfers,
+                batch_start_page=batch_start_page,
+                batch_page_count=len(batch_hashes),
+                total_page_count=total_page_count,
+            )
+            if auxiliary_requirements:
+                extra_info.extra_info["auxiliary_hit_requirements"] = auxiliary_requirements
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size

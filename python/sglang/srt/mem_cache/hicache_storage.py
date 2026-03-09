@@ -261,8 +261,29 @@ class HiCacheStorage(ABC):
         return the number of consecutive existing keys from the start.
         Can be overridden by subclasses for more efficient implementation.
         """
+        auxiliary_requirements = []
+        if extra_info is not None and extra_info.extra_info is not None:
+            auxiliary_requirements = extra_info.extra_info.get(
+                "auxiliary_hit_requirements", []
+            )
+
+        def auxiliary_hit_satisfied(key: str, page_ordinal: int) -> bool:
+            for requirement in auxiliary_requirements:
+                name = requirement["name"]
+                policy = requirement.get("policy", "all_pages")
+                if policy == "all_pages":
+                    if not self.exists(f"{key}.{name}"):
+                        return False
+                elif policy in ("last_page", "explicit_pages"):
+                    required_pages = {int(x) for x in requirement.get("page_ordinals", [])}
+                    if page_ordinal in required_pages and not self.exists(f"{key}.{name}"):
+                        return False
+                else:
+                    raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
+            return True
+
         for i in range(len(keys)):
-            if not self.exists(keys[i]):
+            if not self.exists(keys[i]) or not auxiliary_hit_satisfied(keys[i], i):
                 return i
         return len(keys)
 
