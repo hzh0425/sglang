@@ -1,3 +1,5 @@
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -24,6 +26,15 @@ QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 ACC_THRESHOLDS = {
     QWEN3_NEXT_MODEL: {"kl_div": 0.0025, "gsm8k": 0.93},
 }
+
+
+def flush_cache(base_url) -> bool:
+    """Flush device cache to force remote storage access"""
+    try:
+        response = requests.post(f"{base_url}/flush_cache", timeout=10)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
 
 
 def send_request_helper(base_url: str, text: str):
@@ -124,6 +135,88 @@ class TestQwen3Next(CustomTestCase):
                     cached_tokens == 0
                 ), f"{i=}, {cache_hit=}, {cached_tokens=} is not 0"
         print("test_prefix_cache_branching passed")
+
+
+class TestQwen3NextWithHiCache(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = QWEN3_NEXT_MODEL
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.storage_dir = tempfile.mkdtemp(prefix="qwen3-next-hicache-")
+        env = {
+            "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_dir,
+        }
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env=env,
+            other_args=[
+                "--tp",
+                "2",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--page-size",
+                "64",
+                "--max-total-tokens",
+                "131072",
+                "--max-mamba-cache-size",
+                "600",
+                "--hicache-mem-layout",
+                "page_first_direct",
+                "--enable-hierarchical-cache",
+                "--hicache-ratio",
+                "2",
+                "--hicache-size",
+                "0",
+                "--hicache-write-policy",
+                "write_through",
+                "--hicache-storage-backend",
+                "file",
+                "--hicache-storage-prefetch-policy",
+                "wait_complete",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        shutil.rmtree(cls.storage_dir, ignore_errors=True)
+
+    def _run_gsm8k(self):
+        args = SimpleNamespace(
+            num_shots=5,
+            data_path=None,
+            num_questions=100,
+            max_new_tokens=512,
+            parallel=10,
+            host="http://127.0.0.1",
+            port=int(self.base_url.split(":")[-1]),
+        )
+        return run_eval(args)
+
+    def test_gsm8k(self):
+        first_metrics = self._run_gsm8k()
+        print(f"first_metrics={first_metrics}")
+        self.assertGreaterEqual(
+            first_metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+
+        print(f"flush cache")
+        assert flush_cache(self.base_url)
+
+        second_metrics = self._run_gsm8k()
+        print(f"second_metrics={second_metrics}")
+        self.assertGreaterEqual(
+            second_metrics["accuracy"], ACC_THRESHOLDS[self.model]["gsm8k"]
+        )
+        self.assertLessEqual(
+            abs(second_metrics["accuracy"] - first_metrics["accuracy"]),
+            0.05,
+            f"HiCache prefetch accuracy drift too large: "
+            f"first={first_metrics['accuracy']}, second={second_metrics['accuracy']}",
+        )
 
 
 if __name__ == "__main__":
