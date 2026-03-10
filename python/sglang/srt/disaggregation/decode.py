@@ -919,6 +919,10 @@ class DecodeTransferQueue:
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
+                if self.scheduler.enable_hisparse:
+                    self.scheduler.hisparse_coordinator.request_finished(
+                        decode_req.req
+                    )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
@@ -934,6 +938,10 @@ class DecodeTransferQueue:
                         self.scheduler.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
+                        if self.scheduler.enable_hisparse:
+                            self.scheduler.hisparse_coordinator.request_finished(
+                                decode_req.req
+                            )
                         release_kv_cache(
                             decode_req.req, self.tree_cache, is_insert=False
                         )
@@ -1056,6 +1064,8 @@ class SchedulerDisaggregationDecodeMixin:
                 else:
                     # merge running_batch with prefill batch
                     self.running_batch.merge_batch(last_batch)
+                if self.enable_hisparse:
+                    self.running_batch.hisparse_coordinator = self.hisparse_coordinator
 
         new_prebuilt_batch = self.get_new_prebuilt_batch()
 
@@ -1074,6 +1084,9 @@ class SchedulerDisaggregationDecodeMixin:
         # 3. prebuilt + None -> None (None forward, prebuilt returns) + None
         # 4. prebuilt + decode + None -> idle (idle forward, prebuilt returns) + decode + idle
         ret = self.maybe_prepare_mlp_sync_batch(ret)
+
+        if ret is not None and self.enable_hisparse:
+            ret.hisparse_coordinator = self.hisparse_coordinator
 
         if ret:
             trace_event_batch("schedule", ret.reqs)
@@ -1128,6 +1141,8 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
+        if self.enable_hisparse:
+            new_batch.hisparse_coordinator = self.hisparse_coordinator
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
 
@@ -1139,7 +1154,11 @@ class SchedulerDisaggregationDecodeMixin:
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
-        self.waiting_queue.extend(resumed_reqs)
+        if self.enable_hisparse:
+            for req in resumed_reqs:
+                self.hisparse_coordinator.admit_request_into_staging(req)
+        else:
+            self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
             return
@@ -1158,4 +1177,11 @@ class SchedulerDisaggregationDecodeMixin:
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
-            self.waiting_queue.extend(transferred_reqs)
+            if self.enable_hisparse:
+                for req in transferred_reqs:
+                    self.hisparse_coordinator.admit_request_into_staging(req)
+            else:
+                self.waiting_queue.extend(transferred_reqs)
+
+        if self.enable_hisparse:
+            self.waiting_queue.extend(self.hisparse_coordinator.collect_ready_reqs())

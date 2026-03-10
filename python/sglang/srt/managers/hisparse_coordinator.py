@@ -228,6 +228,33 @@ class HiSparseCoordinator:
             req.batch = None
         return ready_batch
 
+    def collect_ready_reqs(self) -> List[Req]:
+        ready_reqs: List[Req] = []
+        if len(self.ack_staging_queue) == 0:
+            return ready_reqs
+
+        finish_count = 0
+        for _, finish_event, _ in self.ack_staging_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        finish_count = int(queue_size.item())
+        while finish_count > 0:
+            _, _, req = self.ack_staging_queue.pop(0)
+            self.alloc_device_buffer(req)
+            req.staging = False
+            ready_reqs.append(req)
+            req.batch = None
+            finish_count -= 1
+        return ready_reqs
+
     def map_last_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
