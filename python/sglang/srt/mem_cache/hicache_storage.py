@@ -3,7 +3,7 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Set
 
 import torch
 
@@ -64,6 +64,48 @@ class HiCacheStorageExtraInfo:
     extra_info: Optional[dict] = None
 
 
+@dataclass
+class PoolTransfer:
+    """Unified per-pool transfer descriptor.
+
+    device<->host path : host_indices + device_indices  (keys ignored)
+    host<->storage path: host_indices + keys            (device_indices ignored;
+                          keys=None means all KV pages, list means specific pages)
+    """
+
+    name: str
+    host_indices: Optional[torch.Tensor] = None
+    device_indices: Optional[torch.Tensor] = None
+    keys: Optional[List[str]] = None
+
+
+@dataclass
+class PoolTransferResult:
+    """Tracks how many pages were successfully processed per pool.
+
+    kv_pages     : consecutive KV pages found / loaded / written.
+    pool_pages   : same count per extra pool (e.g. "mamba").
+                   Written only by actual load/write operations, NOT by the
+                   existence-check in _storage_hit_query, so callers can rely
+                   on it reflecting real success/failure.
+    """
+
+    kv_pages: int
+    pool_pages: dict[str, int]
+
+    @classmethod
+    def empty(cls) -> "PoolTransferResult":
+        return cls(0, {})
+
+    def update_kv_pages(self, kv_pages: int) -> None:
+        """Accumulate kv_pages across batches (max = last successful batch)."""
+        self.kv_pages = max(self.kv_pages, kv_pages)
+
+    def update_extra_pool_pages(self, results: dict[str, List[bool]]) -> None:
+        """Record actual load/write success counts per extra pool."""
+        self.pool_pages.update({name: sum(rs) for name, rs in results.items()})
+
+
 class HiCacheStorage(ABC):
     """
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
@@ -71,9 +113,37 @@ class HiCacheStorage(ABC):
     """
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
-
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        self.registered_pools[host_pool_name] = host_pool
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        auxiliary_constraints: List[dict[str, Any]],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        raise NotImplementedError(
+            "batch_exists_v2 must be implemented by each storage backend."
+        )
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        raise NotImplementedError()
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        raise NotImplementedError()
 
     def batch_get_v1(
         self,
@@ -202,13 +272,28 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix = f"_{model_name}"
         else:
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
-
         if not os.path.exists(self.file_path) and tp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
+        if component_name is None or component_name in ("__default__", "kv"):
+            return self._get_suffixed_key(key)
+        return self._get_suffixed_key(f"{key}.{component_name}")
+
+    def _get_component_path(
+        self, key: str, component_name: Optional[str] = None
+    ) -> str:
+        return os.path.join(
+            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
+        )
+
+    def _get_aux_component_names(self) -> list[str]:
+        registered_pools = getattr(self, "registered_pools", {})
+        return [name for name in registered_pools if name != "kv"]
 
     def get(
         self,
@@ -278,6 +363,264 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{key}.bin")
         return os.path.exists(tensor_path)
+
+    def _collect_existing_component_keys(
+        self,
+        keys: List[str],
+        auxiliary_constraints: Optional[List[dict[str, Any]]] = None,
+    ) -> Set[str]:
+        target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
+        for constraint in auxiliary_constraints or []:
+            component_name = constraint["pool_name"]
+            for key in keys:
+                target_files.add(f"{self._get_component_key(key, component_name)}.bin")
+
+        existing_files = set()
+        with os.scandir(self.file_path) as entries:
+            for entry in entries:
+                if entry.is_file() and entry.name in target_files:
+                    existing_files.add(entry.name)
+        return existing_files
+
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        existing_files = self._collect_existing_component_keys(keys)
+        for i, key in enumerate(keys):
+            if f"{self._get_component_key(key)}.bin" not in existing_files:
+                return i
+        return len(keys)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        auxiliary_constraints: List[dict[str, Any]],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> int:
+        existing_files = self._collect_existing_component_keys(
+            keys, auxiliary_constraints
+        )
+
+        def has_component(page_idx: int, component_name: str) -> bool:
+            return (
+                f"{self._get_component_key(keys[page_idx], component_name)}.bin"
+                in existing_files
+            )
+
+        full_hit_page_num = 0
+        while full_hit_page_num < len(keys):
+            if (
+                f"{self._get_component_key(keys[full_hit_page_num])}.bin"
+                not in existing_files
+            ):
+                break
+            full_hit_page_num += 1
+
+        final_hit_page_num = full_hit_page_num
+        auxiliary_boundaries: dict[str, int] = {}
+        hit_count_by_pool: dict[str, int] = (
+            {"kv": full_hit_page_num} if full_hit_page_num > 0 else {}
+        )
+        for constraint in auxiliary_constraints:
+            name = constraint["pool_name"]
+            policy = constraint.get("policy", "all_pages")
+            boundary = 0
+
+            if policy == "all_pages":
+                while boundary < full_hit_page_num and has_component(boundary, name):
+                    boundary += 1
+            elif policy == "trailing_pages":
+                trailing_pages = max(1, int(constraint.get("trailing_pages", 1)))
+                for prefix_len in range(full_hit_page_num, 0, -1):
+                    start = max(0, prefix_len - trailing_pages)
+                    if all(
+                        has_component(page_idx, name)
+                        for page_idx in range(start, prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            else:
+                raise ValueError(f"Unsupported auxiliary hit policy: {policy}")
+
+            auxiliary_boundaries[name] = boundary
+            if boundary > 0:
+                hit_count_by_pool[name] = boundary
+            final_hit_page_num = min(final_hit_page_num, boundary)
+            if final_hit_page_num == 0:
+                break
+
+        if auxiliary_constraints:
+            logger.info(
+                "HiCacheFile batch_exists_v2: full_hit_pages=%s final_hit_pages=%s aux_boundaries=%s first_key=%s last_key=%s",
+                full_hit_page_num,
+                final_hit_page_num,
+                auxiliary_boundaries,
+                keys[0] if keys else None,
+                (
+                    keys[min(final_hit_page_num, len(keys)) - 1]
+                    if final_hit_page_num > 0
+                    else None
+                ),
+            )
+
+        return PoolTransferResult(final_hit_page_num, hit_count_by_pool)
+
+    def _log_key(self, pool_name: str, key: str) -> str:
+        return key if pool_name == "kv" else f"{key}.{pool_name}"
+
+    def _read_page(
+        self, pool_name: str, key: str, host_pool, page_offset: int
+    ) -> bool:
+        """Read one page from storage into host_pool at page_offset."""
+        tensor_path = self._get_component_path(key, pool_name)
+        if not os.path.exists(tensor_path):
+            return False
+        try:
+            with open(tensor_path, "rb", buffering=0) as f:
+                file_data = f.read()
+            dummy_page = host_pool.get_dummy_flat_data_page()
+            expected_bytes = dummy_page.numel() * dummy_page.element_size()
+            if len(file_data) != expected_bytes:
+                logger.warning(
+                    "File size mismatch for %s: expected %s, got %s",
+                    self._log_key(pool_name, key),
+                    expected_bytes,
+                    len(file_data),
+                )
+                return False
+            data_page = (
+                torch.frombuffer(
+                    file_data, dtype=dummy_page.dtype, count=dummy_page.numel()
+                )
+                .clone()
+                .reshape(dummy_page.shape)
+            )
+            host_pool.set_from_flat_data_page(page_offset, data_page)
+            return True
+        except Exception as e:
+            logger.error("Failed to read key %s: %s", self._log_key(pool_name, key), e)
+            return False
+
+    def _write_page(
+        self, pool_name: str, key: str, host_pool, page_offset: int
+    ) -> bool:
+        """Write one page from host_pool at page_offset to storage as raw bytes. """
+        try:
+            data_page = host_pool.get_data_page(page_offset, flat=True)
+            data_bytes = (
+                data_page.contiguous().view(torch.uint8).reshape(-1).numpy().tobytes()
+            )
+            component_path = self._get_component_path(key, pool_name)
+            if os.path.exists(component_path):
+                existing_size = os.path.getsize(component_path)
+                if existing_size == len(data_bytes):
+                    return True  # same-size file → assume identical, skip write
+                logger.warning(
+                    "Overwriting stale storage entry for %s: expected %s bytes, got %s",
+                    self._log_key(pool_name, key),
+                    len(data_bytes),
+                    existing_size,
+                )
+            with open(component_path, "wb", buffering=0) as f:
+                f.write(data_bytes)
+            if pool_name != "kv":
+                logger.info(
+                    "HiCacheFile wrote auxiliary component %s for key %s",
+                    pool_name,
+                    key,
+                )
+            return True
+        except Exception as e:
+            logger.error(
+                "Failed to store key %s: %s", self._log_key(pool_name, key), e
+            )
+            return False
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        kv_pool = self.registered_pools["kv"]
+        page_size = getattr(kv_pool, "page_size", 1) or 1
+        return [
+            self._read_page("kv", key, kv_pool, host_indices[i * page_size].item())
+            for i, key in enumerate(keys)
+        ]
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> List[bool]:
+        kv_pool = self.registered_pools["kv"]
+        page_size = getattr(kv_pool, "page_size", 1) or 1
+        return [
+            self._write_page("kv", key, kv_pool, host_indices[i * page_size].item())
+            for i, key in enumerate(keys)
+        ]
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        del extra_info
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            if transfer.host_indices.numel() != len(transfer.keys) * page_size:
+                logger.error(
+                    "batch_get_v2 indices length mismatch for %s: expected %s, got %s",
+                    transfer.name,
+                    len(transfer.keys) * page_size,
+                    transfer.host_indices.numel(),
+                )
+                results[transfer.name] = [False] * len(transfer.keys)
+            else:
+                results[transfer.name] = [
+                    self._read_page(
+                        transfer.name,
+                        key,
+                        host_pool,
+                        transfer.host_indices[i * page_size].item(),
+                    )
+                    for i, key in enumerate(transfer.keys)
+                ]
+        return results
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional["HiCacheStorageExtraInfo"] = None,
+    ) -> dict[str, List[bool]]:
+        del extra_info
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            if transfer.host_indices.numel() != len(transfer.keys) * page_size:
+                logger.error(
+                    "batch_set_v2 indices length mismatch for %s: expected %s, got %s",
+                    transfer.name,
+                    len(transfer.keys) * page_size,
+                    transfer.host_indices.numel(),
+                )
+                results[transfer.name] = [False] * len(transfer.keys)
+            else:
+                results[transfer.name] = [
+                    self._write_page(
+                        transfer.name,
+                        key,
+                        host_pool,
+                        transfer.host_indices[i * page_size].item(),
+                    )
+                    for i, key in enumerate(transfer.keys)
+                ]
+        return results
 
     def clear(self) -> bool:
         try:
