@@ -13,6 +13,8 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
+from python.sglang.srt.mem_cache.hiradix_cache import logger
+
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):
     def __init__(
@@ -29,6 +31,7 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
     ):
         # todo hisparse: fix the hack for index buf size
         super().__init__(
@@ -44,8 +47,9 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * 2,
+            index_buf_size=index_buf_size if index_buf_size is not None else size * 2,
         )
+        logger.info(f"Init index buf size:{index_buf_size}")
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
 
     def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):

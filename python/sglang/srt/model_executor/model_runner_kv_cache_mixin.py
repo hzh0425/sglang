@@ -486,25 +486,31 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            nsa_pool = (
-                NSATokenToKVPool
-                if not self.enable_hisparse
-                else HiSparseNSATokenToKVPool
-            )
-            self.token_to_kv_pool = nsa_pool(
-                self.max_total_num_tokens,
+            kwargs = dict(
+                size=self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
+                index_head_dim=self.model_config.index_head_dim,
                 kv_cache_dim=self.calculate_mla_kv_cache_dim(),
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
+            if self.enable_hisparse:
+                kwargs["index_buf_size"] = (
+                    self.max_total_num_tokens * int(self.server_args.hicache_ratio)
+                )
+
+            nsa_pool = (
+                NSATokenToKVPool
+                if not self.enable_hisparse
+                else HiSparseNSATokenToKVPool
+            )
+            self.token_to_kv_pool = nsa_pool(**kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):

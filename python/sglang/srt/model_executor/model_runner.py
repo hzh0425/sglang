@@ -630,6 +630,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     if self.server_args.enable_dp_attention
                     else self.tp_group.cpu_group
                 ),
+                host_ratio=int(self.server_args.hicache_ratio),
             )
 
         # Init routed experts capturer

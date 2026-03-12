@@ -1,7 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional
 
 import torch
 
@@ -36,6 +36,7 @@ class HiSparseCoordinator:
         device_buffer_size: int,
         device: str,
         tp_group: torch.distributed.ProcessGroup,
+        host_ratio: int = 2,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -48,7 +49,7 @@ class HiSparseCoordinator:
         )
         self.mem_pool_host = MLATokenToKVPoolHost(
             device_pool=self.mem_pool_device,
-            host_to_device_ratio=2,
+            host_to_device_ratio=host_ratio,
             host_size=0,
             page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
             layout="layer_first",
