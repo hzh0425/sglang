@@ -80,6 +80,15 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
+    if token_num_per_seq is not None or extend_lens is not None:
+        batch_size = (
+            num_tokens // token_num_per_seq
+            if token_num_per_seq is not None
+            else len(extend_lens)
+        )
+        if batch_size < 2:
+            return None
+
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
@@ -407,6 +416,13 @@ class TboDPAttentionPreparer:
                 and enable_a2a_moe
                 and (resolved_deepep_mode.is_low_latency())
             )
+            if (
+                local_can_run_tbo
+                and local_batch.forward_mode.is_extend()
+                and local_batch.mamba_track_mask is not None
+                and local_batch.mamba_track_mask.any()
+            ):
+                local_can_run_tbo = False
         else:
             self.local_tbo_split_seq_index = 0
             local_can_run_tbo = True
@@ -648,6 +664,9 @@ class TboForwardBatchPreparer:
             "req_pool_indices",
             "seq_lens",
             "seq_lens_cpu",
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
             "extend_seq_lens",
             "extend_prefix_lens",
             "extend_start_loc",
@@ -670,6 +689,8 @@ class TboForwardBatchPreparer:
             ):
                 output_dict[key] = None
                 continue
+            if isinstance(old_value, list) and len(old_value) < num_seqs:
+                old_value = old_value + [None] * (num_seqs - len(old_value))
             assert (
                 len(old_value) == num_seqs
             ), f"{key=} {old_value=} {num_seqs=} {batch=}"
@@ -698,11 +719,17 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
         ]:
             output_dict[key] = getattr(batch, key)
+
+        if batch.mrope_positions is not None:
+            output_dict["mrope_positions"] = batch.mrope_positions[
+                :, start_token_index:end_token_index
+            ]
+        else:
+            output_dict["mrope_positions"] = None
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)

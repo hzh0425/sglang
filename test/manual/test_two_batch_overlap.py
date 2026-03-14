@@ -148,5 +148,43 @@ class TestQwen3TwoBatchOverlap(TestTwoBatchOverlap):
             )
 
 
+class TestQwen35TwoBatchOverlap(TestTwoBatchOverlap):
+    @classmethod
+    def setUpClass(cls):
+        # cls.model = _resolve_qwen35_model_path("Qwen/Qwen3.5-27B")
+        cls.model = "Qwen/Qwen3.5-27B"
+        cls.launch_env = {
+            "CUDA_VISIBLE_DEVICES": "4,5,6,7",
+            "SGLANG_DISABLE_CUDNN_CHECK": "1",
+            "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+        }
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        with envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=cls.launch_env,
+                other_args=[
+                    "--trust-remote-code",
+                    "--tp",
+                    "2",
+                    "--dp",
+                    "1",
+                    "--enable-dp-attention",
+                    # "--moe-a2a-backend",
+                    # "deepep",
+                    # "--deepep-mode",
+                    # "low_latency",
+                    # "--disable-cuda-graph",  # DeepEP normal does not support CUDA Graph
+                    # "--enable-two-batch-overlap",
+                    "--mamba-scheduler-strategy",
+                    "extra_buffer",
+                    "--page-size",
+                    "64",
+                ],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
