@@ -326,6 +326,8 @@ class SchedulerRuntimeCheckerMixin:
             )
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
+            if self.enable_hisparse and self.hisparse_coordinator.has_ongoing_staging():
+                queue_size += 1
             if queue_size:
                 return
         elif self.enable_hisparse:

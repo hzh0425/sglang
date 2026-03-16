@@ -611,13 +611,21 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
             self._pre_alloc(decode_req.req)
 
-            kv_indices = (
-                self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
-                ]
-                .cpu()
-                .numpy()
-            )
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                decode_req.req.req_pool_idx
+            ][: len(decode_req.req.origin_input_ids)]
+            if self.scheduler.enable_hisparse and hasattr(
+                self.token_to_kv_pool, "translate_loc_to_hisparse_device"
+            ):
+                kv_indices = (
+                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
+                        kv_indices_full
+                    )
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                kv_indices = kv_indices_full.cpu().numpy()
             page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
@@ -651,10 +659,9 @@ class DecodePreallocQueue:
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
-                kv_indices_full = self.req_to_token_pool.req_to_token[
+                state_indices = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
-                ]
-                state_indices = kv_indices_full.cpu().numpy()
+                ].cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             else:
                 state_indices = None
