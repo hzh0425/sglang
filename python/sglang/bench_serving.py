@@ -85,6 +85,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    first_token_event: Optional[asyncio.Event] = None
 
 
 @dataclass
@@ -192,6 +193,8 @@ async def async_request_trt_llm(
                         if ttft == 0.0:
                             ttft = timestamp - st
                             output.ttft = ttft
+                            if request_func_input.first_token_event:
+                                request_func_input.first_token_event.set()
 
                         # Decoding phase
                         else:
@@ -213,6 +216,11 @@ async def async_request_trt_llm(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+        if (
+            request_func_input.first_token_event
+            and not request_func_input.first_token_event.is_set()
+        ):
+            request_func_input.first_token_event.set()
         if pbar:
             pbar.update(1)
         return output
@@ -300,6 +308,8 @@ async def async_request_openai_completions(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    if request_func_input.first_token_event:
+                                        request_func_input.first_token_event.set()
 
                                 # Decoding phase
                                 else:
@@ -328,6 +338,11 @@ async def async_request_openai_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if (
+        request_func_input.first_token_event
+        and not request_func_input.first_token_event.is_set()
+    ):
+        request_func_input.first_token_event.set()
     if pbar:
         pbar.update(1)
     return output
@@ -445,6 +460,8 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        if request_func_input.first_token_event:
+                            request_func_input.first_token_event.set()
                     else:
                         # Streaming response
                         async for chunk_bytes in response.content:
@@ -469,6 +486,8 @@ async def async_request_openai_chat_completions(
                                     if ttft == 0.0:
                                         ttft = timestamp - st
                                         output.ttft = ttft
+                                        if request_func_input.first_token_event:
+                                            request_func_input.first_token_event.set()
 
                                     # Decoding phase
                                     else:
@@ -499,6 +518,11 @@ async def async_request_openai_chat_completions(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if (
+        request_func_input.first_token_event
+        and not request_func_input.first_token_event.is_set()
+    ):
+        request_func_input.first_token_event.set()
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
         curr_t = time.time()
@@ -566,6 +590,8 @@ async def async_request_truss(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    if request_func_input.first_token_event:
+                                        request_func_input.first_token_event.set()
 
                                 # Decoding phase
                                 else:
@@ -588,6 +614,11 @@ async def async_request_truss(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
 
+    if (
+        request_func_input.first_token_event
+        and not request_func_input.first_token_event.is_set()
+    ):
+        request_func_input.first_token_event.set()
     if pbar:
         pbar.update(1)
     return output
@@ -666,6 +697,8 @@ async def async_request_sglang_generate(
                                 if ttft == 0.0:
                                     ttft = time.perf_counter() - st
                                     output.ttft = ttft
+                                    if request_func_input.first_token_event:
+                                        request_func_input.first_token_event.set()
 
                                 # Decoding phase
                                 else:
@@ -694,6 +727,11 @@ async def async_request_sglang_generate(
             output.error = "".join(traceback.format_exception(*exc_info))
             print(f"{output.error=}")
 
+    if (
+        request_func_input.first_token_event
+        and not request_func_input.first_token_event.is_set()
+    ):
+        request_func_input.first_token_event.set()
     if pbar:
         pbar.update(1)
     return output
@@ -1285,6 +1323,17 @@ async def benchmark(
         lora_probs = None
 
     pbar = None if disable_tqdm else tqdm(total=pbar_total)
+    wait_first_token_between_rounds = not (
+        backend == "sglang" and getattr(args, "dataset_name", None) == "mooncake"
+    )
+    if wait_first_token_between_rounds:
+        requests_per_round = (
+            len(input_requests)
+            if request_rate == float("inf")
+            else max(1, int(request_rate))
+        )
+        round_first_token_events: List[asyncio.Event] = []
+
     async for request in request_generator:
         if lora_names is not None and len(lora_names) != 0:
             if lora_request_distribution == "uniform":
@@ -1304,6 +1353,11 @@ async def benchmark(
         # Merge global extra_request_body with per-request extras
         # Per-request parameters take precedence over global ones
         merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        first_token_event = (
+            asyncio.Event() if wait_first_token_between_rounds else None
+        )
+        if wait_first_token_between_rounds:
+            round_first_token_events.append(first_token_event)
 
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -1316,6 +1370,7 @@ async def benchmark(
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
+            first_token_event=first_token_event,
         )
 
         tasks.append(
@@ -1323,6 +1378,16 @@ async def benchmark(
                 limited_request_func(request_func_input=request_func_input, pbar=pbar)
             )
         )
+        if (
+            wait_first_token_between_rounds
+            and len(round_first_token_events) >= requests_per_round
+        ):
+            await asyncio.gather(*(e.wait() for e in round_first_token_events))
+            round_first_token_events = []
+
+    if wait_first_token_between_rounds and round_first_token_events:
+        await asyncio.gather(*(e.wait() for e in round_first_token_events))
+
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
