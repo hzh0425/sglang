@@ -123,7 +123,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         self._kvcache = kvcache
         # todo: adapt to the host memory size
-        self._size_full = size * 2
+        self._size_full = size * 5
         self._size_hisparse = size
         self.dtype = dtype
         self.device = device
@@ -174,10 +174,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._size_full
 
     def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
-        )
+        # return min(
+        #     self.logical_attn_allocator.available_size(),
+        #     self.hisparse_attn_allocator.available_size(),
+        # )
+        return self.hisparse_attn_allocator.available_size()
 
     def alloc(self, need_size: int):
         raise NotImplementedError(
