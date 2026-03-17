@@ -118,6 +118,14 @@ class HiSparseCoordinator:
         self.top_k_device_locs_buffer = torch.full(
             (max_num_reqs, self.top_k), -1, dtype=torch.int32, device=device
         )
+        max_transfer_tasks = max_num_reqs * (self.top_k + 1)
+        self.transfer_tasks_src = torch.full(
+            (max_transfer_tasks,), -1, dtype=torch.int64, device=device
+        )
+        self.transfer_tasks_dst = torch.full(
+            (max_transfer_tasks,), -1, dtype=torch.int64, device=device
+        )
+
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -545,6 +553,8 @@ class HiSparseCoordinator:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             lru_slots=self.lru_slots[layer_id],
+            transfer_tasks_src=self.transfer_tasks_src,
+            transfer_tasks_dst=self.transfer_tasks_dst,
             item_size_bytes=self.mem_pool_host.token_stride_size,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
