@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from abc import ABC, abstractmethod
 from collections import defaultdict
 from functools import partial
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from numpy import float64
 
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
@@ -24,52 +22,34 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hybrid_cache import (
+    BASE_COMPONENT_NAME,
+    ComponentData,
+    ComponentInsertResult,
+    FullComponent,
+    LockHandle,
+    MambaComponent,
+    SWAComponent,
+    TreeComponent,
+    get_last_access_time,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     _key_match_paged,
     get_child_key,
-    maybe_bigram_convert,
     page_align_keys,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
-from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
-
-BASE_COMPONENT_NAME = "full"
-
-
-@dataclasses.dataclass
-class ComponentData:
-    value: Optional[torch.Tensor] = None
-    lock_ref: int = 0
-    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
-
-
-@dataclasses.dataclass
-class ComponentInsertResult:
-    reused_existing: bool = False
-
-
-@dataclasses.dataclass
-class LockHandle:
-    component_handles: dict[str, Any] = dataclasses.field(default_factory=dict)
-
-    @property
-    def legacy_swa_uuid(self) -> Any:
-        return self.component_handles.get("swa")
-
-
 class HybridTreeNode:
     counter = 0
-    last_access_time_counter_float = float64(1.0)
-    component_uuid_counter = 1
 
     def __init__(self, component_names: list[str]):
         self.children = defaultdict(partial(HybridTreeNode, component_names))
@@ -110,17 +90,6 @@ class HybridTreeNode:
 
     def __lt__(self, other: "HybridTreeNode"):
         return self.last_access_time < other.last_access_time
-
-
-def get_last_access_time() -> float64:
-    ret = HybridTreeNode.last_access_time_counter_float
-    HybridTreeNode.last_access_time_counter_float += 1.0
-    return ret
-
-
-def gen_component_uuid() -> int:
-    HybridTreeNode.component_uuid_counter += 1
-    return HybridTreeNode.component_uuid_counter
 
 
 class HybridLRUList:
@@ -211,430 +180,6 @@ class HybridLRUList:
         return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
 
-class TreeComponent(ABC):
-    def __init__(self, cache: "HybridRadixCache"):
-        self.cache = cache
-
-    @property
-    @abstractmethod
-    def name(self) -> str: ...
-
-    @abstractmethod
-    def preprocess_match_key(self, key: RadixKey) -> Optional[RadixKey]: ...
-
-    @abstractmethod
-    def preprocess_insert_key(
-        self, key: RadixKey, value: Optional[torch.Tensor]
-    ) -> tuple[RadixKey, torch.Tensor]: ...
-
-    @abstractmethod
-    def init_match_state(self) -> dict[str, Any]: ...
-
-    @abstractmethod
-    def on_match_visit(
-        self, node: HybridTreeNode, matched_seg_len: int, state: dict[str, Any]
-    ) -> bool: ...
-
-    @abstractmethod
-    def on_match_finalize(
-        self,
-        params: MatchPrefixParams,
-        last_node: HybridTreeNode,
-        value_chunks: list[torch.Tensor],
-        best_value_len: int,
-    ) -> dict[str, Any]: ...
-
-    @abstractmethod
-    def on_split_node(self, new_node: HybridTreeNode, child: HybridTreeNode): ...
-
-    @abstractmethod
-    def should_track_in_lru(self, node: HybridTreeNode) -> bool: ...
-
-    @abstractmethod
-    def handle_overlap(
-        self,
-        node: HybridTreeNode,
-        prefix_len: int,
-        total_prefix_length: int,
-        update_after_len: int,
-        value_slice: torch.Tensor,
-        params: InsertParams,
-    ) -> None: ...
-
-    @abstractmethod
-    def before_add_new_leaf(
-        self,
-        node: HybridTreeNode,
-        total_prefix_length: int,
-        key: RadixKey,
-        value: torch.Tensor,
-        params: InsertParams,
-    ) -> tuple[HybridTreeNode, RadixKey, torch.Tensor]: ...
-
-    @abstractmethod
-    def finalize_new_leaf(
-        self, leaf: HybridTreeNode, params: InsertParams
-    ) -> ComponentInsertResult: ...
-
-    @abstractmethod
-    def finalize_existing_node(
-        self, node: HybridTreeNode, params: InsertParams
-    ) -> ComponentInsertResult: ...
-
-    @abstractmethod
-    def free_internal(self, node: HybridTreeNode) -> int: ...
-
-    @abstractmethod
-    def free_leaf(self, node: HybridTreeNode) -> int: ...
-
-    def value_len(self, node: HybridTreeNode) -> int:
-        value = node.component_value(self.name)
-        return len(value) if value is not None else 0
-
-    @abstractmethod
-    def get_lock_handle_and_inc(self, node: HybridTreeNode) -> Any: ...
-
-    @abstractmethod
-    def dec_lock_ref(self, node: HybridTreeNode, handle: Any) -> None: ...
-
-    def export_public_lock_handle(self, handle: LockHandle) -> Any:
-        return handle
-
-    def import_public_lock_handle(self, handle: Any) -> LockHandle:
-        if isinstance(handle, LockHandle):
-            return handle
-        return LockHandle(component_handles={self.name: handle})
-
-
-class MambaComponent(TreeComponent):
-    @property
-    def name(self) -> str:
-        return "mamba"
-
-    def preprocess_match_key(self, key: RadixKey) -> Optional[RadixKey]:
-        if self.cache.disable or len(key) == 0:
-            return None
-        return key
-
-    def preprocess_insert_key(
-        self, key: RadixKey, value: Optional[torch.Tensor]
-    ) -> tuple[RadixKey, torch.Tensor]:
-        if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        return key, value
-
-    def init_match_state(self) -> dict[str, Any]:
-        return {}
-
-    def on_match_visit(
-        self, node: HybridTreeNode, matched_seg_len: int, state: dict[str, Any]
-    ) -> bool:
-        return node.component_value(self.name) is not None
-
-    def on_match_finalize(
-        self,
-        params: MatchPrefixParams,
-        last_node: HybridTreeNode,
-        value_chunks: list[torch.Tensor],
-        best_value_len: int,
-    ) -> dict[str, Any]:
-        cow_mamba = params.cow_mamba
-        req = params.req
-
-        if len(value_chunks) > best_value_len:
-            chunk_size = get_global_server_args().mamba_cache_chunk_size
-            aligned_seqlen = (sum(len(v) for v in value_chunks) // chunk_size) * chunk_size
-            branching_seqlen = aligned_seqlen if aligned_seqlen > 0 else None
-        else:
-            branching_seqlen = None
-
-        mamba_value = last_node.component_value(self.name)
-        if cow_mamba and mamba_value is not None:
-            assert req is not None
-            if req.mamba_pool_idx is None:
-                dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                if dst_index is None:
-                    self.cache.inc_lock_ref(last_node)
-                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                    self.cache.dec_lock_ref(last_node)
-                    assert dst_index is not None, "Can not alloc mamba cache"
-                self.cache.req_to_token_pool.mamba_pool.copy_from(mamba_value, dst_index)
-                req.mamba_pool_idx = dst_index[0]
-            else:
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.cache.req_to_token_pool.mamba_pool.copy_from(mamba_value, dst_index)
-
-        return {"mamba_branching_seqlen": branching_seqlen}
-
-    def on_split_node(self, new_node: HybridTreeNode, child: HybridTreeNode):
-        new_node.set_component_value(self.name, None)
-        new_node.component(self.name).lock_ref = 0
-
-    def should_track_in_lru(self, node: HybridTreeNode) -> bool:
-        return node.component_value(self.name) is not None
-
-    def handle_overlap(
-        self,
-        node: HybridTreeNode,
-        prefix_len: int,
-        total_prefix_length: int,
-        update_after_len: int,
-        value_slice: torch.Tensor,
-        params: InsertParams,
-    ) -> None:
-        return
-
-    def before_add_new_leaf(
-        self,
-        node: HybridTreeNode,
-        total_prefix_length: int,
-        key: RadixKey,
-        value: torch.Tensor,
-        params: InsertParams,
-    ) -> tuple[HybridTreeNode, RadixKey, torch.Tensor]:
-        return node, key, value
-
-    def finalize_new_leaf(
-        self, leaf: HybridTreeNode, params: InsertParams
-    ) -> ComponentInsertResult:
-        assert params.mamba_value is not None
-        leaf.set_component_value(self.name, params.mamba_value)
-        self.cache.lru_lists[self.name].insert_mru(leaf)
-        self.cache.component_evictable_size_[self.name] += len(params.mamba_value)
-        return ComponentInsertResult()
-
-    def finalize_existing_node(
-        self, node: HybridTreeNode, params: InsertParams
-    ) -> ComponentInsertResult:
-        assert params.mamba_value is not None
-        if node.component_value(self.name) is None:
-            node.set_component_value(self.name, params.mamba_value)
-            self.cache.lru_lists[self.name].insert_mru(node)
-            self.cache.component_evictable_size_[self.name] += len(params.mamba_value)
-            node.last_access_time = get_last_access_time()
-            return ComponentInsertResult(reused_existing=False)
-        self.cache.lru_lists[self.name].reset_node_mru(node)
-        node.last_access_time = get_last_access_time()
-        return ComponentInsertResult(reused_existing=True)
-
-    def free_internal(self, node: HybridTreeNode) -> int:
-        value = node.component_value(self.name)
-        self.cache.req_to_token_pool.mamba_pool.free(value)
-        freed = len(value)
-        self.cache.component_evictable_size_[self.name] -= freed
-        node.set_component_value(self.name, None)
-        return freed
-
-    def free_leaf(self, node: HybridTreeNode) -> int:
-        value = node.component_value(self.name)
-        self.cache.req_to_token_pool.mamba_pool.free(value)
-        return len(value)
-
-    def get_lock_handle_and_inc(self, node: HybridTreeNode) -> Any:
-        value = node.component_value(self.name)
-        if value is not None:
-            if node.component(self.name).lock_ref == 0:
-                self.cache.component_evictable_size_[self.name] -= len(value)
-                self.cache.component_protected_size_[self.name] += len(value)
-            node.component(self.name).lock_ref += 1
-        return None
-
-    def dec_lock_ref(self, node: HybridTreeNode, handle: Any) -> None:
-        value = node.component_value(self.name)
-        if value is not None:
-            assert node.component(self.name).lock_ref > 0
-            if node.component(self.name).lock_ref == 1:
-                self.cache.component_evictable_size_[self.name] += len(value)
-                self.cache.component_protected_size_[self.name] -= len(value)
-            node.component(self.name).lock_ref -= 1
-
-
-class SWAComponent(TreeComponent):
-    @property
-    def name(self) -> str:
-        return "swa"
-
-    def preprocess_match_key(self, key: RadixKey) -> Optional[RadixKey]:
-        key, _ = maybe_bigram_convert(self.cache.is_eagle, key)
-        if self.cache.disable or len(key) == 0:
-            return None
-        if self.cache.page_size != 1:
-            page_aligned_len = len(key) // self.cache.page_size * self.cache.page_size
-            key = key[:page_aligned_len]
-        return key
-
-    def preprocess_insert_key(
-        self, key: RadixKey, value: Optional[torch.Tensor]
-    ) -> tuple[RadixKey, torch.Tensor]:
-        if value is None:
-            value = torch.tensor([x for x in key.token_ids], dtype=torch.int64)
-        return maybe_bigram_convert(self.cache.is_eagle, key, value)
-
-    def init_match_state(self) -> dict[str, Any]:
-        return {"match_len_since_release": float("inf")}
-
-    def on_match_visit(
-        self, node: HybridTreeNode, matched_seg_len: int, state: dict[str, Any]
-    ) -> bool:
-        if node.component_value(self.name) is None:
-            state["match_len_since_release"] = 0
-            return False
-        state["match_len_since_release"] += len(node.full_value)
-        return state["match_len_since_release"] >= self.cache.sliding_window_size
-
-    def on_match_finalize(
-        self,
-        params: MatchPrefixParams,
-        last_node: HybridTreeNode,
-        value_chunks: list[torch.Tensor],
-        best_value_len: int,
-    ) -> dict[str, Any]:
-        return {}
-
-    def on_split_node(self, new_node: HybridTreeNode, child: HybridTreeNode):
-        child_value = child.component_value(self.name)
-        new_node.set_component_value(
-            self.name,
-            new_node.full_value.clone() if child_value is not None else None,
-        )
-        new_node.component(self.name).lock_ref = child.component(self.name).lock_ref
-        if "component_uuid" in child.component(self.name).metadata:
-            new_node.component(self.name).metadata["component_uuid"] = child.component(
-                self.name
-            ).metadata["component_uuid"]
-            child.component(self.name).metadata.pop("component_uuid", None)
-
-    def should_track_in_lru(self, node: HybridTreeNode) -> bool:
-        return node.component_value(self.name) is not None
-
-    def handle_overlap(
-        self,
-        node: HybridTreeNode,
-        prefix_len: int,
-        total_prefix_length: int,
-        update_after_len: int,
-        value_slice: torch.Tensor,
-        params: InsertParams,
-    ) -> None:
-        if update_after_len >= total_prefix_length + prefix_len:
-            return
-        if node.component_value(self.name) is not None:
-            self.cache.token_to_kv_pool_allocator.free(value_slice)
-            return
-
-        assert params.swa_evicted_seqlen % self.cache.page_size == 0
-        assert node.component(self.name).lock_ref == 0
-
-        if params.swa_evicted_seqlen <= total_prefix_length:
-            self.cache.token_to_kv_pool_allocator.free(node.full_value[:prefix_len])
-            node.full_value = value_slice.clone()
-            node.set_component_value(self.name, node.full_value)
-            self.cache.lru_lists[self.name].insert_mru(node)
-            self.cache.component_evictable_size_[self.name] += len(node.component_value(self.name))
-        elif params.swa_evicted_seqlen < total_prefix_length + prefix_len:
-            start_update_idx = params.swa_evicted_seqlen - total_prefix_length
-            self.cache.token_to_kv_pool_allocator.free(
-                node.full_value[start_update_idx:prefix_len]
-            )
-            self.cache._split_node(node.key, node, start_update_idx)
-            node.full_value = value_slice[start_update_idx:prefix_len].clone()
-            self.cache.token_to_kv_pool_allocator.free(value_slice[:start_update_idx])
-            node.set_component_value(self.name, node.full_value)
-            self.cache.lru_lists[self.name].insert_mru(node)
-            self.cache.component_evictable_size_[self.name] += len(node.component_value(self.name))
-        else:
-            self.cache.token_to_kv_pool_allocator.free(value_slice)
-
-    def before_add_new_leaf(
-        self,
-        node: HybridTreeNode,
-        total_prefix_length: int,
-        key: RadixKey,
-        value: torch.Tensor,
-        params: InsertParams,
-    ) -> tuple[HybridTreeNode, RadixKey, torch.Tensor]:
-        if (
-            params.swa_evicted_seqlen > total_prefix_length
-            and params.swa_evicted_seqlen < total_prefix_length + len(key)
-        ):
-            tombstone_len = params.swa_evicted_seqlen - total_prefix_length
-            node = self.cache._add_new_leaf(
-                node,
-                key[:tombstone_len],
-                value[:tombstone_len],
-                component_values={self.name: None},
-            )
-            key = key[tombstone_len:]
-            value = value[tombstone_len:]
-        return node, key, value
-
-    def finalize_new_leaf(
-        self, leaf: HybridTreeNode, params: InsertParams
-    ) -> ComponentInsertResult:
-        leaf.set_component_value(self.name, leaf.full_value)
-        self.cache.lru_lists[self.name].insert_mru(leaf)
-        self.cache.component_evictable_size_[self.name] += len(leaf.component_value(self.name))
-        return ComponentInsertResult()
-
-    def finalize_existing_node(
-        self, node: HybridTreeNode, params: InsertParams
-    ) -> ComponentInsertResult:
-        return ComponentInsertResult(reused_existing=True)
-
-    def free_internal(self, node: HybridTreeNode) -> int:
-        self.cache.token_to_kv_pool_allocator.free_swa(node.full_value)
-        freed = len(node.full_value)
-        self.cache.component_evictable_size_[self.name] -= freed
-        node.set_component_value(self.name, None)
-        return freed
-
-    def free_leaf(self, node: HybridTreeNode) -> int:
-        return len(node.component_value(self.name))
-
-    def get_lock_handle_and_inc(self, node: HybridTreeNode) -> Any:
-        secondary_lock_size = 0
-        stop_uuid = None
-        cur = node
-        while cur != self.cache.root_node and secondary_lock_size < self.cache.sliding_window_size:
-            value = cur.component_value(self.name)
-            assert value is not None
-            if cur.component(self.name).lock_ref == 0:
-                self.cache.component_evictable_size_[self.name] -= len(value)
-                self.cache.component_protected_size_[self.name] += len(value)
-            cur.component(self.name).lock_ref += 1
-            secondary_lock_size += len(value)
-            if secondary_lock_size >= self.cache.sliding_window_size:
-                if "component_uuid" not in cur.component(self.name).metadata:
-                    cur.component(self.name).metadata["component_uuid"] = gen_component_uuid()
-                stop_uuid = cur.component(self.name).metadata["component_uuid"]
-            cur = cur.parent
-        return stop_uuid
-
-    def dec_lock_ref(self, node: HybridTreeNode, handle: Any) -> None:
-        dec_secondary = True
-        stop_uuid = handle
-        while node != self.cache.root_node and dec_secondary:
-            value = node.component_value(self.name)
-            assert value is not None
-            assert node.component(self.name).lock_ref > 0
-            if node.component(self.name).lock_ref == 1:
-                self.cache.component_evictable_size_[self.name] += len(value)
-                self.cache.component_protected_size_[self.name] -= len(value)
-            node.component(self.name).lock_ref -= 1
-            if stop_uuid and node.component(self.name).metadata.get("component_uuid") == stop_uuid:
-                dec_secondary = False
-            node = node.parent
-
-    def export_public_lock_handle(self, handle: LockHandle) -> Any:
-        return handle.legacy_swa_uuid
-
-    def import_public_lock_handle(self, handle: Any) -> LockHandle:
-        if isinstance(handle, LockHandle):
-            return handle
-        return LockHandle(component_handles={self.name: handle})
-
-
 @dataclasses.dataclass(frozen=True)
 class HybridTreeSpec:
     component_names: tuple[str, ...]
@@ -662,6 +207,7 @@ def build_hybrid_tree_spec(
 
 
 COMPONENT_REGISTRY = {
+    BASE_COMPONENT_NAME: FullComponent,
     "mamba": MambaComponent,
     "swa": SWAComponent,
 }
@@ -783,7 +329,7 @@ class HybridRadixCache(BasePrefixCache):
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
         for component in self.components.values():
-            processed_key = component.preprocess_match_key(key)
+            processed_key = component.transform_key_for_match(key)
             if processed_key is None:
                 return MatchResult(
                     device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -801,7 +347,7 @@ class HybridRadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         for component in self.components.values():
-            key, value = component.preprocess_insert_key(key, value)
+            key, value = component.transform_key_value_for_insert(key, value)
         prefix_len, component_results = self._insert_helper(self.root_node, key, value, params)
         self._mark_usage_counters_dirty()
         mamba_result = component_results.get("mamba", ComponentInsertResult())
@@ -819,7 +365,7 @@ class HybridRadixCache(BasePrefixCache):
         best_value_len = 0
         best_node = node
         component_states = {
-            name: component.init_match_state()
+            name: component.init_match_walk_state()
             for name, component in self.components.items()
         }
         while len(key) > 0 and child_key in node.children:
@@ -829,8 +375,8 @@ class HybridRadixCache(BasePrefixCache):
                 node = self._split_node(child.key, child, prefix_len)
                 value.append(node.full_value)
                 if all(
-                    self.components[name].on_match_visit(
-                        node, prefix_len, component_states[name]
+                    self.components[name].is_valid_match_endpoint(
+                        node, component_states[name]
                     )
                     for name in self.component_order
                 ):
@@ -840,8 +386,8 @@ class HybridRadixCache(BasePrefixCache):
             value.append(child.full_value)
             node = child
             if all(
-                self.components[name].on_match_visit(
-                    node, prefix_len, component_states[name]
+                self.components[name].is_valid_match_endpoint(
+                    node, component_states[name]
                 )
                 for name in self.component_order
             ):
@@ -865,7 +411,7 @@ class HybridRadixCache(BasePrefixCache):
         )
         for component_name, component in self.components.items():
             self.lru_lists[component_name].reset_node_and_parents_mru(
-                node_update, self.root_node, component.should_track_in_lru
+                node_update, self.root_node, component.node_has_component_data
             )
         cur_time = get_last_access_time()
         while node_update:
@@ -876,7 +422,7 @@ class HybridRadixCache(BasePrefixCache):
         extras = {}
         for component in self.components.values():
             extras.update(
-                component.on_match_finalize(params, last_node, value, best_value_len)
+                component.compute_match_result_extras(params, last_node, value, best_value_len)
             )
 
         value = value[:best_value_len]
@@ -903,11 +449,11 @@ class HybridRadixCache(BasePrefixCache):
             BASE_COMPONENT_NAME
         ).lock_ref
         for component in self.components.values():
-            component.on_split_node(new_node, child)
+            component.redistribute_on_node_split(new_node, child)
 
         self.lru_lists[BASE_COMPONENT_NAME].remove_node(child)
         for component_name, component in self.components.items():
-            if component.should_track_in_lru(child):
+            if component.node_has_component_data(child):
                 self.lru_lists[component_name].remove_node(child)
 
         child.parent = new_node
@@ -922,9 +468,9 @@ class HybridRadixCache(BasePrefixCache):
         self.lru_lists[BASE_COMPONENT_NAME].insert_mru(new_node)
         self.lru_lists[BASE_COMPONENT_NAME].insert_mru(child)
         for component_name, component in self.components.items():
-            if component.should_track_in_lru(new_node):
+            if component.node_has_component_data(new_node):
                 self.lru_lists[component_name].insert_mru(new_node)
-            if component.should_track_in_lru(child):
+            if component.node_has_component_data(child):
                 self.lru_lists[component_name].insert_mru(child)
         child.last_access_time = get_last_access_time()
         return new_node
@@ -934,7 +480,7 @@ class HybridRadixCache(BasePrefixCache):
         if node != self.root_node:
             self.lru_lists[BASE_COMPONENT_NAME].reset_node_mru(node)
             for component_name, component in self.components.items():
-                if component.should_track_in_lru(node):
+                if component.node_has_component_data(node):
                     self.lru_lists[component_name].reset_node_mru(node)
 
     def _add_new_leaf(
@@ -976,11 +522,10 @@ class HybridRadixCache(BasePrefixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             for component in self.components.values():
-                component.handle_overlap(
+                component.update_component_on_insert_overlap(
                     node,
                     prefix_len,
                     total_prefix_length,
-                    params.prev_prefix_len,
                     value[:prefix_len],
                     params,
                 )
@@ -992,14 +537,33 @@ class HybridRadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
-            for component in self.components.values():
-                node, key, value = component.before_add_new_leaf(
-                    node, total_prefix_length, key, value, params
+            tombstone_len = max(
+                (comp.get_tombstone_prefix_len_for_insert(
+                    total_prefix_length, len(key), params
+                ) for comp in self.components.values()),
+                default=0,
+            )
+            if 0 < tombstone_len < len(key):
+                node = self._add_new_leaf(
+                    node,
+                    key[:tombstone_len],
+                    value[:tombstone_len],
+                    component_values={
+                        name: None
+                        for name, comp in self.components.items()
+                        if comp.get_tombstone_prefix_len_for_insert(
+                            total_prefix_length, len(key), params
+                        ) > 0
+                    },
                 )
+                total_prefix_length += tombstone_len
+                key = key[tombstone_len:]
+                value = value[tombstone_len:]
+
             if len(key):
                 new_node = self._add_new_leaf(node, key, value)
                 results = {
-                    name: component.finalize_new_leaf(new_node, params)
+                    name: component.commit_insert_component_data(new_node, True, params)
                     for name, component in self.components.items()
                 }
             else:
@@ -1009,7 +573,7 @@ class HybridRadixCache(BasePrefixCache):
                 }
         else:
             results = {
-                name: component.finalize_existing_node(node, params)
+                name: component.commit_insert_component_data(node, False, params)
                 for name, component in self.components.items()
             }
         return total_prefix_length, results
@@ -1071,11 +635,13 @@ class HybridRadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(node.full_value)
         full_num_evicted = len(node.full_value)
         component_num_evicted = {}
+        components_with_data = set()
         for component_name, component in self.components.items():
             if node.component_value(component_name) is None:
                 component_num_evicted[component_name] = 0
                 continue
-            component_num_evicted[component_name] = component.free_leaf(node)
+            components_with_data.add(component_name)
+            component_num_evicted[component_name] = component.release_component_on_leaf_eviction(node)
             node.set_component_value(component_name, None)
 
         if trigger_component_name == BASE_COMPONENT_NAME:
@@ -1084,9 +650,8 @@ class HybridRadixCache(BasePrefixCache):
             next_node = self.lru_lists[trigger_component_name].get_prev_no_lock(node)
 
         self.lru_lists[BASE_COMPONENT_NAME].remove_node(node)
-        for component_name, component in self.components.items():
-            if component.should_track_in_lru(node):
-                self.lru_lists[component_name].remove_node(node)
+        for component_name in components_with_data:
+            self.lru_lists[component_name].remove_node(node)
         self._delete_leaf(node)
         node, extra_full = self._iteratively_delete_tombstone_leaf(node)
         full_num_evicted += extra_full
@@ -1134,14 +699,15 @@ class HybridRadixCache(BasePrefixCache):
             ):
                 assert x.component_value(component_name) is not None
                 if len(x.children) > 0:
-                    component_num_evicted[component_name] += component.free_internal(x)
+                    component_num_evicted[component_name] += component.evict_component_from_internal_node(x)
                     x_next = self.lru_lists[component_name].get_prev_no_lock(x)
                     self.lru_lists[component_name].remove_node(x)
                 else:
                     full_delta, component_delta, _, x_next = self._evict_leaf_node(
                         x, component_name
                     )
-                    full_num_evicted += full_delta
+                    if component.count_full_tokens_on_component_leaf_eviction():
+                        full_num_evicted += full_delta
                     for name in self.component_order:
                         component_num_evicted[name] += component_delta[name]
                 x = x_next
@@ -1161,7 +727,7 @@ class HybridRadixCache(BasePrefixCache):
             return None
         handle = LockHandle()
         for component_name, component in self.components.items():
-            handle.component_handles[component_name] = component.get_lock_handle_and_inc(node)
+            handle.component_handles[component_name] = component.acquire_component_lock(node)
         cur = node
         while cur != self.root_node:
             if cur.component(BASE_COMPONENT_NAME).lock_ref == 0:
@@ -1188,7 +754,7 @@ class HybridRadixCache(BasePrefixCache):
         else:
             normalized_handle = LockHandle()
         for component_name, component in self.components.items():
-            component.dec_lock_ref(
+            component.release_component_lock(
                 node, normalized_handle.component_handles.get(component_name)
             )
         cur = node
