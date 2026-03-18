@@ -4,7 +4,7 @@ import logging
 from typing import List, NamedTuple, Optional
 
 import torch
-
+import nvtx
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
@@ -129,10 +129,9 @@ class HiSparseCoordinator:
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
-        self._cache_hit_rate_warmup_calls = 2
-        self._cache_hit_rate_log_interval = 20
-        self._load_cache_call_count = 0
+        self._cache_hit_rate_log_interval = 10
         self._load_cache_counted_calls = 0
+        self._should_log_cache_hit_rate = False
         self._cache_hit_requested_tokens = torch.zeros(
             layer_num, dtype=torch.int64, device=device
         )
@@ -250,6 +249,7 @@ class HiSparseCoordinator:
             ready_reqs.append(req)
         return ready_reqs
 
+    @nvtx.annotate(message="hisparse_coordinator._grow_device_buffers", color="blue")
     def _grow_device_buffers(
         self,
         seq_lens: torch.Tensor,
@@ -314,6 +314,7 @@ class HiSparseCoordinator:
         )
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    @nvtx.annotate(message="hisparse_coordinator.map_last_loc_to_buffer", color="green")
     def map_last_loc_to_buffer(
         self,
         seq_lens: torch.Tensor,
@@ -333,6 +334,7 @@ class HiSparseCoordinator:
             reserved_buffer_loc
         )
 
+    @nvtx.annotate(message="hisparse_coordinator._eager_backup_previous_token", color="red")
     def _eager_backup_previous_token(
         self,
         seq_lens: torch.Tensor,
@@ -380,6 +382,7 @@ class HiSparseCoordinator:
             io_backend="kernel",
         )
 
+    @nvtx.annotate(message="hisparse_coordinator.get_front_topk_tokens", color="yellow")
     def get_front_topk_tokens(
         self,
         req_pool_indices: torch.Tensor,
@@ -523,6 +526,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
 
+    @nvtx.annotate(message="hisparse_coordinator.swap_in_selected_pages", color="purple")
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -551,6 +555,7 @@ class HiSparseCoordinator:
         self.residency_map.fill_(-1)
         # todo, adjustable for performance
         block_size = 512
+        start_range = nvtx.start_range(message="load_cache_to_device_buffer_mla")
         load_cache_to_device_buffer_mla(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -563,8 +568,8 @@ class HiSparseCoordinator:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             lru_slots=self.lru_slots[layer_id],
-            transfer_tasks_src=self.transfer_tasks_src,
-            transfer_tasks_dst=self.transfer_tasks_dst,
+            # transfer_tasks_src=self.transfer_tasks_src,
+            # transfer_tasks_dst=self.transfer_tasks_dst,
             item_size_bytes=self.mem_pool_host.token_stride_size,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
@@ -572,7 +577,8 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
-        self._record_layer_cache_hit_rate(layer_id, seq_lens)
+        nvtx.end_range(start_range)
+        #self._record_layer_cache_hit_rate(layer_id, seq_lens)
         return top_k_indices
 
     def _record_layer_cache_hit_rate(
@@ -580,25 +586,35 @@ class HiSparseCoordinator:
         layer_id: int,
         seq_lens: torch.Tensor,
     ) -> None:
-        if layer_id == 0:
-            self._load_cache_call_count += 1
-
         num_reqs = seq_lens.size(0)
         req_offsets = torch.arange(num_reqs, dtype=torch.int64, device=self.device)
         valid_mask = req_offsets < self.num_real_reqs[0].to(torch.int64)
         tasks_per_req = self.top_k + 1
         miss_count_offsets = req_offsets * tasks_per_req + self.top_k
 
-        requested_tokens = seq_lens.to(torch.int64).clamp(max=self.top_k)
-        self._cache_hit_requested_tokens[layer_id] += requested_tokens[valid_mask].sum()
+        del seq_lens
+        requested_tokens = valid_mask.sum() * (self.top_k)
+        self._cache_hit_requested_tokens[layer_id] += requested_tokens
         self._cache_hit_missed_tokens[layer_id] += self.transfer_tasks_src[
             miss_count_offsets[valid_mask]
         ].sum()
 
+        if layer_id == 0:
+            self._load_cache_counted_calls += 1
+            self._should_log_cache_hit_rate = (
+                self._load_cache_counted_calls % self._cache_hit_rate_log_interval == 0
+            )
+
+        if (
+            not self._should_log_cache_hit_rate
+            or layer_id != self.mem_pool_device.layer_num - 1
+        ):
+            return
+
         requested_cpu = self._cache_hit_requested_tokens.cpu()
         missed_cpu = self._cache_hit_missed_tokens.cpu()
         log_parts = []
-        for log_layer_id in range(self.mem_pool_device.layer_num):
+        for log_layer_id in range(min(10, self.mem_pool_device.layer_num)):
             requested = int(requested_cpu[log_layer_id].item())
             missed = int(missed_cpu[log_layer_id].item())
             hits = max(requested - missed, 0)
@@ -610,13 +626,11 @@ class HiSparseCoordinator:
                 f"layer {log_layer_id}: {hit_rate:.2%} ({hits}/{requested})"
             )
 
-        if self._load_cache_counted_calls % self._cache_hit_rate_log_interval != 0:
-            self._load_cache_counted_calls = 0
-            logger.info(
-                "HiSparse cache hit rate over the last %d tracked load_cache_to_device_buffer_mla calls (after skipping first %d): %s",
-                self._cache_hit_rate_log_interval,
-                self._cache_hit_rate_warmup_calls,
-                ", ".join(log_parts),
-            )
-            self._cache_hit_requested_tokens.zero_()
-            self._cache_hit_missed_tokens.zero_()
+        logger.info(
+            "HiSparse cache hit rate over the last %d forwards: %s",
+            self._cache_hit_rate_log_interval,
+            ", ".join(log_parts),
+        )
+        self._should_log_cache_hit_rate = False
+        self._cache_hit_requested_tokens.zero_()
+        self._cache_hit_missed_tokens.zero_()
