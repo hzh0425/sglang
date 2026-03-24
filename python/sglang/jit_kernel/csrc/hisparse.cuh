@@ -67,10 +67,10 @@ struct SmemLayout {
 };
 
 // Each block processes one request
-// req_pool_indices are int64_t (pool indices can be large), seq_lens are int32_t
+// req_pool_indices are int64_t (pool indices can be large), seq_lens can be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename SeqLensT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -82,7 +82,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     void* __restrict__ device_buffer_v,
     int32_t* __restrict__ top_k_device_locs,
     const int64_t* __restrict__ req_pool_indices,
-    const int32_t* __restrict__ seq_lens,
+    const SeqLensT* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
     const int32_t* __restrict__ num_real_reqs,
     int64_t buffer_stride_0,
@@ -384,35 +384,47 @@ void load_cache_to_device_buffer(
   const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
   const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
 
-  constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
-  auto kernel_fn = load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA>;
-  // Opt in to dynamic shared memory beyond the default 48 KB limit.
-  if constexpr (smem_bytes > 48u * 1024u) {
-    cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-  }
+  // Generic lambda: both int32 and int64 kernel variants are compiled;
+  // the correct one is selected at runtime based on seq_lens dtype.
+  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr) {
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    if constexpr (smem_bytes > 48u * 1024u) {
+      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+        device_buffer_k.data_ptr(),
+        (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        seq_lens_ptr,
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride_0,
+        host_stride,
+        lru_slot_stride_0,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        page_size,
+        item_size_bytes);
+  };
 
-  LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
-      kernel_fn,
-      static_cast<const int32_t*>(top_k_tokens.data_ptr()),
-      static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
-      static_cast<const int64_t*>(host_cache_locs.data_ptr()),
-      static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
-      host_cache_k.data_ptr(),
-      (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
-      device_buffer_k.data_ptr(),
-      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
-      static_cast<int32_t*>(top_k_device_locs.data_ptr()),
-      static_cast<const int64_t*>(req_pool_indices.data_ptr()),
-      static_cast<const int32_t*>(seq_lens.data_ptr()),
-      static_cast<int16_t*>(lru_slots.data_ptr()),
-      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
-      buffer_stride_0,
-      host_stride,
-      lru_slot_stride_0,
-      top_k_tokens_stride,
-      top_k_device_locs_stride,
-      page_size,
-      item_size_bytes);
+  const auto dtype = seq_lens.dtype();
+  if (dtype.code == kDLInt && dtype.bits == 64) {
+    launch(
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()));
+  } else {
+    launch(
+        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()));
+  }
 }
 
 }  // namespace
