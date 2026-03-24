@@ -71,6 +71,8 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t* __restrict__ req_pool_indices,
     const int32_t* __restrict__ seq_lens,
     int16_t* __restrict__ lru_slots,
+    int32_t* __restrict__ top_k_hit_counts,
+    int32_t* __restrict__ top_k_valid_counts,
     const int32_t* __restrict__ num_real_reqs,
     int64_t buffer_stride_0,
     int64_t host_stride,
@@ -115,6 +117,10 @@ __global__ void load_cache_to_device_buffer_kernel(
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
       }
     }
+    if (tid == 0) {
+      top_k_hit_counts[bid] = count;
+      top_k_valid_counts[bid] = count;
+    }
     return;
   }
 
@@ -133,11 +139,13 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   __shared__ int32_t s_total_hits;
   __shared__ int32_t s_newest_hit;
+  __shared__ int32_t s_valid_top_k_count;
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_valid_top_k_count = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -154,6 +162,12 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
+    if (token_idx < 0) {
+      // Invalid padded entries are excluded from miss accounting.
+      s_top_k_tokens[i] = TOKEN_HIT;
+      continue;
+    }
+    atomicAdd(&s_valid_top_k_count, 1);
     if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
@@ -315,7 +329,8 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = s_valid_top_k_count - s_total_hits - s_newest_hit;
+  if (total_misses < 0) total_misses = 0;
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
@@ -334,6 +349,10 @@ __global__ void load_cache_to_device_buffer_kernel(
       transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
     }
   }
+  if (tid == 0) {
+    top_k_hit_counts[bid] = s_total_hits + s_newest_hit;
+    top_k_valid_counts[bid] = s_valid_top_k_count;
+  }
 }
 
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
@@ -350,6 +369,8 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView req_pool_indices,
     tvm::ffi::TensorView seq_lens,
     tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView top_k_hit_counts,
+    tvm::ffi::TensorView top_k_valid_counts,
     tvm::ffi::TensorView num_real_reqs,
     int64_t page_size,
     int64_t item_size_bytes) {
@@ -377,6 +398,8 @@ void load_cache_to_device_buffer(
       static_cast<const int64_t*>(req_pool_indices.data_ptr()),
       static_cast<const int32_t*>(seq_lens.data_ptr()),
       static_cast<int16_t*>(lru_slots.data_ptr()),
+      static_cast<int32_t*>(top_k_hit_counts.data_ptr()),
+      static_cast<int32_t*>(top_k_valid_counts.data_ptr()),
       static_cast<const int32_t*>(num_real_reqs.data_ptr()),
       buffer_stride_0,
       host_stride,

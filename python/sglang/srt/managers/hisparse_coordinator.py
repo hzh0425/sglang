@@ -111,6 +111,20 @@ class HiSparseCoordinator:
         self.top_k_device_locs_buffer = torch.full(
             (max_num_reqs, self.top_k), -1, dtype=torch.int32, device=device
         )
+        self.top_k_hit_counts_buffer = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.top_k_valid_counts_buffer = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self._num_layers = layer_num
+        self._swap_layer_hit_rates = [0.0] * layer_num
+        self._swap_layer_hits = [0] * layer_num
+        self._swap_layer_valid = [0] * layer_num
+        self._swap_layer_seen = [False] * layer_num
+        self._swap_seen_layers = 0
+        self._swap_step_counter = 0
+        self.last_swap_hit_rate = 0.0
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -309,8 +323,11 @@ class HiSparseCoordinator:
         out_cache_loc: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor | None = None,
     ) -> None:
-        req_pool_indices_cpu = req_pool_indices.cpu()
+        # Backward compatibility: older callsites may pass req_pool_indices_cpu explicitly.
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = req_pool_indices.cpu()
 
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -554,25 +571,23 @@ class HiSparseCoordinator:
         seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
-    ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices."""
-        # The CUDA kernel expects req_pool_indices as int64 and seq_lens as int32.
+    ) -> tuple[torch.Tensor, float]:
+        """Swap selected top-k tokens into device memory and return indices + hit rate."""
+        # Normalize dtypes for kernel compatibility.
         if req_pool_indices.dtype != torch.int64:
-            raise ValueError(
-                f"req_pool_indices dtype {req_pool_indices.dtype} is not int64 as expected"
-            )
+            req_pool_indices = req_pool_indices.to(dtype=torch.int64)
         if seq_lens.dtype != torch.int32:
-            raise ValueError(
-                f"seq_lens dtype {seq_lens.dtype} is not int32 as expected"
-            )
+            seq_lens = seq_lens.to(dtype=torch.int32)
         if top_k_result.dtype != torch.int32:
-            raise ValueError(
-                f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
-            )
+            top_k_result = top_k_result.to(dtype=torch.int32)
 
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
+        top_k_hit_counts = self.top_k_hit_counts_buffer[:num_reqs]
+        top_k_valid_counts = self.top_k_valid_counts_buffer[:num_reqs]
         top_k_indices.fill_(-1)
+        top_k_hit_counts.zero_()
+        top_k_valid_counts.zero_()
         # todo, adjustable for performance
         block_size = 1024
         load_cache_to_device_buffer_mla(
@@ -586,6 +601,8 @@ class HiSparseCoordinator:
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             lru_slots=self.lru_slots[layer_id],
+            top_k_hit_counts=top_k_hit_counts,
+            top_k_valid_counts=top_k_valid_counts,
             item_size_bytes=self.mem_pool_host.token_stride_size,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
@@ -593,4 +610,29 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
-        return top_k_indices
+        total_hits = int(top_k_hit_counts.sum().item())
+        total_valid = int(top_k_valid_counts.sum().item())
+        hit_rate = (total_hits / total_valid) if total_valid > 0 else 0.0
+        if not self._swap_layer_seen[layer_id]:
+            self._swap_layer_seen[layer_id] = True
+            self._swap_seen_layers += 1
+        self._swap_layer_hit_rates[layer_id] = hit_rate
+        self._swap_layer_hits[layer_id] = total_hits
+        self._swap_layer_valid[layer_id] = total_valid
+
+        if self._swap_seen_layers == self._num_layers:
+            self._swap_step_counter += 1
+            avg_hit_rate = sum(self._swap_layer_hit_rates) / self._num_layers
+            agg_hits = sum(self._swap_layer_hits)
+            agg_valid = sum(self._swap_layer_valid)
+            self.last_swap_hit_rate = avg_hit_rate
+            logger.info(
+                "HiSparse cache hit rate (all-layer avg): step=%d hit_rate=%.2f%% (%d/%d)",
+                self._swap_step_counter,
+                avg_hit_rate * 100.0,
+                agg_hits,
+                agg_valid,
+            )
+            self._swap_layer_seen = [False] * self._num_layers
+            self._swap_seen_layers = 0
+        return top_k_indices, hit_rate
