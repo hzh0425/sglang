@@ -16,10 +16,17 @@ namespace {
 constexpr int WARP_SIZE = 32;
 constexpr int32_t TOKEN_HIT = 0xFFFFFFFF;
 constexpr int32_t HASH_EMPTY = -1;
+constexpr int64_t EVICTION_POLICY_LRU = 0;
+constexpr int64_t EVICTION_POLICY_RANDOM = 1;
+constexpr int64_t EVICTION_POLICY_FIFO = 2;
 
 // Knuth multiplicative hash for open-addressing table of size hash_size.
 __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
+}
+
+__device__ __forceinline__ uint32_t lcg_next(uint32_t state) {
+  return state * 1664525u + 1013904223u;
 }
 
 __device__ __forceinline__ void
@@ -79,6 +86,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t lru_slot_stride_0,
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
+    int64_t eviction_policy,
     int64_t page_size,
     int64_t item_size_bytes) {
   // todo hisparse: support page wise sparsity
@@ -260,19 +268,24 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  // Write back LRU order: evictables at front (LRU), hits at back (MRU).
-  {
-    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
-    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
-      if (i < total_evictable) {
-        // Evictables: source at backward end, dest at LRU front
-        req_lru_slots[i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
-      } else {
-        // Hits: source at forward end, dest at MRU back
-        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+  const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+  if (tid == 0) {
+    if (eviction_policy == EVICTION_POLICY_RANDOM) {
+      // Fisher-Yates shuffle on the logical eviction order.
+      // Logical index i maps to s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i].
+      uint32_t seed = static_cast<uint32_t>(rid) ^ (static_cast<uint32_t>(seq_len) * 1103515245u);
+      for (int i = 0; i < total_evictable; ++i) {
+        seed = lcg_next(seed);
+        int j = i + static_cast<int>(seed % static_cast<uint32_t>(total_evictable - i));
+        const int idx_i = HOT_BUFFER_SIZE - 1 - i;
+        const int idx_j = HOT_BUFFER_SIZE - 1 - j;
+        int16_t tmp = s_lru_slots_out[idx_i];
+        s_lru_slots_out[idx_i] = s_lru_slots_out[idx_j];
+        s_lru_slots_out[idx_j] = tmp;
       }
     }
   }
+  __syncthreads();
 
   // Reset offsets for the miss counting phase (only NUM_TOKEN_CHUNKS + 1 entries needed).
   for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
@@ -331,6 +344,7 @@ __global__ void load_cache_to_device_buffer_kernel(
 
   total_misses = s_valid_top_k_count - s_total_hits - s_newest_hit;
   if (total_misses < 0) total_misses = 0;
+  if (total_misses > total_evictable) total_misses = total_evictable;
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
@@ -347,6 +361,41 @@ __global__ void load_cache_to_device_buffer_kernel(
       const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
       auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
       transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+    }
+  }
+  __syncthreads();
+
+  if (eviction_policy == EVICTION_POLICY_LRU) {
+    // Write back LRU order: evictables at front (LRU), hits at back (MRU).
+    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+      if (i < total_evictable) {
+        // Evictables: source at backward end, dest at LRU front
+        req_lru_slots[i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else {
+        // Hits: source at forward end, dest at MRU back
+        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+      }
+    }
+  } else {
+    // FIFO / RANDOM: keep relative order of survivors, append newly inserted slots at the tail.
+    if (tid == 0) {
+      int write_idx = 0;
+      for (int i = 0; i < HOT_BUFFER_SIZE; ++i) {
+        const int16_t slot = req_lru_slots[i];
+        bool is_evicted = false;
+        for (int j = 0; j < total_misses; ++j) {
+          if (s_lru_slots_out[HOT_BUFFER_SIZE - 1 - j] == slot) {
+            is_evicted = true;
+            break;
+          }
+        }
+        if (!is_evicted) {
+          req_lru_slots[write_idx++] = slot;
+        }
+      }
+      for (int j = 0; j < total_misses; ++j) {
+        req_lru_slots[write_idx++] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - j];
+      }
     }
   }
   if (tid == 0) {
@@ -372,6 +421,7 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_hit_counts,
     tvm::ffi::TensorView top_k_valid_counts,
     tvm::ffi::TensorView num_real_reqs,
+    int64_t eviction_policy,
     int64_t page_size,
     int64_t item_size_bytes) {
   using namespace host;
@@ -406,6 +456,7 @@ void load_cache_to_device_buffer(
       lru_slot_stride_0,
       top_k_tokens_stride,
       top_k_device_locs_stride,
+      eviction_policy,
       page_size,
       item_size_bytes);
 }

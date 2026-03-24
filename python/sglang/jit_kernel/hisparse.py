@@ -49,6 +49,7 @@ def load_cache_to_device_buffer_mla(
     lru_slots: torch.Tensor,
     top_k_hit_counts: torch.Tensor,
     top_k_valid_counts: torch.Tensor,
+    eviction_policy: int,
     item_size_bytes: int,
     num_top_k: int,
     hot_buffer_size: int,
@@ -87,6 +88,7 @@ def load_cache_to_device_buffer_mla(
         top_k_hit_counts,
         top_k_valid_counts,
         num_real_reqs,
+        eviction_policy,
         page_size,
         item_size_bytes,
     )

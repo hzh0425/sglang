@@ -1,6 +1,7 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
+import os
 from typing import List, NamedTuple
 
 import torch
@@ -19,6 +20,12 @@ from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
+
+HISPARSE_EVICTION_POLICY = {
+    "lru": 0,
+    "random": 1,
+    "fifo": 2,
+}
 
 
 class HiSparseAct(NamedTuple):
@@ -43,6 +50,15 @@ class HiSparseCoordinator:
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        policy_name = os.getenv("SGLANG_HISPARSE_EVICTION_POLICY", "lru").lower()
+        if policy_name not in HISPARSE_EVICTION_POLICY:
+            raise ValueError(
+                "Invalid SGLANG_HISPARSE_EVICTION_POLICY. "
+                f"Expected one of {list(HISPARSE_EVICTION_POLICY.keys())}, got {policy_name!r}"
+            )
+        self.eviction_policy_name = policy_name
+        self.eviction_policy = HISPARSE_EVICTION_POLICY[policy_name]
+        logger.info("HiSparse eviction policy: %s", self.eviction_policy_name)
 
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
@@ -603,6 +619,7 @@ class HiSparseCoordinator:
             lru_slots=self.lru_slots[layer_id],
             top_k_hit_counts=top_k_hit_counts,
             top_k_valid_counts=top_k_valid_counts,
+            eviction_policy=self.eviction_policy,
             item_size_bytes=self.mem_pool_host.token_stride_size,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
