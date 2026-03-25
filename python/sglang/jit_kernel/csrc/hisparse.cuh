@@ -29,6 +29,15 @@ __device__ __forceinline__ uint32_t lcg_next(uint32_t state) {
   return state * 1664525u + 1013904223u;
 }
 
+__device__ __forceinline__ int gcd_int(int a, int b) {
+  while (b != 0) {
+    int t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   const uint64_t* __restrict__ src = static_cast<const uint64_t*>(src_addr);
@@ -148,12 +157,17 @@ __global__ void load_cache_to_device_buffer_kernel(
   __shared__ int32_t s_total_hits;
   __shared__ int32_t s_newest_hit;
   __shared__ int32_t s_valid_top_k_count;
+  __shared__ int32_t s_random_start;
+  __shared__ int32_t s_random_step;
+  __shared__ uint8_t s_slot_evicted[HOT_BUFFER_SIZE];
 
   // Initialize shared memory: counters, hash table, prefix-sum offsets.
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
     s_valid_top_k_count = 0;
+    s_random_start = 0;
+    s_random_step = 1;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -271,17 +285,21 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
   if (tid == 0) {
     if (eviction_policy == EVICTION_POLICY_RANDOM) {
-      // Fisher-Yates shuffle on the logical eviction order.
-      // Logical index i maps to s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i].
+      // Use a lightweight permutation instead of full shuffle:
+      // evict_rank(i) = (start + i * step) % total_evictable.
       uint32_t seed = static_cast<uint32_t>(rid) ^ (static_cast<uint32_t>(seq_len) * 1103515245u);
-      for (int i = 0; i < total_evictable; ++i) {
+      seed = lcg_next(seed);
+      s_random_start = (total_evictable > 0) ? static_cast<int>(seed % static_cast<uint32_t>(total_evictable)) : 0;
+      if (total_evictable > 1) {
         seed = lcg_next(seed);
-        int j = i + static_cast<int>(seed % static_cast<uint32_t>(total_evictable - i));
-        const int idx_i = HOT_BUFFER_SIZE - 1 - i;
-        const int idx_j = HOT_BUFFER_SIZE - 1 - j;
-        int16_t tmp = s_lru_slots_out[idx_i];
-        s_lru_slots_out[idx_i] = s_lru_slots_out[idx_j];
-        s_lru_slots_out[idx_j] = tmp;
+        int step = 1 + static_cast<int>(seed % static_cast<uint32_t>(total_evictable - 1));
+        while (gcd_int(step, total_evictable) != 1) {
+          step++;
+          if (step >= total_evictable) step = 1;
+        }
+        s_random_step = step;
+      } else {
+        s_random_step = 1;
       }
     }
   }
@@ -332,7 +350,11 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     if (is_miss) {
       int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
-      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      int evict_rank = miss_offset;
+      if (eviction_policy == EVICTION_POLICY_RANDOM && total_evictable > 0) {
+        evict_rank = (s_random_start + miss_offset * s_random_step) % total_evictable;
+      }
+      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_rank];
       // Reuse s_top_k_tokens as miss scratch: miss_offset < my_token_idx always
       // holds (hits are skipped), so compacted writes never overrun pending reads.
       s_top_k_tokens[miss_offset] = my_token;
@@ -348,7 +370,11 @@ __global__ void load_cache_to_device_buffer_kernel(
   // each warp copies one miss directly, can be separated into a new kernel if parallelism is a concern
   for (int miss_idx = warp_id; miss_idx < total_misses; miss_idx += NUM_WARPS) {
     const int32_t miss_token = s_top_k_tokens[miss_idx];
-    const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_idx];
+    int evict_rank = miss_idx;
+    if (eviction_policy == EVICTION_POLICY_RANDOM && total_evictable > 0) {
+      evict_rank = (s_random_start + miss_idx * s_random_step) % total_evictable;
+    }
+    const int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_rank];
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
@@ -379,22 +405,32 @@ __global__ void load_cache_to_device_buffer_kernel(
   } else {
     // FIFO / RANDOM: keep relative order of survivors, append newly inserted slots at the tail.
     if (tid == 0) {
+      for (int i = 0; i < HOT_BUFFER_SIZE; ++i) {
+        s_slot_evicted[i] = 0;
+      }
+      for (int j = 0; j < total_misses; ++j) {
+        int evict_rank = j;
+        if (eviction_policy == EVICTION_POLICY_RANDOM && total_evictable > 0) {
+          evict_rank = (s_random_start + j * s_random_step) % total_evictable;
+        }
+        int evict_slot = static_cast<int>(s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_rank]);
+        if (evict_slot >= 0 && evict_slot < HOT_BUFFER_SIZE) {
+          s_slot_evicted[evict_slot] = 1;
+        }
+      }
       int write_idx = 0;
       for (int i = 0; i < HOT_BUFFER_SIZE; ++i) {
         const int16_t slot = req_lru_slots[i];
-        bool is_evicted = false;
-        for (int j = 0; j < total_misses; ++j) {
-          if (s_lru_slots_out[HOT_BUFFER_SIZE - 1 - j] == slot) {
-            is_evicted = true;
-            break;
-          }
-        }
-        if (!is_evicted) {
+        if (slot < 0 || slot >= HOT_BUFFER_SIZE || s_slot_evicted[slot] == 0) {
           req_lru_slots[write_idx++] = slot;
         }
       }
       for (int j = 0; j < total_misses; ++j) {
-        req_lru_slots[write_idx++] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - j];
+        int evict_rank = j;
+        if (eviction_policy == EVICTION_POLICY_RANDOM && total_evictable > 0) {
+          evict_rank = (s_random_start + j * s_random_step) % total_evictable;
+        }
+        req_lru_slots[write_idx++] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_rank];
       }
     }
   }

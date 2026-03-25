@@ -58,7 +58,6 @@ class HiSparseCoordinator:
             )
         self.eviction_policy_name = policy_name
         self.eviction_policy = HISPARSE_EVICTION_POLICY[policy_name]
-        logger.info("HiSparse eviction policy: %s", self.eviction_policy_name)
 
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
@@ -99,6 +98,9 @@ class HiSparseCoordinator:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self.tp_rank = torch.distributed.get_rank(group=self.tp_group)
+        if self.tp_rank == 0:
+            logger.info("HiSparse eviction policy: %s", self.eviction_policy_name)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -140,6 +142,11 @@ class HiSparseCoordinator:
         self._swap_layer_seen = [False] * layer_num
         self._swap_seen_layers = 0
         self._swap_step_counter = 0
+        self._swap_log_window_steps = 100
+        self._swap_window_hit_rate_sum = 0.0
+        self._swap_window_count = 0
+        self._swap_window_hits_sum = 0
+        self._swap_window_valid_sum = 0
         self.last_swap_hit_rate = 0.0
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
@@ -151,6 +158,20 @@ class HiSparseCoordinator:
 
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
+
+    def _reset_swap_hit_rate_stats(self) -> None:
+        """Reset swap hit-rate statistics."""
+        self._swap_layer_hit_rates = [0.0] * self._num_layers
+        self._swap_layer_hits = [0] * self._num_layers
+        self._swap_layer_valid = [0] * self._num_layers
+        self._swap_layer_seen = [False] * self._num_layers
+        self._swap_seen_layers = 0
+        self._swap_step_counter = 0
+        self._swap_window_hit_rate_sum = 0.0
+        self._swap_window_count = 0
+        self._swap_window_hits_sum = 0
+        self._swap_window_valid_sum = 0
+        self.last_swap_hit_rate = 0.0
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.staging = True
@@ -544,6 +565,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.staging = False
+        self._reset_swap_hit_rate_stats()
 
     def retract_req(self, req: Req) -> None:
         if req.staging:
@@ -580,6 +602,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._reset_swap_hit_rate_stats()
 
     def swap_in_selected_pages(
         self,
@@ -643,13 +666,30 @@ class HiSparseCoordinator:
             agg_hits = sum(self._swap_layer_hits)
             agg_valid = sum(self._swap_layer_valid)
             self.last_swap_hit_rate = avg_hit_rate
-            logger.info(
-                "HiSparse cache hit rate (all-layer avg): step=%d hit_rate=%.2f%% (%d/%d)",
-                self._swap_step_counter,
-                avg_hit_rate * 100.0,
-                agg_hits,
-                agg_valid,
-            )
+            self._swap_window_hit_rate_sum += avg_hit_rate
+            self._swap_window_count += 1
+            self._swap_window_hits_sum += agg_hits
+            self._swap_window_valid_sum += agg_valid
+            if self._swap_step_counter % self._swap_log_window_steps == 0:
+                window_avg_hit_rate = (
+                    self._swap_window_hit_rate_sum / self._swap_window_count
+                    if self._swap_window_count > 0
+                    else 0.0
+                )
+                if self.tp_rank == 0:
+                    logger.info(
+                        "HiSparse cache hit rate (all-layer avg, last %d steps): "
+                        "step=%d hit_rate=%.2f%% (%d/%d)",
+                        self._swap_log_window_steps,
+                        self._swap_step_counter,
+                        window_avg_hit_rate * 100.0,
+                        self._swap_window_hits_sum,
+                        self._swap_window_valid_sum,
+                    )
+                self._swap_window_hit_rate_sum = 0.0
+                self._swap_window_count = 0
+                self._swap_window_hits_sum = 0
+                self._swap_window_valid_sum = 0
             self._swap_layer_seen = [False] * self._num_layers
             self._swap_seen_layers = 0
         return top_k_indices, hit_rate
