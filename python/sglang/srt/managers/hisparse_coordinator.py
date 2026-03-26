@@ -161,6 +161,17 @@ class HiSparseCoordinator:
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
+    def admit_request_direct(self, req: Req) -> None:
+        """Direct-to-host path: KV data already resides in host pool via RDMA.
+
+        Skips staging DMA entirely. Only allocates a small device buffer
+        (4KB) for decode-time swap-in, then marks the request as ready.
+        Host indices were already written to req_to_host_pool during _pre_alloc.
+        """
+        self.alloc_device_buffer(req)
+        req.staging = False
+        self._skip_first_backup[req.req_pool_idx] = True
+
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
@@ -531,6 +542,18 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
+        # Free hisparse indices still in the mapping.  When a request is
+        # aborted before alloc_device_buffer() (e.g. pd transfer failure), the
+        # pre-allocated hisparse indices remain in the mapping and must be
+        # freed here; otherwise they leak. 
+        remaining_hisparse = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+                allocated_locs
+            ]
+        )
+        remaining_to_free = remaining_hisparse[remaining_hisparse > 0]
+        if remaining_to_free.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(remaining_to_free)
         self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
             allocated_locs
         ] = 0

@@ -293,9 +293,16 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_data_ptrs, kv_data_lens, kv_item_lens = (
-            self.token_to_kv_pool.get_contiguous_buf_infos()
-        )
+        if self.scheduler.enable_hisparse:
+            # Direct-to-host: register host pool pointers so P writes to D's host memory
+            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                host_pool.get_contiguous_buf_infos()
+            )
+        else:
+            kv_data_ptrs, kv_data_lens, kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -309,7 +316,10 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.page_size = self.token_to_kv_pool.page_size
+        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
+        kv_args.page_size = (
+            1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
+        )
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -671,16 +681,20 @@ class DecodePreallocQueue:
                 decode_req.req.req_pool_idx
             ][: len(decode_req.req.origin_input_ids)]
             if self.scheduler.enable_hisparse:
+                # Direct-to-host: use host indices as RDMA destination
+                coordinator = self.scheduler.hisparse_coordinator
                 kv_indices = (
-                    self.token_to_kv_pool.translate_loc_to_hisparse_device(
-                        kv_indices_full
-                    )
+                    coordinator.req_to_host_pool[
+                        decode_req.req.req_pool_idx,
+                        : len(decode_req.req.origin_input_ids),
+                    ]
                     .cpu()
                     .numpy()
                 )
+                page_size = 1  # host pool page_size
             else:
                 kv_indices = kv_indices_full.cpu().numpy()
-            page_size = self.token_to_kv_pool_allocator.page_size
+                page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
@@ -807,8 +821,38 @@ class DecodePreallocQueue:
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
         req.kv_committed_len = fill_len
-        if self.token_to_kv_pool_allocator.page_size == 1:
+
+        if self.scheduler.enable_hisparse:
+            # Direct-to-host path: only allocate logical indices (no hisparse
+            # device indices) and allocate host indices for RDMA destination.
+            coordinator = self.scheduler.hisparse_coordinator
+            device = self.token_to_kv_pool_allocator.device
+            kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
+                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
+                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
+                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
+                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
+                extend_num_tokens=fill_len,
+            )
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
+
+            # Allocate host indices for the RDMA transfer target
+            host_indices = coordinator.mem_pool_host.alloc(fill_len)
+            if host_indices is None:
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
+                    f"in _pre_alloc (req {req.rid})"
+                )
+            host_indices = host_indices.to(device=coordinator.device)
+            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+        elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
         else:
             device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
@@ -819,10 +863,9 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-
-        assert (
-            kv_loc is not None
-        ), "KV cache is full! There is a bug in memory estimation."
+            assert (
+                kv_loc is not None
+            ), "KV cache is full! There is a bug in memory estimation."
 
         self.req_to_token_pool.write((req.req_pool_idx, slice(0, len(kv_loc))), kv_loc)
 
@@ -1211,6 +1254,8 @@ class SchedulerDisaggregationDecodeMixin:
             )  # the requests which kv has arrived
             if self.enable_hisparse:
                 for req in transferred_reqs:
-                    self.hisparse_coordinator.admit_request_into_staging(req)
+                    # Direct-to-host: KV data already in host pool, skip staging
+                    self.hisparse_coordinator.admit_request_direct(req)
+                self.waiting_queue.extend(transferred_reqs)
             else:
                 self.waiting_queue.extend(transferred_reqs)
