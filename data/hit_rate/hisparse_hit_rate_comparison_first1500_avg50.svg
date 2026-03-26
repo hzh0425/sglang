@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+<rect width="100%" height="100%" fill="white"/>
+<text x="600.0" y="36" text-anchor="middle" font-size="22" font-family="Arial">Hit Rate (first 1500 steps, avg every 50 steps)</text>
+<line x1="90" y1="640.00" x2="980" y2="640.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="645.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">0.012</text>
+<line x1="90" y1="526.00" x2="980" y2="526.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="531.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">0.209</text>
+<line x1="90" y1="412.00" x2="980" y2="412.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="417.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">0.407</text>
+<line x1="90" y1="298.00" x2="980" y2="298.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="303.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">0.605</text>
+<line x1="90" y1="184.00" x2="980" y2="184.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="189.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">0.802</text>
+<line x1="90" y1="70.00" x2="980" y2="70.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="75.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">1.000</text>
+<line x1="90.00" y1="70" x2="90.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="90.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1</text>
+<line x1="179.00" y1="70" x2="179.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="179.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">148</text>
+<line x1="268.00" y1="70" x2="268.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="268.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">296</text>
+<line x1="357.00" y1="70" x2="357.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="357.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">444</text>
+<line x1="446.00" y1="70" x2="446.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="446.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">591</text>
+<line x1="535.00" y1="70" x2="535.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="535.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">738</text>
+<line x1="624.00" y1="70" x2="624.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="624.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">886</text>
+<line x1="713.00" y1="70" x2="713.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="713.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1034</text>
+<line x1="802.00" y1="70" x2="802.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="802.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1181</text>
+<line x1="891.00" y1="70" x2="891.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="891.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1328</text>
+<line x1="980.00" y1="70" x2="980.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="980.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1476</text>
+<line x1="90" y1="640" x2="980" y2="640" stroke="#111827" stroke-width="1.5"/>
+<line x1="90" y1="70" x2="90" y2="640" stroke="#111827" stroke-width="1.5"/>
+<text x="535.0" y="698" text-anchor="middle" font-size="16" font-family="Arial">step</text>
+<text x="26" y="355.0" text-anchor="middle" font-size="16" font-family="Arial" transform="rotate(-90 26 355.0)">hit_rate</text>
+<polyline points="90.00,599.46 105.39,216.89 135.56,228.97 165.73,252.68 195.89,274.48 226.06,260.37 256.23,223.51 286.40,199.86 316.57,209.80 346.74,205.23 376.91,196.24 407.08,204.12 437.25,207.55 467.42,201.61 497.59,180.87 527.76,187.11 557.93,192.61 588.10,176.88 618.27,171.67 648.44,168.46 678.61,183.71 708.78,165.91 738.95,159.73 769.12,174.67 799.28,182.35 829.45,183.85 859.62,146.83 889.79,152.93 919.96,183.51 950.13,162.53 980.00,159.48" fill="none" stroke="#1f77b4" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="90" x2="1038" y2="90" stroke="#1f77b4" stroke-width="3"/>
+<text x="1048" y="95" font-size="15" font-family="Arial" fill="#111827">2048</text>
+<polyline points="90.00,590.60 105.39,144.17 135.56,168.61 165.73,196.00 195.89,189.71 226.06,177.29 256.23,135.58 286.40,143.49 316.57,142.55 346.74,142.12 376.91,153.35 407.08,153.97 437.25,145.30 467.42,134.83 497.59,133.18 527.76,131.79 557.93,128.74 588.10,129.29 618.27,122.46 648.44,122.16 678.61,124.20 708.78,119.00 738.95,113.47 769.12,121.25 799.28,129.15 829.45,106.82 859.62,101.40 889.79,124.19 919.96,103.43 950.13,106.15 980.00,114.09" fill="none" stroke="#ff7f0e" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="120" x2="1038" y2="120" stroke="#ff7f0e" stroke-width="3"/>
+<text x="1048" y="125" font-size="15" font-family="Arial" fill="#111827">fifo_4096</text>
+<polyline points="90.00,590.11 105.39,141.27 135.56,173.06 165.73,185.09 195.89,181.99 226.06,157.99 256.23,126.70 286.40,136.76 316.57,153.50 346.74,139.70 376.91,137.63 407.08,133.57 437.25,126.49 467.42,128.16 497.59,128.25 527.76,113.81 557.93,123.37 588.10,119.24 618.27,114.94 648.44,122.62 678.61,120.56 708.78,108.07 738.95,119.36 769.12,115.10 799.28,113.31 829.45,97.41 859.62,101.62 889.79,116.49 919.96,97.82 950.13,104.55 980.00,111.96" fill="none" stroke="#d62728" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="150" x2="1038" y2="150" stroke="#d62728" stroke-width="3"/>
+<text x="1048" y="155" font-size="15" font-family="Arial" fill="#111827">random_4096</text>
+<polyline points="90.00,590.40 105.39,137.51 135.56,136.91 165.73,159.43 195.89,167.88 226.06,158.37 256.23,135.15 286.40,118.66 316.57,126.44 346.74,129.55 376.91,123.71 407.08,133.12 437.25,119.96 467.42,129.76 497.59,112.81 527.76,119.90 557.93,108.60 588.10,113.46 618.27,111.58 648.44,108.85 678.61,105.17 708.78,105.52 738.95,109.65 769.12,105.32 799.28,94.92 829.45,92.76 859.62,107.32 889.79,94.91 919.96,94.73 950.13,97.14 980.00,95.69" fill="none" stroke="#2ca02c" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="180" x2="1038" y2="180" stroke="#2ca02c" stroke-width="3"/>
+<text x="1048" y="185" font-size="15" font-family="Arial" fill="#111827">lru_4096</text>
+</svg>

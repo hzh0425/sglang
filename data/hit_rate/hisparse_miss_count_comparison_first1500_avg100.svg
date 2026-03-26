@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+<rect width="100%" height="100%" fill="white"/>
+<text x="600.0" y="36" text-anchor="middle" font-size="22" font-family="Arial">Miss Count (first 1500 steps, avg every 100 steps)</text>
+<line x1="90" y1="640.00" x2="980" y2="640.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="645.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">-55.2</text>
+<line x1="90" y1="526.00" x2="980" y2="526.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="531.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">360.5</text>
+<line x1="90" y1="412.00" x2="980" y2="412.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="417.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">776.1</text>
+<line x1="90" y1="298.00" x2="980" y2="298.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="303.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">1191.8</text>
+<line x1="90" y1="184.00" x2="980" y2="184.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="189.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">1607.5</text>
+<line x1="90" y1="70.00" x2="980" y2="70.00" stroke="#e5e7eb" stroke-width="1"/>
+<text x="78" y="75.00" text-anchor="end" font-size="14" font-family="Arial" fill="#374151">2023.2</text>
+<line x1="90.00" y1="70" x2="90.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="90.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1</text>
+<line x1="179.00" y1="70" x2="179.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="179.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">146</text>
+<line x1="268.00" y1="70" x2="268.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="268.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">291</text>
+<line x1="357.00" y1="70" x2="357.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="357.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">436</text>
+<line x1="446.00" y1="70" x2="446.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="446.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">581</text>
+<line x1="535.00" y1="70" x2="535.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="535.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">726</text>
+<line x1="624.00" y1="70" x2="624.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="624.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">871</text>
+<line x1="713.00" y1="70" x2="713.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="713.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1016</text>
+<line x1="802.00" y1="70" x2="802.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="802.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1161</text>
+<line x1="891.00" y1="70" x2="891.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="891.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1306</text>
+<line x1="980.00" y1="70" x2="980.00" y2="640" stroke="#f3f4f6" stroke-width="1"/>
+<text x="980.00" y="668" text-anchor="middle" font-size="14" font-family="Arial" fill="#374151">1451</text>
+<line x1="90" y1="640" x2="980" y2="640" stroke="#111827" stroke-width="1.5"/>
+<line x1="90" y1="70" x2="90" y2="640" stroke="#111827" stroke-width="1.5"/>
+<text x="535.0" y="698" text-anchor="middle" font-size="16" font-family="Arial">step</text>
+<text x="26" y="355.0" text-anchor="middle" font-size="16" font-family="Arial" transform="rotate(-90 26 355.0)">miss_count</text>
+<polyline points="90.00,109.31 121.00,475.95 182.38,436.37 243.76,457.44 305.13,493.57 366.51,497.56 427.89,492.60 489.27,506.80 550.65,508.15 612.03,523.33 673.41,521.56 734.79,534.47 796.17,519.20 857.55,532.02 918.93,529.22 980.00,536.23" fill="none" stroke="#1f77b4" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="90" x2="1038" y2="90" stroke="#1f77b4" stroke-width="3"/>
+<text x="1048" y="95" font-size="15" font-family="Arial" fill="#111827">2048</text>
+<polyline points="90.00,117.94 121.00,540.74 182.38,505.23 243.76,540.69 305.13,553.75 366.51,549.16 427.89,547.32 489.27,562.54 550.65,566.18 612.03,570.45 673.41,573.08 734.79,579.84 796.17,571.11 857.55,591.65 918.93,582.20 980.00,585.83" fill="none" stroke="#ff7f0e" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="120" x2="1038" y2="120" stroke="#ff7f0e" stroke-width="3"/>
+<text x="1048" y="125" font-size="15" font-family="Arial" fill="#111827">fifo_4096</text>
+<polyline points="90.00,118.41 121.00,539.98 182.38,514.30 243.76,554.41 305.13,551.70 366.51,558.00 427.89,566.41 489.27,568.18 550.65,577.54 612.03,579.01 673.41,574.63 734.79,582.29 796.17,581.81 857.55,596.12 918.93,588.68 980.00,587.64" fill="none" stroke="#d62728" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="150" x2="1038" y2="150" stroke="#d62728" stroke-width="3"/>
+<text x="1048" y="155" font-size="15" font-family="Arial" fill="#111827">random_4096</text>
+<polyline points="90.00,118.14 121.00,559.42 182.38,533.66 243.76,550.11 305.13,573.69 366.51,569.71 427.89,569.80 489.27,574.92 550.65,581.77 612.03,583.46 673.41,588.82 734.79,588.26 796.17,595.53 857.55,595.61 918.93,600.69 980.00,599.13" fill="none" stroke="#2ca02c" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+<line x1="1010" y1="180" x2="1038" y2="180" stroke="#2ca02c" stroke-width="3"/>
+<text x="1048" y="185" font-size="15" font-family="Arial" fill="#111827">lru_4096</text>
+</svg>

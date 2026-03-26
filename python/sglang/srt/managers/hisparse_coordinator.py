@@ -2,6 +2,8 @@
 
 import logging
 import os
+import json
+from pathlib import Path
 from typing import List, NamedTuple
 
 import torch
@@ -58,6 +60,18 @@ class HiSparseCoordinator:
             )
         self.eviction_policy_name = policy_name
         self.eviction_policy = HISPARSE_EVICTION_POLICY[policy_name]
+        self.hit_rate_log_enabled = (
+            os.getenv("SGLANG_HISPARSE_HIT_RATE_ENABLE_LOG", "1").lower() == "1"
+        )
+        self.hit_rate_file_enabled = (
+            os.getenv("SGLANG_HISPARSE_HIT_RATE_ENABLE_FILE", "1").lower() == "1"
+        )
+        self.hit_rate_log_every_steps = max(
+            1, int(os.getenv("SGLANG_HISPARSE_HIT_RATE_LOG_EVERY_STEPS", "100"))
+        )
+        self.hit_rate_output_dir = Path(
+            os.getenv("SGLANG_HISPARSE_HIT_RATE_OUTPUT_DIR", "data/hit_rate")
+        )
 
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
@@ -142,11 +156,10 @@ class HiSparseCoordinator:
         self._swap_layer_seen = [False] * layer_num
         self._swap_seen_layers = 0
         self._swap_step_counter = 0
-        self._swap_log_window_steps = 100
-        self._swap_window_hit_rate_sum = 0.0
-        self._swap_window_count = 0
-        self._swap_window_hits_sum = 0
-        self._swap_window_valid_sum = 0
+        self._swap_step_records: list[dict[str, float | int]] = []
+        self._swap_log_hit_rate_sum = 0.0
+        self._swap_log_miss_count_sum = 0.0
+        self._swap_log_count = 0
         self.last_swap_hit_rate = 0.0
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
@@ -167,11 +180,37 @@ class HiSparseCoordinator:
         self._swap_layer_seen = [False] * self._num_layers
         self._swap_seen_layers = 0
         self._swap_step_counter = 0
-        self._swap_window_hit_rate_sum = 0.0
-        self._swap_window_count = 0
-        self._swap_window_hits_sum = 0
-        self._swap_window_valid_sum = 0
+        self._swap_step_records = []
+        self._swap_log_hit_rate_sum = 0.0
+        self._swap_log_miss_count_sum = 0.0
+        self._swap_log_count = 0
         self.last_swap_hit_rate = 0.0
+
+    def _dump_swap_hit_rate_stats_to_file(self, req: Req) -> None:
+        """Persist per-step hit-rate stats to a file at request end."""
+        if (
+            self.tp_rank != 0
+            or not self.hit_rate_file_enabled
+            or not self._swap_step_records
+        ):
+            return
+        self.hit_rate_output_dir.mkdir(parents=True, exist_ok=True)
+        filename = (
+            f"hisparse_hit_rate_{self.eviction_policy_name}_{self.device_buffer_size}.jsonl"
+        )
+        output_path = self.hit_rate_output_dir / filename
+        with output_path.open("a", encoding="utf-8") as f:
+            for row in self._swap_step_records:
+                row_out = {
+                    "req_rid": req.rid,
+                    "req_pool_idx": req.req_pool_idx,
+                    "policy_name": self.eviction_policy_name,
+                    "device_buffer_size": self.device_buffer_size,
+                    "step": row["step"],
+                    "hit_rate": row["hit_rate"],
+                    "miss_count": row["miss_count"],
+                }
+                f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.staging = True
@@ -565,6 +604,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.staging = False
+        self._dump_swap_hit_rate_stats_to_file(req)
         self._reset_swap_hit_rate_stats()
 
     def retract_req(self, req: Req) -> None:
@@ -602,6 +642,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+        self._dump_swap_hit_rate_stats_to_file(req)
         self._reset_swap_hit_rate_stats()
 
     def swap_in_selected_pages(
@@ -665,31 +706,42 @@ class HiSparseCoordinator:
             avg_hit_rate = sum(self._swap_layer_hit_rates) / self._num_layers
             agg_hits = sum(self._swap_layer_hits)
             agg_valid = sum(self._swap_layer_valid)
+            avg_miss_count = max(agg_valid - agg_hits, 0) / self._num_layers
             self.last_swap_hit_rate = avg_hit_rate
-            self._swap_window_hit_rate_sum += avg_hit_rate
-            self._swap_window_count += 1
-            self._swap_window_hits_sum += agg_hits
-            self._swap_window_valid_sum += agg_valid
-            if self._swap_step_counter % self._swap_log_window_steps == 0:
-                window_avg_hit_rate = (
-                    self._swap_window_hit_rate_sum / self._swap_window_count
-                    if self._swap_window_count > 0
-                    else 0.0
+            if self.hit_rate_file_enabled:
+                self._swap_step_records.append(
+                    {
+                        "step": self._swap_step_counter,
+                        "hit_rate": avg_hit_rate,
+                        "miss_count": avg_miss_count,
+                    }
                 )
-                if self.tp_rank == 0:
-                    logger.info(
-                        "HiSparse cache hit rate (all-layer avg, last %d steps): "
-                        "step=%d hit_rate=%.2f%% (%d/%d)",
-                        self._swap_log_window_steps,
-                        self._swap_step_counter,
-                        window_avg_hit_rate * 100.0,
-                        self._swap_window_hits_sum,
-                        self._swap_window_valid_sum,
+            if self.hit_rate_log_enabled:
+                self._swap_log_hit_rate_sum += avg_hit_rate
+                self._swap_log_miss_count_sum += avg_miss_count
+                self._swap_log_count += 1
+                if self._swap_step_counter % self.hit_rate_log_every_steps == 0:
+                    window_avg_hit_rate = (
+                        self._swap_log_hit_rate_sum / self._swap_log_count
+                        if self._swap_log_count > 0
+                        else 0.0
                     )
-                self._swap_window_hit_rate_sum = 0.0
-                self._swap_window_count = 0
-                self._swap_window_hits_sum = 0
-                self._swap_window_valid_sum = 0
+                    window_avg_miss_count = (
+                        self._swap_log_miss_count_sum / self._swap_log_count
+                        if self._swap_log_count > 0
+                        else 0.0
+                    )
+                    if self.tp_rank == 0:
+                        logger.info(
+                            "HiSparse stats (last %d steps): step=%d hit_rate=%.4f miss_count=%.4f",
+                            self.hit_rate_log_every_steps,
+                            self._swap_step_counter,
+                            window_avg_hit_rate,
+                            window_avg_miss_count,
+                        )
+                    self._swap_log_hit_rate_sum = 0.0
+                    self._swap_log_miss_count_sum = 0.0
+                    self._swap_log_count = 0
             self._swap_layer_seen = [False] * self._num_layers
             self._swap_seen_layers = 0
         return top_k_indices, hit_rate
