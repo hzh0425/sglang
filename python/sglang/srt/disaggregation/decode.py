@@ -675,24 +675,17 @@ class DecodePreallocQueue:
                 break
 
             allocatable_tokens -= required_tokens_for_request
-            self._pre_alloc(decode_req.req)
+            dst_kv_indices = self._pre_alloc(decode_req.req)
 
-            kv_indices_full = self.req_to_token_pool.req_to_token[
-                decode_req.req.req_pool_idx
-            ][: len(decode_req.req.origin_input_ids)]
+            origin_input_len = len(decode_req.req.origin_input_ids)
             if self.scheduler.enable_hisparse:
-                # Direct-to-host: use host indices as RDMA destination
-                coordinator = self.scheduler.hisparse_coordinator
-                kv_indices = (
-                    coordinator.req_to_host_pool[
-                        decode_req.req.req_pool_idx,
-                        : len(decode_req.req.origin_input_ids),
-                    ]
-                    .cpu()
-                    .numpy()
-                )
+                # Direct-to-host: _pre_alloc returns host indices
+                kv_indices = dst_kv_indices[:origin_input_len].cpu().numpy()
                 page_size = 1  # host pool page_size
             else:
+                kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx
+                ][:origin_input_len]
                 kv_indices = kv_indices_full.cpu().numpy()
                 page_size = self.token_to_kv_pool_allocator.page_size
 
@@ -731,7 +724,9 @@ class DecodePreallocQueue:
                     decode_req.req.req_pool_idx, :seq_len
                 ]
                 state_indices = kv_indices_full.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
+                # Indexer lives on device pool; always use device page_size
+                device_page_size = self.token_to_kv_pool.page_size
+                state_indices = kv_to_page_indices(state_indices, device_page_size)
             else:
                 state_indices = None
 
@@ -873,6 +868,11 @@ class DecodePreallocQueue:
         req.fill_ids = req.origin_input_ids + req.output_ids
         req.set_extend_input_len(len(req.fill_ids))
 
+        # Return the transfer destination indices:
+        # - hisparse: host indices (RDMA writes to host pool)
+        # - non-hisparse: logical/device indices (RDMA writes to GPU pool)
+        if self.scheduler.enable_hisparse:
+            return host_indices
         return kv_loc
 
 
@@ -1228,8 +1228,8 @@ class SchedulerDisaggregationDecodeMixin:
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
-        if self.enable_hisparse:
-            self.waiting_queue.extend(self.hisparse_coordinator.collect_ready_reqs())
+        # if self.enable_hisparse:
+        #     self.waiting_queue.extend(self.hisparse_coordinator.collect_ready_reqs())
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
