@@ -315,7 +315,32 @@ class PrefillBootstrapQueue:
             assert req.metadata_buffer_index is not None
 
             num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
-            req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
+
+            # Detect hisparse: dst per-token item_len < src per-page item_len
+            hisparse_transfer = False
+            kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+            if kv_mgr is not None and hasattr(kv_mgr, "decode_kv_args_table") and hasattr(
+                kv_mgr, "transfer_infos"
+            ):
+                room_sessions = kv_mgr.transfer_infos.get(
+                    req.bootstrap_room, {}
+                )
+                for sid in room_sessions:
+                    if sid in kv_mgr.decode_kv_args_table:
+                        reg_info = kv_mgr.decode_kv_args_table[sid]
+                        if (
+                            reg_info.dst_kv_item_len
+                            < kv_mgr.kv_args.kv_item_lens[0]
+                        ):
+                            hisparse_transfer = True
+                    break
+            req._hisparse_transfer = hisparse_transfer
+
+            if hisparse_transfer:
+                # Token-level transfer: use token count, not page count
+                req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
+            else:
+                req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
             indices_to_remove.add(i)
@@ -713,6 +738,7 @@ class SchedulerDisaggregationPrefillMixin:
         Send a prefilled chunk to the decode server
         """
         page_size = self.token_to_kv_pool_allocator.page_size
+        hisparse_transfer = getattr(req, "_hisparse_transfer", False)
         start_idx = req.start_send_idx
         end_idx = (
             end_idx
@@ -720,7 +746,7 @@ class SchedulerDisaggregationPrefillMixin:
             else min(len(req.fill_ids), len(req.origin_input_ids))
         )
 
-        if not last_chunk:
+        if not last_chunk and not hisparse_transfer:
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
 
@@ -775,7 +801,11 @@ class SchedulerDisaggregationPrefillMixin:
                 state_indices = kv_indices_full.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
 
-        page_indices = kv_to_page_indices(kv_indices, page_size)
+        if hisparse_transfer:
+            # HiSparse: send token-level indices (dst host pool page_size=1)
+            page_indices = kv_indices
+        else:
+            page_indices = kv_to_page_indices(kv_indices, page_size)
         if len(page_indices) == 0:
             logger.info(
                 f"Skip sending kv chunk for request {req.rid=} {req.bootstrap_room=} because page_indices is empty"

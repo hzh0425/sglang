@@ -56,7 +56,7 @@ class HiSparseCoordinator:
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
 
-        max_num_reqs = req_to_token_pool.size
+        max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
 
         # to have an extra page for new tokens
@@ -119,6 +119,7 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_reqs
 
+
     def set_decode_producer_stream(self, stream) -> None:
         self.decode_producer_stream = stream
 
@@ -160,6 +161,64 @@ class HiSparseCoordinator:
                 device_indices.record_stream(self.write_staging_stream)
 
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+
+    def admit_request_direct(self, req: Req) -> None:
+        """Direct-to-host path: KV data already resides in host pool via RDMA.
+
+        Skips staging DMA entirely. Only allocates a small device buffer
+        (4KB) for decode-time swap-in, then marks the request as ready.
+        Host indices were already written to req_to_host_pool during _pre_alloc.
+
+        Metadata fixups after alloc_device_buffer():
+        - alloc_device_buffer() sets device_buffer_tokens = [0, 1, ..., buf_size-1],
+          which tells the swap-in kernel that those tokens are cached in the device
+          buffer.  In the staging path this is correct (prefill filled the buffer),
+          but here the buffer is empty.
+        - Short sequences (seq_len <= device_buffer_size): the kernel fast path
+          returns device_buffer_locs directly without any host loading, so we
+          must preload all tokens from host pool into the device buffer.
+        - Long sequences: we reset device_buffer_tokens to -1 so the kernel
+          treats every slot as a miss and loads from host on the first decode.
+        """
+        self.alloc_device_buffer(req)
+
+        if req.kv_allocated_len <= self.device_buffer_size:
+            # Short sequence: kernel fast path bypasses host loading entirely.
+            # Preload all tokens from host pool into the device buffer so that
+            # the KV data behind device_buffer_locs is valid.
+            self._preload_to_device_buffer(req)
+            # device_buffer_tokens = [0, 1, ..., n-1] set by alloc_device_buffer
+            # is now correct because the data is actually present.
+        else:
+            # Long sequence: reset device_buffer_tokens to -1 so the kernel
+            # sees all slots as empty → every top-k lookup is a miss → host load.
+            self.req_device_buffer_tokens[
+                :, req.req_pool_idx, : self.device_buffer_size
+            ] = -1
+
+        req.staging = False
+        self._skip_first_backup[req.req_pool_idx] = True
+        logger.info("HiSparse: admitting request %s directly", req.rid)
+
+    def _preload_to_device_buffer(self, req: Req) -> None:
+        """Preload all tokens from host pool into the device buffer.
+
+        Used by the direct-to-host path for short sequences where the swap-in
+        kernel's fast path (seq_len <= HOT_BUFFER_SIZE) returns device_buffer_locs
+        directly without performing any host→device copy.
+        """
+        n = req.kv_allocated_len
+        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.mem_pool_host.load_to_device_per_layer(
+                self.mem_pool_device,
+                host_indices,
+                device_locs,
+                layer_id,
+                io_backend="kernel",
+            )
 
     def alloc_device_buffer(self, req: Req) -> None:
         allocated_indices = self.req_to_token_pool.req_to_token[
@@ -531,6 +590,24 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.kv_allocated_len
         ]
+        # Free hisparse indices still in the mapping ONLY when the device
+        # buffer was never allocated (e.g. request aborted during staging
+        # before alloc_device_buffer() ran).  When current_cap > 0,
+        # alloc_device_buffer() already cleared the mapping and any entries
+        # written afterwards by map_last_loc_to_buffer() are device-buffer
+        # indices that were just freed in step 1 above; freeing them again
+        # would cause a page-level double-free.
+        if current_cap == 0:
+            remaining_hisparse = (
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+                    allocated_locs
+                ]
+            )
+            remaining_to_free = remaining_hisparse[remaining_hisparse > 0]
+            if remaining_to_free.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(
+                    remaining_to_free
+                )
         self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
             allocated_locs
         ] = 0
@@ -592,4 +669,5 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
+
         return top_k_indices

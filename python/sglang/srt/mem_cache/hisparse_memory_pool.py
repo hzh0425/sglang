@@ -180,38 +180,56 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "Page size = 1 is not supported in HiSparse allocator"
         )
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        """Allocate only logical indices without hisparse device indices.
+
+        Used in the direct-to-host transfer path where KV data is written
+        directly to host memory by the prefill node, skipping GPU staging.
+        """
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
+        # Filter valid (non-zero) hisparse indices.
+        # In the direct-to-host path, mapping is all zeros since no hisparse
+        # device indices were pre-allocated.
+        valid_hisparse = hisparse_indices[hisparse_indices > 0]
+        if len(valid_hisparse) >= need_size:
+            buffer_indices = valid_hisparse[:need_size]
+            self.free_hisparse_indices(valid_hisparse[need_size:])
         else:
-            # page alignment, claiming the residual space for an incomplete page
-            page_residual_length = len(hisparse_indices) % self.page_size
-            if page_residual_length != 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
-                )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
+            if len(valid_hisparse) > 0:
+                self.free_hisparse_indices(valid_hisparse)
+            # page alignment for residual
+            residual = len(valid_hisparse) % self.page_size
+            alloc_need = need_size - len(valid_hisparse)
+            if residual != 0:
+                alloc_need += self.page_size - residual
+            extra_indices = self.hisparse_attn_allocator.alloc(alloc_need)
             assert (
                 extra_indices is not None
             ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
+            buffer_indices = extra_indices[:need_size]
+            if len(extra_indices) > need_size:
+                self.free_hisparse_indices(extra_indices[need_size:])
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):

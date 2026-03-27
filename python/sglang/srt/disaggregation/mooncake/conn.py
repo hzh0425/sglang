@@ -371,6 +371,36 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
         )
 
+    def send_kvcache_hisparse(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        executor: concurrent.futures.ThreadPoolExecutor,
+    ):
+        """HiSparse transfer: src page_size > dst host page_size=1.
+
+        Converts src per-page kv_item_lens to per-token, then reuses
+        _send_kvcache_generic for token-level RDMA transfer.
+        Both src MLA buffer and dst host buffer are token-level flat,
+        so ptr + token_idx * bytes_per_token addresses correctly on both sides.
+        """
+        page_size = self.kv_args.page_size
+        per_token_item_lens = [
+            il // page_size for il in self.kv_args.kv_item_lens
+        ]
+
+        return self._send_kvcache_generic(
+            mooncake_session_id=mooncake_session_id,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=dst_kv_ptrs,
+            item_lens=per_token_item_lens,
+            prefill_data_indices=prefill_kv_indices,
+            dst_data_indices=dst_kv_indices,
+            executor=executor,
+        )
+
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
@@ -824,7 +854,20 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
+                        src_kv_item_len = self.kv_args.kv_item_lens[0]
+                        dst_kv_item_len = (
+                            target_rank_registration_info.dst_kv_item_len
+                        )
+                        if dst_kv_item_len < src_kv_item_len:
+                            # HiSparse: dst per-token < src per-page
+                            ret = self.send_kvcache_hisparse(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                executor,
+                            )
+                        elif self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
