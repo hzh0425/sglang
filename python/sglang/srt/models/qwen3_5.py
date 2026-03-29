@@ -578,6 +578,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z_shape_og = z.shape
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
+
+        if core_attn_out.shape != z.shape:
+            core_attn_out_pad = torch.zeros_like(z)
+            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
+            core_attn_out = core_attn_out_pad
+
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
@@ -610,7 +616,9 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         self.experts = get_moe_impl_class(quant_config)(
             layer_id=layer_id,
             top_k=config.num_experts_per_tok,
-            num_experts=config.num_experts,
+            num_experts=(
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
+            ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -645,6 +653,9 @@ class Qwen3_5SparseMoeBlock(nn.Module):
 
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_moe_expert_parallel_world_size()
+            self.num_experts = (
+                config.num_experts + get_global_server_args().ep_num_redundant_experts
+            )
         else:
             self.ep_size = 1
 
@@ -689,16 +700,17 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             state.router_logits = None
 
     def op_shared_experts(self, state):
-        hidden_states_mlp_input = state.hidden_states_mlp_input
+        hidden_states_mlp_input = state.pop("hidden_states_mlp_input")
         shared_output = None
         if self.shared_expert is not None and is_non_idle_and_non_empty(
             state.forward_batch.forward_mode, hidden_states_mlp_input
         ):
             shared_output = self.shared_expert(hidden_states_mlp_input)
             shared_output = (
-                F.sigmoid(self.shared_expert_gate(hidden_states_mlp_input))
+                torch.sigmoid(self.shared_expert_gate(hidden_states_mlp_input))
                 * shared_output
             )
+        state.hidden_states_mlp_input = hidden_states_mlp_input
         state.shared_output = shared_output
 
     def op_select_experts(self, state):
@@ -758,7 +770,6 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             )
 
     def op_output(self, state):
-        state.pop("hidden_states_mlp_input")
         final_hidden_states = state.pop("hidden_states_after_combine")
         if (shared_output := state.pop("shared_output")) is not None:
             final_hidden_states = final_hidden_states + shared_output
