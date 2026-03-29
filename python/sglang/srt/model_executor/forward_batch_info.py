@@ -912,6 +912,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # function is refactored and merged into the Scheduler.
         if self.tbo_children:
             for child in self.tbo_children:
+                if (
+                    child.forward_mode.is_decode()
+                    or child.forward_mode.is_target_verify()
+                    or child.forward_mode.is_idle()
+                ):
+                    child.batch_size = child.tbo_padded_len
                 child._pad_inputs_to_size(
                     model_runner, child.tbo_padded_len, child.batch_size
                 )

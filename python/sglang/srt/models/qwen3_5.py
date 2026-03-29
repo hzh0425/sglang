@@ -710,7 +710,6 @@ class Qwen3_5SparseMoeBlock(nn.Module):
                 torch.sigmoid(self.shared_expert_gate(hidden_states_mlp_input))
                 * shared_output
             )
-        state.hidden_states_mlp_input = hidden_states_mlp_input
         state.shared_output = shared_output
 
     def op_select_experts(self, state):
