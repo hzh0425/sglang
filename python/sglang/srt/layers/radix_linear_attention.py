@@ -22,6 +22,7 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -91,14 +92,48 @@ class RadixLinearAttention(nn.Module):
                 self.layer_id,
             )
             return output
-        else:
-            return forward_batch.attn_backend.forward(
+
+        backend = forward_batch.attn_backend
+        # TBO and hybrid wrappers should expose a custom `forward`, but some
+        # split paths may hand linear attention layers a direct linear backend.
+        # In that case, route by forward mode instead of falling back to the
+        # abstract AttentionBackend.forward(q, k, v, ...) signature.
+        backend_with_custom_forward = backend
+        if (
+            type(backend_with_custom_forward).forward is AttentionBackend.forward
+            and (primary := getattr(backend_with_custom_forward, "primary", None))
+            is not None
+        ):
+            backend_with_custom_forward = primary
+
+        if type(backend_with_custom_forward).forward is AttentionBackend.forward:
+            if forward_batch.forward_mode.is_idle():
+                return mixed_qkv.new_empty(
+                    mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim
+                )
+            if forward_batch.forward_mode.is_decode():
+                return backend_with_custom_forward.forward_decode(
+                    layer=self,
+                    forward_batch=forward_batch,
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                )
+            return backend_with_custom_forward.forward_extend(
                 layer=self,
                 forward_batch=forward_batch,
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
             )
+
+        return backend.forward(
+            layer=self,
+            forward_batch=forward_batch,
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+        )
 
 
 @register_custom_op(mutates_args=["output"])
