@@ -42,6 +42,7 @@ from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_pp_indices,
+    tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -72,9 +73,18 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    DeepEPMode,
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    DeepEPBuffer,
+    _DeepEPDispatcherImplNormal,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     PerTensorScaleParameter,
@@ -659,20 +669,70 @@ class Qwen3_5SparseMoeBlock(nn.Module):
         else:
             self.ep_size = 1
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+        self._maybe_enable_extend_normal_deepep()
+
+    def _maybe_enable_extend_normal_deepep(self):
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            or not get_deepep_mode().is_low_latency()
+        ):
+            return
+
+        dispatchers = getattr(
+            self.experts.dispatcher, "_inners", [self.experts.dispatcher]
+        )
+        for dispatcher in dispatchers:
+            if not hasattr(dispatcher, "_low_latency_dispatcher") or hasattr(
+                dispatcher, "_normal_dispatcher"
+            ):
+                continue
+
+            ll_dispatcher = dispatcher._low_latency_dispatcher
+            normal_dispatcher = _DeepEPDispatcherImplNormal(
+                group=ll_dispatcher.group,
+                router_topk=ll_dispatcher.router_topk,
+                permute_fusion=ll_dispatcher.permute_fusion,
+                num_experts=ll_dispatcher.num_experts,
+                num_local_experts=ll_dispatcher.num_local_experts,
+                hidden_size=ll_dispatcher.hidden_size,
+                params_dtype=ll_dispatcher.params_dtype,
+                deepep_mode=DeepEPMode.AUTO,
+                async_finish=True,
+            )
+            normal_dispatcher.set_quant_config(ll_dispatcher.quant_config)
+            dispatcher._normal_dispatcher = normal_dispatcher
+            dispatcher.deepep_mode = DeepEPMode.AUTO
+            DeepEPBuffer.get_deepep_buffer(
+                group=ll_dispatcher.group,
+                hidden_size=ll_dispatcher.hidden_size,
+                param_bytes=ll_dispatcher.params_bytes,
+                deepep_mode=DeepEPMode.AUTO,
+                num_max_dispatch_tokens_per_rank=ll_dispatcher.num_max_dispatch_tokens_per_rank,
+                num_experts=ll_dispatcher.num_experts,
+            )
+
+    def _forward_shared_experts(self, hidden_states: torch.Tensor):
+        shared_output = None
+        if self.shared_expert is not None:
+            shared_output = self.shared_expert(hidden_states)
+            shared_output = (
+                torch.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
+            )
+        return shared_output
+
+    def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        shared_output = None
         if hidden_states.shape[0] > 0:
             router_logits, _ = self.gate(hidden_states)
+            shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
+                expert_location_dispatch_info=(
+                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                    if not self.is_nextn
+                    else None
                 ),
             )
         else:
@@ -682,14 +742,67 @@ class Qwen3_5SparseMoeBlock(nn.Module):
             topk_output=topk_output,
         )
 
-        if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
-            shared_output = (
-                torch.sigmoid(self.shared_expert_gate(hidden_states)) * shared_output
-            )
-            final_hidden_states = final_hidden_states + shared_output
+        if shared_output is not None:
+            final_hidden_states.add_(shared_output)
 
         return final_hidden_states
+
+    def _forward_router_experts(self, hidden_states: torch.Tensor):
+        router_logits, _ = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        return self.experts(hidden_states, topk_output)
+
+    def forward_normal_dual_stream(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        shared_output = self._forward_shared_experts(hidden_states.clone())
+
+        with torch.cuda.stream(self.alt_stream):
+            router_output = self._forward_router_experts(hidden_states)
+
+        current_stream.wait_stream(self.alt_stream)
+
+        return router_output, shared_output
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+        use_reduce_scatter: bool = False,
+        should_allreduce_fusion: bool = False,
+    ) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if get_moe_a2a_backend().is_deepep():
+            return self._forward_deepep(hidden_states, forward_batch)
+
+        if (
+            self.alt_stream is not None
+            and hidden_states.shape[0] > 0
+            and get_is_capture_mode()
+        ):
+            final_hidden_states, shared_output = self.forward_normal_dual_stream(
+                hidden_states
+            )
+        else:
+            shared_output = self._forward_shared_experts(hidden_states)
+            final_hidden_states = self._forward_router_experts(hidden_states)
+
+        if shared_output is not None:
+            final_hidden_states += shared_output
+        if (
+            self.tp_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states.view(num_tokens, hidden_dim)
 
     def op_gate(self, state):
         if is_non_idle_and_non_empty(
@@ -732,9 +845,27 @@ class Qwen3_5SparseMoeBlock(nn.Module):
 
     def op_dispatch_a(self, state):
         if self.ep_size > 1:
+            hidden_states = state.hidden_states_mlp_input
+            topk_output = state.pop("topk_output")
+
+            resolved_deepep_mode = get_deepep_mode().resolve(
+                state.forward_batch.forward_mode.is_extend()
+            )
+            if resolved_deepep_mode.is_low_latency():
+                num_token_non_padded = state.forward_batch.num_token_non_padded_cpu
+                if (
+                    num_token_non_padded is not None
+                    and num_token_non_padded < hidden_states.shape[0]
+                ):
+                    hidden_states = hidden_states[:num_token_non_padded]
+                    topk_output = topk_output._replace(
+                        topk_weights=topk_output.topk_weights[:num_token_non_padded],
+                        topk_ids=topk_output.topk_ids[:num_token_non_padded],
+                    )
+
             self.experts.dispatcher.dispatch_a(
-                hidden_states=state.hidden_states_mlp_input,
-                topk_output=state.pop("topk_output"),
+                hidden_states=hidden_states,
+                topk_output=topk_output,
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -886,6 +1017,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
                 use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
             )
         else:
             hidden_states = self.mlp(
@@ -1217,6 +1349,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
                 use_reduce_scatter=use_reduce_scatter,
+                should_allreduce_fusion=should_allreduce_fusion,
             )
         else:
             hidden_states = self.mlp(

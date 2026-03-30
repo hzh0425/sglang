@@ -163,6 +163,36 @@ class TestQwen35TwoBatchOverlap(TestTwoBatchOverlap):
                 "--trust-remote-code",
                 "--tp",
                 "2",
+                "--dp",
+                "1",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-mode",
+                "low_latency",
+                #"--enable-two-batch-overlap",
+                "--mamba-scheduler-strategy",
+                "extra_buffer",
+                "--page-size",
+                "64",
+            ],
+        )
+
+class TestQwen35Baseline(TestTwoBatchOverlap):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3.5-35B-A3B-FP8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        #with envs.SGLANG_ENABLE_JIT_DEEPGEMM.override(False):
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            #env=cls.launch_env,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
                 # "--dp",
                 # "1",
                 # "--enable-dp-attention",
@@ -182,4 +212,3 @@ class TestQwen35TwoBatchOverlap(TestTwoBatchOverlap):
 
 if __name__ == "__main__":
     unittest.main()
-

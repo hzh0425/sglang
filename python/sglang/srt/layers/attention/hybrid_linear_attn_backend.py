@@ -152,6 +152,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
+        padded_bs = bs
 
         retrieve_next_token = None
         retrieve_next_sibling = None
@@ -167,8 +168,20 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            if (
+                forward_batch.tbo_padded_len is not None
+                and forward_batch.tbo_padded_len > bs
+            ):
+                padded_bs = forward_batch.tbo_padded_len
+                pad_len = padded_bs - bs
+                mamba_cache_indices = torch.cat(
+                    [
+                        mamba_cache_indices,
+                        mamba_cache_indices.new_full((pad_len,), PAD_SLOT_ID),
+                    ]
+                )
             query_start_loc = torch.arange(
-                0, bs + 1, dtype=torch.int32, device=self.device
+                0, padded_bs + 1, dtype=torch.int32, device=self.device
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
