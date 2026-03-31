@@ -1035,6 +1035,7 @@ class MoriKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        cached_tokens: int = 0,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return

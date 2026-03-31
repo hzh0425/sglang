@@ -105,6 +105,7 @@ class FakeKVReceiver(BaseKVReceiver):
         kv_indices: list[int],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        cached_tokens: int = 0,
     ):
         self.has_sent_metadata = True
         logger.debug(

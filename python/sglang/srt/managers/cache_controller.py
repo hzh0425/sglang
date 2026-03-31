@@ -714,6 +714,18 @@ class HiCacheController:
         )
         return device_indices
 
+    def load_to_indices(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int = -1,
+    ) -> torch.Tensor:
+        """Load KV from host to pre-allocated device indices (no allocation)."""
+        self.load_queue.append(
+            CacheOperation(host_indices, device_indices, node_id)
+        )
+        return device_indices
+
     def move_indices(self, op: CacheOperation):
         host_indices, device_indices = op.host_indices, op.device_indices
         # move indices to GPU if using kernels, to host if using direct indexing

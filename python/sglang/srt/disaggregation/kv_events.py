@@ -78,6 +78,24 @@ class OffloadedState:
         self.last_hash = last_hash
 
 
+class PrefetchState:
+    """Track the state of an in-flight HiCache prefetch (Storage -> Host -> Device)."""
+
+    def __init__(
+        self,
+        prefetch_op,  # PrefetchOperation
+        host_indices,  # torch.Tensor
+        device_indices,  # torch.Tensor
+        cached_tokens: int,
+    ):
+        self.prefetch_op = prefetch_op
+        self.host_indices = host_indices
+        self.device_indices = device_indices
+        self.cached_tokens = cached_tokens
+        self.phase: str = "s2h"  # "s2h" | "h2d" | "done"
+        self.load_ack = None  # HiCacheAck set when transitioning to h2d
+
+
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
     parent_block_hash: Optional[int]

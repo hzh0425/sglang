@@ -221,6 +221,8 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    hicache_cached_tokens: int = 0
+    hicache_prefetch_done: bool = True
 
     @property
     def seqlen(self) -> int:
@@ -681,14 +683,55 @@ class DecodePreallocQueue:
             allocatable_tokens -= required_tokens_for_request
             self._pre_alloc(decode_req.req)
 
+            origin_len = len(decode_req.req.origin_input_ids)
+            page_size = self.token_to_kv_pool_allocator.page_size
+
+            # Query HiCache storage for cached prefix tokens
+            cached_tokens = 0
+            if self.scheduler.server_args.disaggregation_decode_enable_offload_kvcache:
+                cached_tokens = (
+                    self.scheduler.decode_offload_manager.query_storage_cached_tokens(
+                        decode_req.req.origin_input_ids
+                    )
+                )
+                if self.tp_size > 1:
+                    cached_tensor = torch.tensor(
+                        [cached_tokens], dtype=torch.int, device="cpu"
+                    )
+                    torch.distributed.all_reduce(
+                        cached_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.gloo_group,
+                    )
+                    cached_tokens = cached_tensor.item()
+                if cached_tokens > 0:
+                    kv_loc = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx
+                    ]
+                    prefetch_started = self.scheduler.decode_offload_manager.start_prefetch(
+                        decode_req.req, cached_tokens, kv_loc,
+                    )
+                    if prefetch_started:
+                        decode_req.hicache_cached_tokens = cached_tokens
+                        decode_req.hicache_prefetch_done = False
+                    else:
+                        # Prefetch failed to start, fall back to full PD transfer
+                        cached_tokens = 0
+
+            # Only send non-cached kv_indices to P side
+            if cached_tokens > 0:
+                logger.info(
+                    f"[HiCache-Inc] D-side pop_preallocated: req={decode_req.req.rid}, "
+                    f"cached_tokens={cached_tokens}, transfer_tokens={origin_len - cached_tokens}, "
+                    f"total={origin_len}"
+                )
             kv_indices = (
                 self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                    : len(decode_req.req.origin_input_ids)
+                    cached_tokens:origin_len
                 ]
                 .cpu()
                 .numpy()
             )
-            page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
@@ -735,7 +778,10 @@ class DecodePreallocQueue:
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
             decode_req.kv_receiver.send_metadata(
-                page_indices, decode_req.metadata_buffer_index, state_indices
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                cached_tokens=cached_tokens,
             )
             preallocated_reqs.append(decode_req)
             indices_to_remove.add(i)
@@ -927,6 +973,9 @@ class DecodeTransferQueue:
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
+        # Add HiCache prefetch cached tokens
+        if decode_req.hicache_cached_tokens > 0:
+            decode_req.req.cached_tokens += decode_req.hicache_cached_tokens
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
@@ -980,11 +1029,25 @@ class DecodeTransferQueue:
                 )
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                # Clean up any in-flight HiCache prefetch state
+                if not decode_req.hicache_prefetch_done:
+                    if self.scheduler.server_args.disaggregation_decode_enable_offload_kvcache:
+                        self.scheduler.decode_offload_manager.cleanup_prefetch(
+                            decode_req.req.rid
+                        )
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                # HiCache dual-path sync: wait for prefetch to complete too
+                if not decode_req.hicache_prefetch_done:
+                    continue
+                if decode_req.hicache_cached_tokens > 0:
+                    logger.info(
+                        f"[HiCache-Inc] D-side dual-path sync complete: req={decode_req.req.rid}, "
+                        f"hicache_cached={decode_req.hicache_cached_tokens}"
+                    )
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
@@ -1179,7 +1242,13 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler):
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
-            self.decode_offload_manager.check_offload_progress()
+            # check_offload_progress now also TP-syncs prefetch phase transitions
+            # and returns completed prefetch rids (merged all_reduce)
+            completed_rids = self.decode_offload_manager.check_offload_progress()
+            if completed_rids:
+                for decode_req in self.disagg_decode_transfer_queue.queue:
+                    if decode_req.req.rid in completed_rids:
+                        decode_req.hicache_prefetch_done = True
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()

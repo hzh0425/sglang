@@ -136,6 +136,7 @@ class BaseKVReceiver(ABC):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        cached_tokens: int = 0,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.

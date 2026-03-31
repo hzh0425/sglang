@@ -246,6 +246,34 @@ class PrefillBootstrapQueue:
         """
         req.sampling_params.max_new_tokens = 1
 
+    def _get_dst_page_count(self, req: Req, page_size: int) -> int:
+        """Get num_pages from D-side TransferInfo (dst_kv_indices length).
+
+        Falls back to computing from origin_input_ids when TransferInfo
+        is unavailable (e.g. fake backend or no HiCache).
+        """
+        sender = req.disagg_kv_sender
+        room = getattr(sender, "bootstrap_room", None)
+        if room is None:
+            return kv_to_page_num(len(req.origin_input_ids), page_size)
+        transfer_infos = getattr(sender.kv_mgr, "transfer_infos", None)
+        if transfer_infos and room in transfer_infos:
+            infos = transfer_infos[room]
+            # infos is a dict keyed by session_id / engine_key / agent_name
+            for info in infos.values():
+                if hasattr(info, "dst_kv_indices") and not info.is_dummy:
+                    dst_pages = len(info.dst_kv_indices)
+                    full_pages = kv_to_page_num(len(req.origin_input_ids), page_size)
+                    if dst_pages < full_pages:
+                        logger.info(
+                            f"[HiCache-Inc] P-side dst_page_count: req={req.rid}, "
+                            f"dst_pages={dst_pages} (full={full_pages}, "
+                            f"saved={full_pages - dst_pages} pages)"
+                        )
+                    return dst_pages
+        # Fallback: full transfer (no HiCache or fake backend)
+        return kv_to_page_num(len(req.origin_input_ids), page_size)
+
     def pop_bootstrapped(
         self,
         return_failed_reqs: bool = False,
@@ -314,7 +342,12 @@ class PrefillBootstrapQueue:
             )
             assert req.metadata_buffer_index is not None
 
-            num_pages = kv_to_page_num(num_kv_indices, self.token_to_kv_pool.page_size)
+            # Use D-side dst_kv_indices length to determine num_pages.
+            # When HiCache incremental transfer is active, D only sends
+            # dst_indices[cached_tokens:], so len(dst_kv_indices) is already
+            # the adjusted (non-cached) page count.
+            page_size = self.token_to_kv_pool.page_size
+            num_pages = self._get_dst_page_count(req, page_size)
             req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
 
             bootstrapped_reqs.append(req)
@@ -703,6 +736,24 @@ class SchedulerDisaggregationPrefillMixin:
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
+    def _get_hicache_cached_tokens(self: Scheduler, req: Req) -> int:
+        """Get cached_tokens from D-side TransferInfo for HiCache incremental transfer."""
+        sender = req.disagg_kv_sender
+        room = getattr(sender, "bootstrap_room", None)
+        if room is None:
+            return 0
+        transfer_infos = getattr(sender.kv_mgr, "transfer_infos", None)
+        if transfer_infos and room in transfer_infos:
+            infos = transfer_infos[room]
+            cached_values = [
+                getattr(info, "cached_tokens", 0)
+                for info in infos.values()
+                if getattr(info, "cached_tokens", 0) > 0
+            ]
+            if cached_values:
+                return min(cached_values)
+        return 0
+
     def send_kv_chunk(
         self: Scheduler,
         req: Req,
@@ -714,6 +765,18 @@ class SchedulerDisaggregationPrefillMixin:
         """
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
+
+        # HiCache incremental transfer: skip cached prefix on first send
+        if start_idx == 0:
+            cached_tokens = self._get_hicache_cached_tokens(req)
+            if cached_tokens > 0:
+                req.start_send_idx = cached_tokens
+                start_idx = cached_tokens
+                logger.info(
+                    f"[HiCache-Inc] P-side send_kv_chunk: req={req.rid}, "
+                    f"skipping cached prefix, start_send_idx={cached_tokens}"
+                )
+
         end_idx = (
             end_idx
             if end_idx is not None

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.disaggregation.kv_events import OffloadedState
+from sglang.srt.disaggregation.kv_events import OffloadedState, PrefetchState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -104,6 +104,7 @@ class DecodeKVCacheOffloadManager:
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         self.offloaded_state = {}
+        self.ongoing_prefetch = {}
         logger.info("Enable offload kv cache for decode side")
 
     def offload_kv_cache(self, req) -> bool:
@@ -180,24 +181,95 @@ class DecodeKVCacheOffloadManager:
         return True
 
     def check_offload_progress(self):
-        """Check the progress of offload from device to host and backup from host to storage."""
+        """Check offload (D→H→S) and prefetch (S→H→D) progress.
+
+        Prefetch phase transitions are TP-synced via a single merged all_reduce
+        to prevent transfer_queue length divergence across ranks.
+
+        Returns:
+            List of request rids whose prefetch completed this tick.
+        """
         cc = self.cache_controller
 
-        qsizes = torch.tensor(
-            [
-                len(cc.ack_write_queue),
-                cc.ack_backup_queue.qsize(),
-            ],
+        # --- Collect local prefetch phase status ---
+        prefetch_rids = list(self.ongoing_prefetch.keys())
+        n_pf = len(prefetch_rids)
+        s2h_local = []
+        h2d_local = []
+        for rid in prefetch_rids:
+            state = self.ongoing_prefetch[rid]
+            if state.phase == "s2h":
+                op = state.prefetch_op
+                s2h_local.append(
+                    1
+                    if (op.is_terminated() or op.completed_tokens >= state.cached_tokens)
+                    else 0
+                )
+                h2d_local.append(0)
+            elif state.phase == "h2d":
+                s2h_local.append(0)
+                h2d_local.append(
+                    1
+                    if (
+                        state.load_ack is not None
+                        and state.load_ack.finish_event.query()
+                    )
+                    else 0
+                )
+            else:
+                s2h_local.append(0)
+                h2d_local.append(0)
+
+        # --- Single all_reduce: [n_write, n_backup, s2h_0..s2h_n, h2d_0..h2d_n] ---
+        sync_data = torch.tensor(
+            [len(cc.ack_write_queue), cc.ack_backup_queue.qsize()]
+            + s2h_local
+            + h2d_local,
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
             torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+                sync_data, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_write, n_backup = map(int, qsizes.tolist())
+        n_write = int(sync_data[0])
+        n_backup = int(sync_data[1])
+        s2h_synced = sync_data[2 : 2 + n_pf]
+        h2d_synced = sync_data[2 + n_pf : 2 + 2 * n_pf]
+
+        # --- Process offload / backup ---
         self._check_offload_progress(n_write)
         self._check_backup_progress(n_backup)
+
+        # --- Advance prefetch phases (TP-synced) ---
+        completed = []
+        for idx, rid in enumerate(prefetch_rids):
+            state = self.ongoing_prefetch[rid]
+            if state.phase == "s2h" and s2h_synced[idx].item() == 1:
+                # All ranks agree S→H is done – start H→D
+                self.cache_controller.load_to_indices(
+                    host_indices=state.host_indices,
+                    device_indices=state.device_indices,
+                )
+                self.cache_controller.start_loading()
+                state.load_ack = self.cache_controller.ack_load_queue[-1]
+                state.phase = "h2d"
+                logger.info(
+                    f"[HiCache-Inc] D-side prefetch s2h->h2d: req={rid}, "
+                    f"completed_tokens={state.prefetch_op.completed_tokens}/{state.cached_tokens}"
+                )
+            elif state.phase == "h2d" and h2d_synced[idx].item() == 1:
+                # All ranks agree H→D is done – mark complete
+                state.phase = "done"
+                completed.append(rid)
+                self.decode_host_mem_pool.free(state.host_indices)
+                del self.ongoing_prefetch[rid]
+                logger.info(
+                    f"[HiCache-Inc] D-side prefetch DONE: req={rid}, "
+                    f"cached_tokens={state.cached_tokens}"
+                )
+
+        return completed
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
@@ -294,10 +366,106 @@ class DecodeKVCacheOffloadManager:
             page_hashes.append(last_hash)
         return page_hashes
 
+    def query_storage_cached_tokens(self, tokens) -> int:
+        """Query storage backend to find how many consecutive prefix tokens are cached (page-aligned)."""
+        if not self.cache_controller.enable_storage:
+            logger.info("[HiCache-Inc] D-side query: storage NOT enabled, skip")
+            return 0
+        page_aligned_len = (len(tokens) // self.page_size) * self.page_size
+        if page_aligned_len == 0:
+            return 0
+
+        # Diagnostic: compute first page hash manually and check file existence
+        from sglang.srt.mem_cache.hicache_storage import get_hash_str
+
+        first_page_tokens = tokens[: self.page_size]
+        first_hash = get_hash_str(list(first_page_tokens), prior_hash=None)
+        sb = self.cache_controller.storage_backend
+        suffix = getattr(sb, "config_suffix", "N/A")
+        storage_dir = getattr(sb, "file_path", "N/A")
+        import os
+
+        expected_file = os.path.join(storage_dir, f"{first_hash}{suffix}.bin")
+        file_exists = os.path.exists(expected_file)
+        logger.info(
+            f"[HiCache-Inc] DIAG: first_page_tokens[:5]={list(first_page_tokens[:5])}, "
+            f"first_hash={first_hash[:16]}..., suffix={suffix}, "
+            f"file_exists={file_exists}, path={expected_file}"
+        )
+        # Also list a few actual files for comparison
+        try:
+            actual_files = os.listdir(storage_dir)[:3]
+            logger.info(
+                f"[HiCache-Inc] DIAG: sample files in storage: {actual_files}"
+            )
+        except Exception as e:
+            logger.info(f"[HiCache-Inc] DIAG: cannot list storage dir: {e}")
+
+        page_hashes, hit_count = self.cache_controller._storage_hit_query(
+            type(
+                "_Dummy",
+                (),
+                {
+                    "last_hash": None,
+                    "token_ids": tokens[:page_aligned_len],
+                    "prefix_keys": None,
+                },
+            )()
+        )
+        logger.info(
+            f"[HiCache-Inc] D-side storage query: {hit_count}/{page_aligned_len} tokens cached "
+            f"({hit_count // self.page_size} pages), total_pages={page_aligned_len // self.page_size}"
+        )
+        return hit_count
+
+    def start_prefetch(
+        self, req, cached_tokens: int, device_indices: torch.Tensor
+    ) -> bool:
+        """Start async prefetch for [0:cached_tokens] from storage to device."""
+        host_indices = self.decode_host_mem_pool.alloc(cached_tokens)
+        if host_indices is None:
+            logger.warning(
+                f"Not enough host memory for prefetch of request {req.rid}"
+            )
+            return False
+        tokens = req.origin_input_ids[:cached_tokens]
+        prefetch_op = self.cache_controller.prefetch(
+            request_id=req.rid,
+            host_indices=host_indices,
+            new_input_tokens=tokens,
+            last_hash=None,
+        )
+        self.ongoing_prefetch[req.rid] = PrefetchState(
+            prefetch_op=prefetch_op,
+            host_indices=host_indices,
+            device_indices=device_indices[:cached_tokens].clone().to(torch.int64),
+            cached_tokens=cached_tokens,
+        )
+        logger.info(
+            f"[HiCache-Inc] D-side prefetch started: req={req.rid}, "
+            f"cached_tokens={cached_tokens}, host_indices={len(host_indices)}"
+        )
+        return True
+
+    def is_prefetch_done(self, rid: str) -> bool:
+        """Check if prefetch for a given request is complete."""
+        return rid not in self.ongoing_prefetch
+
+    def cleanup_prefetch(self, rid: str):
+        """Clean up prefetch state for a failed/aborted request. Releases host memory."""
+        if rid in self.ongoing_prefetch:
+            state = self.ongoing_prefetch.pop(rid)
+            self.decode_host_mem_pool.free(state.host_indices)
+            logger.debug(f"Cleaned up prefetch state for request {rid}")
+
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
         if req.req_pool_idx == -1:
             return
+        # Clean up any pending prefetch state
+        if req.rid in self.ongoing_prefetch:
+            state = self.ongoing_prefetch.pop(req.rid)
+            self.decode_host_mem_pool.free(state.host_indices)
         state = self.offloaded_state.get(req.rid)
         if state is None:
             prefill_len = len(req.origin_input_ids) // self.page_size * self.page_size
