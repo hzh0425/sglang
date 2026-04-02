@@ -77,12 +77,18 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.recv_requests()
-                    self.process_input_requests(recv_reqs)
+                    if self.pp_group.is_first_rank:
+                        recv_reqs = self.recv_requests()
+                    else:
+                        recv_reqs = self._pp_recv_tagged_pyobj_from_prev_stage("reqs")
+                        self.process_input_requests(recv_reqs)
+                    if self.pp_group.is_first_rank:
+                        self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                        self.send_req_work = self._pp_send_tagged_pyobj_to_next_stage(
+                            "reqs",
                             recv_reqs,
                             async_send=True,
                         )
@@ -98,7 +104,11 @@ class SchedulerPPMixin:
                         self._pp_prefetch_status_map = hicache_sync_payload
                         self._pp_hicache_events_done = True
                     else:
-                        hicache_sync_payload = self._pp_recv_pyobj_from_prev_stage()
+                        hicache_sync_payload = (
+                            self._pp_recv_tagged_pyobj_from_prev_stage(
+                                "hicache_prefetch_status"
+                            )
+                        )
                         if self.enable_hierarchical_cache:
                             self.tree_cache.apply_pp_prefetch_status_map(
                                 hicache_sync_payload
@@ -107,8 +117,10 @@ class SchedulerPPMixin:
                         self._pp_hicache_events_done = True
                     if not self.pp_group.is_last_rank:
                         self._hicache_send_work = (
-                            self._pp_send_pyobj_to_next_stage(
-                                hicache_sync_payload, async_send=True
+                            self._pp_send_tagged_pyobj_to_next_stage(
+                                "hicache_prefetch_status",
+                                hicache_sync_payload,
+                                async_send=True,
                             )
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
@@ -559,6 +571,7 @@ class SchedulerPPMixin:
         self._hicache_send_work = []
         self._pp_prefetch_status_map = {}
         self.launch_event = None
+        self._pp_pyobj_inbox: Dict[str, deque] = defaultdict(deque)
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
@@ -913,6 +926,14 @@ class SchedulerPPMixin:
             )
         return p2p_work
 
+    def _pp_send_tagged_pyobj_to_next_stage(
+        self: Scheduler, kind: str, data, async_send: bool = False
+    ):
+        return self._pp_send_pyobj_to_next_stage(
+            {"__pp_pyobj_kind__": kind, "payload": data},
+            async_send=async_send,
+        )
+
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
             dp_offset = self.attn_dp_rank * self.attn_tp_size
@@ -943,6 +964,30 @@ class SchedulerPPMixin:
             )
 
         return data
+
+    def _pp_recv_tagged_pyobj_from_prev_stage(self: Scheduler, kind: str):
+        if kind in self._pp_pyobj_inbox and self._pp_pyobj_inbox[kind]:
+            return self._pp_pyobj_inbox[kind].popleft()
+
+        while True:
+            data = self._pp_recv_pyobj_from_prev_stage()
+            if (
+                isinstance(data, dict)
+                and data.get("__pp_pyobj_kind__") is not None
+                and "payload" in data
+            ):
+                msg_kind = data["__pp_pyobj_kind__"]
+                payload = data["payload"]
+                if msg_kind == kind:
+                    return payload
+                self._pp_pyobj_inbox[msg_kind].append(payload)
+                continue
+
+            if kind == "reqs":
+                return data
+            raise TypeError(
+                f"Expected tagged PP pyobj kind={kind}, got {type(data).__name__}"
+            )
 
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
