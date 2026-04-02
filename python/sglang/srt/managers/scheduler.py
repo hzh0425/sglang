@@ -2275,6 +2275,38 @@ class Scheduler(
 
         return ret
 
+    def _pp_collect_prefetch_status(self) -> dict[str, dict[str, int | str]]:
+        status_map = {}
+        for req in self.waiting_queue:
+            settled = self.tree_cache.get_prefetch_settled_result(req.rid)
+            if settled is not None:
+                status_map[req.rid] = settled
+                continue
+
+            if req.rid not in self.tree_cache.ongoing_prefetch:
+                self.tree_cache.set_prefetch_settled_result(req.rid, "REVOKED", 0)
+                status_map[req.rid] = {
+                    "status": "REVOKED",
+                    "loaded_from_storage": 0,
+                }
+                continue
+
+            if self.tree_cache.check_prefetch_progress(req.rid):
+                settled = self.tree_cache.get_prefetch_settled_result(req.rid)
+                if settled is None:
+                    self.tree_cache.set_prefetch_settled_result(req.rid, "REVOKED", 0)
+                    settled = {
+                        "status": "REVOKED",
+                        "loaded_from_storage": 0,
+                    }
+                status_map[req.rid] = settled
+            else:
+                status_map[req.rid] = {
+                    "status": "ONGOING",
+                    "loaded_from_storage": 0,
+                }
+        return status_map
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2285,7 +2317,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+            if not getattr(self, "_pp_hicache_events_done", False):
+                self.tree_cache.check_hicache_events()
+            else:
+                self._pp_hicache_events_done = False
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2388,16 +2423,32 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+                if self.pp_size > 1:
+                    settled = self._pp_prefetch_status_map.get(req.rid)
+                    if settled is None or settled["status"] == "ONGOING":
+                        continue
+                    req.storage_hit_length = settled["loaded_from_storage"]
+                else:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(
+                        req.rid
+                    )
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        continue
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    req.storage_hit_length = self.tree_cache.get_prefetch_loaded_tokens(
+                        req.rid
+                    )
 
             req.init_next_round_input(self.tree_cache)
+            logger.info(
+                f"[PP{self.pp_rank}][DIAG-SCHED] add_one_req:"
+                f" req={req.rid} fill_ids_len={len(req.fill_ids)}"
+                f" prefix_indices_len={len(req.prefix_indices)}"
+                f" extend_input_len={req.extend_input_len}"
+                f" host_hit_length={req.host_hit_length}"
+                f" storage_hit_length={getattr(req, 'storage_hit_length', 0)}"
+            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -147,14 +148,20 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
-        # track per-request tokens loaded from storage (L3 hits)
-        # key: request_id, value: number of tokens actually loaded from storage
+        # Stable per-request settled prefetch metadata.
+        # These values are read during scheduling and must remain available across
+        # repeated scheduling attempts until the request is cleaned up.
+        self.prefetch_terminal_status_by_reqid: dict[str, str] = {}
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         # todo: dynamically adjust the threshold
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
+        self._ready_prefetch_successes = deque()
+        self._ready_prefetch_success_set = set()
+        self._pp_prefetch_status_wait_timeout_s = 60.0
+        self._pp_prefetch_status_wait_sleep_s = 0.001
 
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
@@ -474,7 +481,9 @@ class HiRadixCache(RadixCache):
 
         def _drain_revoke():
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                self._discard_ready_prefetch_success(req_id)
                 info = self.ongoing_prefetch.pop(req_id, None)
+                self.set_prefetch_settled_result(req_id, "REVOKED", 0)
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
                     last_host_node.release_host()
@@ -587,6 +596,7 @@ class HiRadixCache(RadixCache):
         self.cache_controller.reset()
         self.token_to_kv_pool_host.clear()
         # Clear per-request tracking dicts
+        self.prefetch_terminal_status_by_reqid.clear()
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
         self.pinned_size_ = 0
@@ -686,11 +696,7 @@ class HiRadixCache(RadixCache):
         if len(self.ongoing_write_through) == 0:
             return
 
-        finish_count = 0
-        for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-            if not finish_event.query():
-                break
-            finish_count += 1
+        finish_count = self._count_ready_write_acks()
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
             # synchronize TP workers to make the same update to radix cache
@@ -701,13 +707,31 @@ class HiRadixCache(RadixCache):
             )
 
         finish_count = int(queue_size.item())
-        while finish_count > 0:
-            _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
+        self._drain_write_ack_impl(finish_count)
+
+    def _count_ready_write_acks(self) -> int:
+        finish_count = 0
+        for _, finish_event, _ in self.cache_controller.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+        return finish_count
+
+    def _drain_write_ack_impl(self, finish_count: int):
+        while finish_count > 0 and self.cache_controller.ack_write_queue:
+            _, finish_event, ack_list = self.cache_controller.ack_write_queue[0]
+            if not finish_event.query():
+                break
+            self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
+                    logger.info(
+                        f"[PP{self.pp_rank}][DIAG-WT] writing_check: write_backup_storage"
+                        f" node_id={backuped_node.id} key_len={len(backuped_node.key)}"
+                    )
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
@@ -981,6 +1005,11 @@ class HiRadixCache(RadixCache):
             key = self.get_child_key_fn(x.key)
             v = x.parent.children.pop(key, None)
             assert v == x, f"parent does not have child key, {key}"
+            logger.info(
+                f"[PP{self.pp_rank}][DIAG-EVICT-HOST] evict_host:"
+                f" node_id={x.id} key_len={len(x.key)}"
+                f" parent_id={x.parent.id} evicted_tokens={len(x.host_value)}"
+            )
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
@@ -1086,11 +1115,173 @@ class HiRadixCache(RadixCache):
     def flush_write_through_acks(self) -> None:
         self.writing_check()
 
+    def _discard_ready_prefetch_success(self, req_id: str):
+        if req_id not in self._ready_prefetch_success_set:
+            return
+        self._ready_prefetch_success_set.discard(req_id)
+        try:
+            self._ready_prefetch_successes.remove(req_id)
+        except ValueError:
+            pass
+
+    def _poll_ready_prefetch_successes(self):
+        for req_id, (_, _, _, operation) in self.ongoing_prefetch.items():
+            if req_id in self._ready_prefetch_success_set:
+                continue
+            if operation.host_indices is None:
+                continue
+            if not self.can_terminate_prefetch(operation):
+                break
+            self._ready_prefetch_successes.append(req_id)
+            self._ready_prefetch_success_set.add(req_id)
+
+    def _count_ready_prefetch_successes(self) -> int:
+        self._poll_ready_prefetch_successes()
+        return len(self._ready_prefetch_successes)
+
+    def _finalize_prefetch_success(self, req_id: str):
+        if req_id not in self.ongoing_prefetch:
+            self._discard_ready_prefetch_success(req_id)
+            return
+
+        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+            req_id
+        ]
+        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
+            operation
+        )
+        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+
+        min_completed_tokens = completed_tokens
+        if self.tp_world_size > 1:
+            completed_tokens_tensor = torch.tensor(
+                min_completed_tokens, dtype=torch.int
+            )
+            torch.distributed.all_reduce(
+                completed_tokens_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+            min_completed_tokens = completed_tokens_tensor.item()
+        fetched_token_ids = token_ids[:min_completed_tokens]
+        written_indices = host_indices[:min_completed_tokens]
+        logger.info(
+            f"[PP{self.pp_rank}][DIAG-PREFETCH] check_prefetch_progress DONE:"
+            f" req={req_id} completed_tokens={completed_tokens}"
+            f" min_completed_tokens={min_completed_tokens}"
+            f" last_host_node_id={last_host_node.id}"
+            f" total_prefetch_tokens={len(token_ids)}"
+        )
+        matched_length = self._insert_helper_host(
+            last_host_node,
+            RadixKey(
+                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
+            ),
+            written_indices,
+            hash_value[: min_completed_tokens // self.page_size],
+        )
+
+        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+        self.cache_controller.append_host_mem_release(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
+        last_host_node.release_host()
+        del self.ongoing_prefetch[req_id]
+        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+
+        loaded_from_storage = min_completed_tokens - matched_length
+        self.set_prefetch_settled_result(req_id, "DONE", loaded_from_storage)
+        self._discard_ready_prefetch_success(req_id)
+
+        if self.enable_storage_metrics:
+            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+
+    def _drain_ready_prefetch_successes_impl(self, count: int):
+        self._poll_ready_prefetch_successes()
+        while count > 0 and self._ready_prefetch_successes:
+            req_id = self._ready_prefetch_successes.popleft()
+            self._ready_prefetch_success_set.discard(req_id)
+            self._finalize_prefetch_success(req_id)
+            count -= 1
+
+    def set_prefetch_settled_result(
+        self, req_id: str, status: str, loaded_from_storage: int = 0
+    ):
+        self.prefetch_terminal_status_by_reqid[req_id] = status
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+
+    def get_prefetch_settled_result(
+        self, req_id: str
+    ) -> Optional[dict[str, int | str]]:
+        status = self.prefetch_terminal_status_by_reqid.get(req_id)
+        if status is None:
+            return None
+        return {
+            "status": status,
+            "loaded_from_storage": self.prefetch_loaded_tokens_by_reqid.get(req_id, 0),
+        }
+
+    def clear_prefetch_settled_result(self, req_id: str):
+        self.prefetch_terminal_status_by_reqid.pop(req_id, None)
+        self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+
+    def apply_pp_prefetch_status_map(self, status_map: dict[str, dict]):
+        deadline = time.monotonic() + self._pp_prefetch_status_wait_timeout_s
+        for req_id, payload in status_map.items():
+            target_status = payload["status"]
+            if target_status == "ONGOING":
+                continue
+
+            while True:
+                settled = self.get_prefetch_settled_result(req_id)
+                if settled is not None and settled["status"] == target_status:
+                    break
+
+                if target_status == "DONE" and req_id in self.ongoing_prefetch:
+                    if self.check_prefetch_progress(req_id):
+                        continue
+
+                self.check_hicache_events()
+
+                if (
+                    target_status == "REVOKED"
+                    and settled is None
+                    and req_id not in self.ongoing_prefetch
+                ):
+                    self.set_prefetch_settled_result(req_id, "REVOKED", 0)
+                    break
+
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "[PP%d] Timeout applying PP prefetch status: req=%s target=%s local=%s",
+                        self.pp_rank,
+                        req_id,
+                        target_status,
+                        settled,
+                    )
+                    break
+                time.sleep(self._pp_prefetch_status_wait_sleep_s)
+
     def check_hicache_events(self):
+        _wt_before = len(self.ongoing_write_through)
         self.writing_check()
+        _wt_after = len(self.ongoing_write_through)
+        _lb_before = len(self.ongoing_load_back)
         self.loading_check()
+        _lb_after = len(self.ongoing_load_back)
+        _drain_info = ""
         if self.enable_storage:
+            _pf_before = len(self.ongoing_prefetch)
+            _bk_before = len(self.ongoing_backup)
             self.drain_storage_control_queues()
+            _pf_after = len(self.ongoing_prefetch)
+            _bk_after = len(self.ongoing_backup)
+            _drain_info = f" drain_prefetch:{_pf_before}->{_pf_after} drain_backup:{_bk_before}->{_bk_after}"
+        #if _wt_before != _wt_after or _lb_before != _lb_after or _drain_info:
+        #    logger.info(
+        #        f"[PP{self.pp_rank}][DIAG-EVENTS] check_hicache_events:"
+        #        f" wt:{_wt_before}->{_wt_after} lb:{_lb_before}->{_lb_after}{_drain_info}"
+        #    )
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1177,6 +1368,10 @@ class HiRadixCache(RadixCache):
             # there is no ongoing prefetch for this request or it has been revoked
             return True
 
+        if req_id in self._ready_prefetch_success_set:
+            self._finalize_prefetch_success(req_id)
+            return True
+
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
         last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
@@ -1188,51 +1383,13 @@ class HiRadixCache(RadixCache):
             return True
 
         if not self.can_terminate_prefetch(operation):
+            logger.info(
+                f"[PP{self.pp_rank}][DIAG-PREFETCH] check_prefetch_progress:"
+                f" req={req_id} NOT_TERMINATED yet, tokens={len(token_ids)}"
+            )
             return False
 
-        completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
-            operation
-        )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
-
-        min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
-        fetched_token_ids = token_ids[:min_completed_tokens]
-        written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-        )
-
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-        last_host_node.release_host()
-        del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
-
-        # Track tokens actually loaded from storage for this request (L3 hits)
-        loaded_from_storage = min_completed_tokens - matched_length
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
-
-        if self.enable_storage_metrics:
-            self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
-
+        self._finalize_prefetch_success(req_id)
         return True
 
     def terminate_prefetch(self, req_id: str):
@@ -1244,13 +1401,8 @@ class HiRadixCache(RadixCache):
             return
         operation.mark_terminate()
 
-    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
-        """
-        Pop and return the number of tokens loaded from storage for a request.
-        Returns 0 if no prefetch was done or was revoked.
-        This should be called after check_prefetch_progress() returns True.
-        """
-        return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+    def get_prefetch_loaded_tokens(self, req_id: str) -> int:
+        return self.prefetch_loaded_tokens_by_reqid.get(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
         key = params.key
@@ -1282,6 +1434,17 @@ class HiRadixCache(RadixCache):
             last_node = last_node.parent
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
+
+        req_id = getattr(params, 'req', None)
+        req_id = getattr(req_id, 'rid', None) if req_id else None
+        if host_hit_length > 0 or len(value) > 0:
+            logger.info(
+                f"[PP{self.pp_rank}][DIAG-MATCH] match_prefix:"
+                f" req={req_id} key_len={page_aligned_len}"
+                f" device_hit={len(value)} host_hit={host_hit_length}"
+                f" last_device_node={last_node.id}"
+                f" last_host_node={last_host_node.id}"
+            )
 
         return MatchResult(
             device_indices=value,
@@ -1334,6 +1497,12 @@ class HiRadixCache(RadixCache):
             operation,
         )
         self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        logger.info(
+            f"[PP{self.pp_rank}][DIAG-PREFETCH-START] prefetch_from_storage:"
+            f" req={req_id} prefetch_len={prefetch_length}"
+            f" last_host_node_id={last_host_node.id}"
+            f" ongoing_prefetch_count={len(self.ongoing_prefetch)}"
+        )
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
@@ -1375,6 +1544,12 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
+            logger.info(
+                f"[PP{self.pp_rank}][DIAG-INSERT-HOST] _insert_helper_host:"
+                f" NEW node_id={new_node.id} key_len={len(key)}"
+                f" parent_id={node.id} matched_length={matched_length}"
+                f" evicted={new_node.evicted} backuped={new_node.backuped}"
+            )
 
         return matched_length
 
@@ -1526,7 +1701,8 @@ class HiRadixCache(RadixCache):
 
     def release_aborted_request(self, rid: str):
         # Clean up storage hit tracking for aborted request
-        self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
+        self.clear_prefetch_settled_result(rid)
+        self._discard_ready_prefetch_success(rid)
 
         if rid not in self.ongoing_prefetch:
             return

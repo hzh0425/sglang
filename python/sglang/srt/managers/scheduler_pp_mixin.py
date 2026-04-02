@@ -86,6 +86,31 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
+                # PP sync for HiCache prefetch settlement:
+                # PP0 is the authority for per-request prefetch status and
+                # downstream ranks align to the same settled view before scheduling.
+                if self.enable_hicache_storage and self.pp_size > 1:
+                    if not self.pp_group.is_last_rank:
+                        self._pp_commit_comm_work(self._hicache_send_work)
+                    if self.pp_group.is_first_rank:
+                        self.tree_cache.check_hicache_events()
+                        hicache_sync_payload = self._pp_collect_prefetch_status()
+                        self._pp_prefetch_status_map = hicache_sync_payload
+                        self._pp_hicache_events_done = True
+                    else:
+                        hicache_sync_payload = self._pp_recv_pyobj_from_prev_stage()
+                        if self.enable_hierarchical_cache:
+                            self.tree_cache.apply_pp_prefetch_status_map(
+                                hicache_sync_payload
+                            )
+                        self._pp_prefetch_status_map = hicache_sync_payload
+                        self._pp_hicache_events_done = True
+                    if not self.pp_group.is_last_rank:
+                        self._hicache_send_work = (
+                            self._pp_send_pyobj_to_next_stage(
+                                hicache_sync_payload, async_send=True
+                            )
+                        )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
@@ -531,6 +556,8 @@ class SchedulerPPMixin:
         self.send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
+        self._hicache_send_work = []
+        self._pp_prefetch_status_map = {}
         self.launch_event = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
