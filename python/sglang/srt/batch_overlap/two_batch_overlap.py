@@ -81,14 +81,6 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
-    if token_num_per_seq is not None or extend_lens is not None:
-        batch_size = (
-            num_tokens // token_num_per_seq
-            if token_num_per_seq is not None
-            else len(extend_lens)
-        )
-        if batch_size < 2:
-            return None
 
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
@@ -1113,3 +1105,4 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
         super().clear_overlap_args()
         for inner in self._inners:
             inner.clear_overlap_args()
+
