@@ -83,6 +83,8 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
+        if sum(extend_lens) < 2:
+            return None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
@@ -609,6 +611,17 @@ class TboForwardBatchPreparer:
             child_b.extend_num_tokens,
         )
 
+        # Disable mamba tracking for child_a's boundary sequence.
+        # child_a only processes partial tokens of the boundary sequence, so
+        # mamba_track_seqlens (which reflects the full sequence length) would
+        # cause _init_track_ssm_indices to compute an h-tensor index that
+        # exceeds the actual h-tensor size derived from extend_seq_lens.
+        # child_b handles the tracking correctly since its prefix_lens is
+        # updated to account for the tokens processed by child_a.
+        if child_a.mamba_track_mask is not None:
+            child_a.mamba_track_mask = child_a.mamba_track_mask.clone()
+            child_a.mamba_track_mask[-1] = False
+
     @classmethod
     def filter_batch(
         cls,
@@ -657,6 +670,9 @@ class TboForwardBatchPreparer:
             "extend_logprob_start_lens_cpu",
             "lora_ids",
             "rids",
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -699,11 +715,19 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
         ]:
             output_dict[key] = getattr(batch, key)
+
+        mrope_positions = getattr(batch, "mrope_positions")
+        if mrope_positions is not None:
+            output_dict["mrope_positions"] = mrope_positions[
+                :, start_token_index:end_token_index
+            ]
+        else:
+            output_dict["mrope_positions"] = None
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
