@@ -19,13 +19,7 @@ if TYPE_CHECKING:
 
 
 class FullComponent(TreeComponent):
-    @property
-    def component_type(self) -> ComponentType:
-        return ComponentType.FULL
-
-    def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        # Override so _for_each_component_lru includes Full in LRU operations
-        return node.component(self.component_type).value is not None
+    component_type = ComponentType.FULL
 
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
         return lambda node: True
@@ -33,16 +27,14 @@ class FullComponent(TreeComponent):
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
-        new_parent.component(self.component_type).lock_ref = child.component(
-            self.component_type
-        ).lock_ref
+        ct = self.component_type
+        new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
 
     def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
-        self.cache.token_to_kv_pool_allocator.free(
-            node.component(self.component_type).value
-        )
-        freed = len(node.component(self.component_type).value)
-        self.cache.component_evictable_size_[self.component_type] -= freed
+        ct = self.component_type
+        self.cache.token_to_kv_pool_allocator.free(node.component_data[ct].value)
+        freed = len(node.component_data[ct].value)
+        self.cache.component_evictable_size_[ct] -= freed
         return freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
@@ -51,9 +43,10 @@ class FullComponent(TreeComponent):
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
+        ct = self.component_type
         request = params.num_tokens
-        lru = self.cache.lru_lists[self.component_type]
-        while tracker[self.component_type] < request:
+        lru = self.cache.lru_lists[ct]
+        while tracker[ct] < request:
             x = lru.get_leaf_lru_no_lock()
             if x is None:
                 break
@@ -65,31 +58,37 @@ class FullComponent(TreeComponent):
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
     ) -> IncLockRefResult:
+        ct = self.component_type
+        cache = self.cache
+        root = cache.root_node
+        evictable = cache.component_evictable_size_
+        protected = cache.component_protected_size_
         cur = node
-        while cur != self.cache.root_node:
-            if cur.component(self.component_type).lock_ref == 0:
-                self.cache.component_evictable_size_[self.component_type] -= len(
-                    cur.component(self.component_type).value
-                )
-                self.cache.component_protected_size_[self.component_type] += len(
-                    cur.component(self.component_type).value
-                )
-            cur.component(self.component_type).lock_ref += 1
+        while cur != root:
+            cd = cur.component_data[ct]
+            if cd.lock_ref == 0:
+                key_len = len(cur.key)
+                evictable[ct] -= key_len
+                protected[ct] += key_len
+            cd.lock_ref += 1
             cur = cur.parent
         return result
 
     def release_component_lock(
         self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
     ) -> None:
+        ct = self.component_type
+        cache = self.cache
+        root = cache.root_node
+        evictable = cache.component_evictable_size_
+        protected = cache.component_protected_size_
         cur = node
-        while cur != self.cache.root_node:
-            assert cur.component(self.component_type).lock_ref > 0
-            if cur.component(self.component_type).lock_ref == 1:
-                self.cache.component_evictable_size_[self.component_type] += len(
-                    cur.component(self.component_type).value
-                )
-                self.cache.component_protected_size_[self.component_type] -= len(
-                    cur.component(self.component_type).value
-                )
-            cur.component(self.component_type).lock_ref -= 1
+        while cur != root:
+            cd = cur.component_data[ct]
+            assert cd.lock_ref > 0
+            if cd.lock_ref == 1:
+                key_len = len(cur.key)
+                evictable[ct] += key_len
+                protected[ct] -= key_len
+            cd.lock_ref -= 1
             cur = cur.parent

@@ -72,21 +72,24 @@ def next_component_uuid() -> int:
 
 
 class TreeComponent(ABC):
+    # If True, create_match_validator() returns a simple
+    # ``node.component_data[ct].value is not None`` check that can be inlined
+    # by the cache to avoid lambda/all() overhead in the match loop.
+    # Override to False for stateful validators (e.g. SWA window tracking).
+    _simple_match_validator: bool = True
+
+    # Subclasses must set this as a class attribute.
+    component_type: ComponentType
+
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         self.cache = cache
 
     def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component(self.component_type).value is not None
+        return node.component_data[self.component_type].value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
-        value = node.component(self.component_type).value
+        value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
-
-    @property
-    @abstractmethod
-    def component_type(self) -> ComponentType:
-        """Component identifier — one of the ``ComponentType`` enum values."""
-        ...
 
     @abstractmethod
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:

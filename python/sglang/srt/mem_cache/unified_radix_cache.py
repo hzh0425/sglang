@@ -48,20 +48,36 @@ if TYPE_CHECKING:
 class UnifiedTreeNode:
     counter = 0
 
+    __slots__ = (
+        "children",
+        "parent",
+        "key",
+        "tree_components",
+        "component_data",
+        "last_access_time",
+        "host_value",
+        "hit_count",
+        "lru_prev",
+        "lru_next",
+        "id",
+        "_base_cd",
+    )
+
     def __init__(self, tree_components: tuple[ComponentType, ...]):
         self.children = defaultdict(partial(UnifiedTreeNode, tree_components))
         self.parent: UnifiedTreeNode | None = None
         self.key: Optional[RadixKey] = None
         self.tree_components = tree_components
-        self.component_data = {ct: ComponentData() for ct in self.tree_components}
+        self.component_data = {ct: ComponentData() for ct in tree_components}
+        self._base_cd = self.component_data[BASE_COMPONENT_TYPE]
         self.last_access_time = get_and_increase_time_counter()
         self.host_value = None
         self.hit_count = 0
         self.lru_prev: dict[ComponentType, UnifiedTreeNode | None] = {
-            ct: None for ct in self.tree_components
+            ct: None for ct in tree_components
         }
         self.lru_next: dict[ComponentType, UnifiedTreeNode | None] = {
-            ct: None for ct in self.tree_components
+            ct: None for ct in tree_components
         }
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
@@ -118,11 +134,11 @@ class UnifiedLRUList:
         self,
         node: UnifiedTreeNode,
         root_node: UnifiedTreeNode,
-        should_include,
     ):
         prev_node = self.head
+        ct = self.component_type
         while node != root_node:
-            if should_include(node):
+            if node.component_data[ct].value is not None:
                 assert node.id in self.cache
                 self._remove_node(node)
                 self._add_node_after(prev_node, node)
@@ -135,9 +151,10 @@ class UnifiedLRUList:
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
-        x = node.lru_prev[self.component_type]
-        while x.component(self.component_type).lock_ref > 0:
-            x = x.lru_prev[self.component_type]
+        ct = self.component_type
+        x = node.lru_prev[ct]
+        while x.component_data[ct].lock_ref > 0:
+            x = x.lru_prev[ct]
         if x == self.head:
             return None
         return x
@@ -145,9 +162,10 @@ class UnifiedLRUList:
     def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
-        x = node.lru_prev[self.component_type]
-        while x.component(self.component_type).lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[self.component_type]
+        ct = self.component_type
+        x = node.lru_prev[ct]
+        while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
+            x = x.lru_prev[ct]
         if x == self.head:
             return None
         return x
@@ -199,6 +217,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.components: dict[ComponentType, TreeComponent] = {
             ct: COMPONENT_REGISTRY[ct](self, params) for ct in self.tree_components
         }
+        self._precompute_hot_paths()
         if self.is_eagle:
             self.key_convert_fn = convert_to_bigram_key
         else:
@@ -206,10 +225,42 @@ class UnifiedRadixCache(BasePrefixCache):
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
+    def _precompute_hot_paths(self):
+        """Pre-compute filtered component lists so hot loops skip no-op components."""
+
+        def _overrides(method_name: str) -> tuple[TreeComponent, ...]:
+            base = getattr(TreeComponent, method_name)
+            return tuple(
+                c for c in self.components.values()
+                if getattr(type(c), method_name) is not base
+            )
+
+        self._component_types_tuple = tuple(self.tree_components)
+        self._all_components_with_ct = tuple(
+            (ct, c) for ct, c in self.components.items()
+        )
+        self._overlap_components = _overrides("update_component_on_insert_overlap")
+        self._skip_leaf_components = _overrides("should_skip_leaf_creation")
+        self._commit_components = _overrides("commit_insert_component_data")
+        self._finalize_match_components = _overrides("finalize_match_result")
+
+        # When exactly one non-trivial component uses a simple "value is not
+        # None" validator, store its ComponentType so _match_prefix_helper can
+        # inline the check instead of creating lambdas / calling all().
+        _always_true = FullComponent.create_match_validator
+        non_trivial = [
+            (ct, c) for ct, c in self.components.items()
+            if type(c).create_match_validator is not _always_true
+        ]
+        if len(non_trivial) == 1 and non_trivial[0][1]._simple_match_validator:
+            self._match_inline_ct = non_trivial[0][0]
+        else:
+            self._match_inline_ct = None
+
     def reset(self) -> None:
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey([], None)
-        self.root_node.component(BASE_COMPONENT_TYPE).value = []
+        self.root_node._base_cd.value = []
         for ct in self.tree_components:
             self.root_node.component(ct).lock_ref = 1
         self.component_evictable_size_ = {ct: 0 for ct in self.tree_components}
@@ -475,7 +526,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if prefix_len < len(child.key):
                 # Read-only: do not split, ignore partial match and stop
                 break
-            value.append(child.component(BASE_COMPONENT_TYPE).value)
+            value.append(child._base_cd.value)
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -491,31 +542,49 @@ class UnifiedRadixCache(BasePrefixCache):
         value: list[torch.Tensor] = []
         best_value_len = 0
         best_node = node
-        validators = {
-            ct: component.create_match_validator()
-            for ct, component in self.components.items()
-        }
+        key_match = self.key_match_fn
+        get_child = self.get_child_key_fn
+        _inline_ct = self._match_inline_ct
 
-        def _update_best_if_valid(node):
-            nonlocal best_value_len, best_node
-            if all(validators[ct](node) for ct in self.components):
-                best_value_len = len(value)
-                best_node = node
+        # Build the per-node validity check.  For configs with a single
+        # simple validator (e.g. mamba) we inline a direct attribute check
+        # to avoid lambda/all() overhead on every node visit.
+        if _inline_ct is not None:
+            is_valid = None  # sentinel — handled inline below
+        else:
+            _always_true = FullComponent.create_match_validator
+            validators = tuple(
+                component.create_match_validator()
+                for ct, component in self.components.items()
+                if type(component).create_match_validator is not _always_true
+            )
 
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = key_match(child.key, key)
             if prefix_len < len(child.key):
                 node = self._split_node(child.key, child, prefix_len)
-                value.append(node.component(BASE_COMPONENT_TYPE).value)
-                _update_best_if_valid(node)
+                value.append(node._base_cd.value)
+                if _inline_ct is not None:
+                    if node.component_data[_inline_ct].value is not None:
+                        best_value_len = len(value)
+                        best_node = node
+                elif not validators or all(v(node) for v in validators):
+                    best_value_len = len(value)
+                    best_node = node
                 break
-            value.append(child.component(BASE_COMPONENT_TYPE).value)
+            value.append(child._base_cd.value)
             node = child
-            _update_best_if_valid(node)
+            if _inline_ct is not None:
+                if node.component_data[_inline_ct].value is not None:
+                    best_value_len = len(value)
+                    best_node = node
+            elif not validators or all(v(node) for v in validators):
+                best_value_len = len(value)
+                best_node = node
             key = key[prefix_len:]
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = get_child(key)
         return value, best_node, best_value_len
 
     def _match_post_processor(
@@ -526,9 +595,10 @@ class UnifiedRadixCache(BasePrefixCache):
         best_value_len: int,
     ) -> MatchResult:
         node_update = last_node
-        for ct, component in self.components.items():
+        root = self.root_node
+        for ct in self._component_types_tuple:
             self.lru_lists[ct].reset_node_and_parents_mru(
-                node_update, self.root_node, component.node_has_component_data
+                node_update, root,
             )
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -546,7 +616,7 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-        for component in self.components.values():
+        for component in self._finalize_match_components:
             result = component.finalize_match_result(
                 result=result,
                 params=params,
@@ -562,17 +632,14 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
-        new_node.component(BASE_COMPONENT_TYPE).value = (
-            child.component(BASE_COMPONENT_TYPE).value[:split_len].clone()
-        )
+        child_base = child._base_cd
+        new_node._base_cd.value = child_base.value[:split_len].clone()
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.component(BASE_COMPONENT_TYPE).value = (
-            child.component(BASE_COMPONENT_TYPE).value[split_len:].clone()
-        )
+        child_base.value = child_base.value[split_len:].clone()
 
         for component in self.components.values():
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -586,7 +653,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def _touch_node(self, node: UnifiedTreeNode):
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
-            self._for_each_component_lru(node, UnifiedLRUList.reset_node_mru)
+            component_data = node.component_data
+            lru_lists = self.lru_lists
+            for ct in self._component_types_tuple:
+                if component_data[ct].value is not None:
+                    UnifiedLRUList.reset_node_mru(lru_lists[ct], node)
 
     def _add_new_node(
         self,
@@ -597,7 +668,7 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node = UnifiedTreeNode(self.tree_components)
         new_node.parent = parent
         new_node.key = key
-        new_node.component(BASE_COMPONENT_TYPE).value = value.clone()
+        new_node._base_cd.value = value.clone()
         parent.children[self.get_child_key_fn(key)] = new_node
         self.lru_lists[BASE_COMPONENT_TYPE].insert_mru(new_node)
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -616,6 +687,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         child_key = self.get_child_key_fn(key)
         total_prefix_length = 0
+        overlap_components = self._overlap_components
+        has_overlap_components = len(overlap_components) > 0
         while len(key) > 0 and child_key in node.children:
             node = node.children[child_key]
             self._touch_node(node)
@@ -623,23 +696,25 @@ class UnifiedRadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
 
-            value_slice = value[:prefix_len]
-            consumed_from = prefix_len
-            # Let each component claim ownership of overlapping KV slots
-            for component in self.components.values():
-                comp_consumed_from = component.update_component_on_insert_overlap(
-                    node=node,
-                    prefix_len=prefix_len,
-                    total_prefix_len=total_prefix_length,
-                    value_slice=value_slice,
-                    params=params,
-                )
-                consumed_from = min(consumed_from, comp_consumed_from)
+            if has_overlap_components:
+                value_slice = value[:prefix_len]
+                consumed_from = prefix_len
+                for component in overlap_components:
+                    comp_consumed_from = component.update_component_on_insert_overlap(
+                        node=node,
+                        prefix_len=prefix_len,
+                        total_prefix_len=total_prefix_length,
+                        value_slice=value_slice,
+                        params=params,
+                    )
+                    consumed_from = min(consumed_from, comp_consumed_from)
+            else:
+                consumed_from = prefix_len
 
             dup_start = max(0, params.prev_prefix_len - total_prefix_length)
             if dup_start < consumed_from:
                 self.token_to_kv_pool_allocator.free(
-                    value_slice[dup_start:consumed_from]
+                    value[dup_start:consumed_from]
                 )
 
             total_prefix_length += prefix_len
@@ -651,13 +726,13 @@ class UnifiedRadixCache(BasePrefixCache):
         is_new_leaf = False
         # Create new leaf for remaining suffix
         if len(key):
-            if any(
+            if self._skip_leaf_components and any(
                 comp.should_skip_leaf_creation(
                     total_prefix_len=total_prefix_length,
                     key_len=len(key),
                     params=params,
                 )
-                for comp in self.components.values()
+                for comp in self._skip_leaf_components
             ):
                 # TODO: When leaf creation is skipped, We should release all component
                 # resources here or propagate a flag so that
@@ -672,7 +747,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
         result = InsertResult(prefix_len=total_prefix_length)
-        for component in self.components.values():
+        for component in self._commit_components:
             component.commit_insert_component_data(
                 node=target_node,
                 is_new_leaf=is_new_leaf,
@@ -699,7 +774,7 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self.components.values():
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node):
-                    assert node.component(comp.component_type).lock_ref == 0
+                    assert node.component_data[comp.component_type].lock_ref == 0
                     self._evict_component_and_detach_lru(
                         node, comp, is_leaf=is_leaf, tracker=tracker
                     )
@@ -733,23 +808,24 @@ class UnifiedRadixCache(BasePrefixCache):
         """After a leaf is removed, walk up the parent chain and delete
         any ancestor that is leaf node and has lost any component data (tombstoned)."""
         cur = deleted_node.parent
+        components = self._all_components_with_ct
         while cur != self.root_node and len(cur.children) == 0:
+            cd = cur.component_data
             has_tombstone = any(
-                not comp.node_has_component_data(cur)
-                for comp in self.components.values()
+                cd[ct].value is None for ct, _ in components
             )
             if not has_tombstone:
                 break
 
             if any(
-                cur.component(comp.component_type).lock_ref > 0
-                for comp in self.components.values()
-                if comp.node_has_component_data(cur)
+                cd[ct].lock_ref > 0
+                for ct, _ in components
+                if cd[ct].value is not None
             ):
                 break
 
-            for comp in self.components.values():
-                if comp.node_has_component_data(cur):
+            for ct, comp in components:
+                if cd[ct].value is not None:
                     self._evict_component_and_detach_lru(
                         cur, comp, is_leaf=True, tracker=tracker
                     )
@@ -757,8 +833,9 @@ class UnifiedRadixCache(BasePrefixCache):
             cur = cur.parent
 
     def _for_each_component_lru(self, node: UnifiedTreeNode, lru_op):
-        for ct, component in self.components.items():
-            if component.node_has_component_data(node):
+        component_data = node.component_data
+        for ct in self._component_types_tuple:
+            if component_data[ct].value is not None:
                 lru_op(self.lru_lists[ct], node)
 
     # ---- Query / Inspection APIs ----
