@@ -83,8 +83,6 @@ def compute_split_seq_index(
 ) -> Optional[int]:
     if forward_mode == ForwardMode.EXTEND:
         assert extend_lens is not None
-        if sum(extend_lens) < 2:
-            return None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
@@ -612,12 +610,12 @@ class TboForwardBatchPreparer:
         )
 
         # Disable mamba tracking for child_a's boundary sequence.
-        # child_a only processes partial tokens of the boundary sequence, so
-        # mamba_track_seqlens (which reflects the full sequence length) would
-        # cause _init_track_ssm_indices to compute an h-tensor index that
-        # exceeds the actual h-tensor size derived from extend_seq_lens.
-        # child_b handles the tracking correctly since its prefix_lens is
-        # updated to account for the tokens processed by child_a.
+        # The tracking code in _init_track_ssm_indices assumes lens_to_track ≈
+        # extend_seq_lens. In two-chunk split, child_a's extend_seq_lens is
+        # truncated but mamba_track_seqlens is not, breaking this assumption
+        # (lens_to_track >> extend_seq_lens → h-tensor index out of bounds).
+        # child_b's tracking works correctly because its updated prefix_lens
+        # makes lens_to_track ≈ child_b's extend_seq_lens.
         if child_a.mamba_track_mask is not None:
             child_a.mamba_track_mask = child_a.mamba_track_mask.clone()
             child_a.mamba_track_mask[-1] = False

@@ -1,6 +1,6 @@
 # Qwen3.5 TBO (Two Batch Overlap) Support Plan
 
-## Status: COMPLETE (test passed, gsm8k score 0.97)
+## Status: COMPLETE (test passed, gsm8k score 0.98)
 
 ## 1. Architecture Overview
 
@@ -228,7 +228,7 @@ Bug-fix changes applied to the TBO framework itself:
 
 2. **`mrope_positions` slicing**: Added `mrope_positions[:, start:end]` slicing (line ~721-727) in `filter_batch` to properly handle multi-rope position tensors.
 
-3. **`mamba_track_mask` two-chunk fix**: In `derive_fields_related_to_seq_len_for_two_chunk` (line ~619-621), disabled mamba tracking for child_a's boundary sequence to prevent h-tensor index out of bounds. See Bug #4 below for details.
+3. **`mamba_track_mask` two-chunk fix**: In `derive_fields_related_to_seq_len_for_two_chunk`, disabled mamba tracking for child_a's boundary sequence. Two-chunk split truncates the boundary sequence's `extend_seq_lens` but not `mamba_track_seqlens`, breaking `_init_track_ssm_indices`'s assumption that `lens_to_track ≈ extend_seq_lens`. child_a has incomplete SSM state so tracking is meaningless; child_b has updated `prefix_lens` making `lens_to_track = extend_seq_lens`, so it handles tracking correctly. See Bug #4 for full analysis.
 
 ## 7. Debugging Log
 
@@ -264,54 +264,82 @@ Model: `/home/t4/models/Qwen/Qwen35-35B-FP8`
 
 **Fix**: Added `mrope_positions[:, start_token_index:end_token_index]` in `filter_batch` (line ~721-727).
 
-### Bug #4: h-tensor index out of bounds in `_init_track_ssm_indices` (FIXED)
+### Bug #4: h-tensor index out of bounds in two-chunk split (FIXED)
 
-**Symptom**: `CUDA_ERROR_ASSERT` / `index out of bounds` in `IndexKernel.cu` during the first `forward_extend` after server startup. The error cascades to `deep_gemm` calls downstream.
+**Symptom**: `CUDA_ERROR_ASSERT` / `index out of bounds` in `IndexKernel.cu` during `forward_extend`.
 
-**Root cause**: In the two-chunk split case, `derive_fields_related_to_seq_len_for_two_chunk` updates `extend_seq_lens` for both children (e.g., from 80 to 40 each) but does NOT update `mamba_track_seqlens` (stays at 80). This causes a mismatch in `_init_track_ssm_indices`:
+**Background: TBO splitting modes**
 
-- The FLA kernel's `h` tensor is sized based on `extend_seq_lens` (40 tokens -> 1 chunk -> 1 h-state)
-- But `track_ssm_h_src` is computed from `mamba_track_seqlens` (80 -> `80 // 64 = 1` -> index 1)
-- Index 1 is out of bounds for h with only 1 entry
+TBO normally splits a batch along the **batch (sequence) dimension**: the first N sequences go to child_a, the rest to child_b. Each sequence stays complete in one child — this is "vanilla split".
 
-Debug output confirming the issue:
+When token counts are severely imbalanced (e.g., one sequence is 800 tokens, the rest are 30), vanilla split produces lopsided children. TBO detects this via `_is_two_chunk_split_enabled` and activates **two-chunk split**: the boundary sequence is split at the **token dimension**, with its first half going to child_a and second half to child_b. `derive_fields_related_to_seq_len_for_two_chunk` adjusts the boundary sequence's `extend_seq_lens` and `extend_prefix_lens` in both children.
+
+**Background: mamba state tracking**
+
+GDN uses SSM recurrent states (not per-token KV cache). For prefix caching, the SSM state must be saved at checkpoint positions (aligned to `mamba_cache_chunk_size=128`). The tracking mechanism:
+
+- `mamba_track_mask[i]`: whether sequence i needs state saving in this extend
+- `mamba_track_seqlens[i]`: the total sequence length (prefix+extend) up to which to track
+- The FLA kernel processes `extend_seq_lens` tokens and outputs intermediate states `h[i]` every `FLA_CHUNK_SIZE=64` tokens, plus a `last_recurrent_state` at the end
+- `_init_track_ssm_indices` computes source indices into the h-tensor: `track_ssm_h_src = offset + (lens_to_track // FLA_CHUNK_SIZE)` where `lens_to_track = mamba_track_seqlens - prefix_lens`
+- **Key assumption**: `lens_to_track ≈ extend_seq_lens` (the h-tensor layout is determined by `extend_seq_lens`)
+
+**Root cause**
+
+In two-chunk split, the boundary sequence's `extend_seq_lens` is truncated (e.g., 80→40) but `mamba_track_seqlens` is NOT updated (stays at 80). For child_a:
+
 ```
-[DEBUG GDN extend] layer=0 seq_len=40 bs=1
-  query_start_loc=[0, 40]       # correct for sub-batch
-  extend_seq_lens=[40]           # correct (updated by two-chunk)
-  mamba_track_seqlens=[80]       # NOT updated (full sequence)
-  mamba_track_mask=[True]        # should be False for child_a
-  tbo_parent_token_range=(0, 40) # child_a
+child_a: prefix=0, extend_seq_lens=40, mamba_track_seqlens=80
+  h-tensor size = ceil(40/64) = 1 entry (index 0 only)
+  lens_to_track = 80 - 0 = 80
+  track_ssm_h_src = 80 // 64 = 1 → OUT OF BOUNDS
 ```
 
-**Fix**: In `derive_fields_related_to_seq_len_for_two_chunk`, disable mamba tracking for child_a's boundary sequence:
+child_a has only processed the first 40 tokens — the SSM state is incomplete, and tracking at this point is meaningless.
+
+For child_b, the fix works naturally because `extend_prefix_lens` is updated to include child_a's tokens:
+
+```
+child_b: prefix=40 (updated), extend_seq_lens=40, mamba_track_seqlens=80
+  lens_to_track = 80 - 40 = 40 = extend_seq_lens ✓
+  track_ssm_h_src = 40 // 64 = 0 → valid
+```
+
+child_b continues from child_a's cached state, so after processing its 40 tokens, the SSM state reflects all 80 tokens — the correct moment to save.
+
+**Fix**: Disable tracking for child_a's boundary sequence in `derive_fields_related_to_seq_len_for_two_chunk`:
+
 ```python
 if child_a.mamba_track_mask is not None:
     child_a.mamba_track_mask = child_a.mamba_track_mask.clone()
     child_a.mamba_track_mask[-1] = False
 ```
-This is correct because:
-- child_a only processes the first portion of the boundary sequence
-- The tracking position (aligned to `mamba_cache_chunk_size`) typically falls beyond child_a's token range
-- child_b handles tracking correctly since its `extend_prefix_lens` is updated to account for child_a's tokens, and `lens_to_track = mamba_track_seqlens - prefix_lens` yields correct indices
 
-### Bug #5: 1-token extend triggers empty child_a (FIXED)
+Note: in vanilla split (no two-chunk), the boundary sequence is NOT split across children, so `extend_seq_lens` and `mamba_track_seqlens` stay consistent. This fix only runs inside `derive_fields_related_to_seq_len_for_two_chunk`.
 
-**Symptom**: `AttributeError: 'NoneType' object has no attribute 'tensor_split'` in `_scatter_hidden_states_and_residual` when `hidden_states_after_attn` is None.
+### Bug #5: GDN op_prepare/op_core crash on 0-token sub-batch (FIXED)
 
-**Root cause**: A 1-token extend batch (`extend_seq_lens_cpu=[1]`) incorrectly triggers two-chunk split. `_is_two_chunk_split_enabled([1])` returns True because `left_sum=0 < 1*0.48`. Then `compute_split_token_index` returns `sum([1])//2 = 0`, producing child_a with `tbo_parent_token_range=(0, 0)` — 0 tokens but batch_size=1. This causes empty tensors to flow through op_prepare/op_core, producing None outputs.
+**Symptom**: `RuntimeError: cannot reshape tensor of 0 elements into shape [0, -1]` in `op_core`, or `AttributeError: 'NoneType' object has no attribute 'tensor_split'` when the crash was masked by an earlier `numel() == 0` guard.
 
-Even without two-chunk, vanilla split also fails for `[1]`: `_split_array_by_balanced_sum([1])` returns 0, giving `sum([1][:0])=0` — the same empty child_a. With only 1 total token, you fundamentally cannot split into two non-empty halves.
+**Root cause**: When `extend_seq_lens=[1]` (a 1-token extend batch), TBO split produces child_a with 0 tokens (`tbo_parent_token_range=(0, 0)`). The TBO framework correctly passes shape `(0, dim)` tensors to the model ops. For DeepSeek (standard attention), 0-element tensors flow through PyTorch matrix ops without issue. But Qwen3.5's GDN uses triton kernels (`fused_qkvzba_split_reshape_cat_contiguous`) and reshape operations (`reshape(*shape[:-2], -1)`) that fail on 0-element tensors.
 
-**Fix**: In `compute_split_seq_index`, return None (disabling TBO for the batch) when `sum(extend_lens) < 2`:
+The TBO framework itself handles 0-token children correctly — `_model_forward_filter_inputs` pads to `tbo_padded_len` (which is 0 when token range is empty), and `TboAttnBackend.init_forward_metadata` skips children with `batch_size == 0`. The fix belongs in the model code, not the framework.
+
+**Fix**: In `Qwen3_5GatedDeltaNet.op_prepare`, add `hidden_states.numel() == 0` to the idle check, so 0-token sub-batches skip the triton kernel and pass through as empty tensors:
+
 ```python
-if forward_mode == ForwardMode.EXTEND:
-    assert extend_lens is not None
-    if sum(extend_lens) < 2:
-        return None
-    return _split_extend_seqs(extend_lens)
+if forward_batch.forward_mode.is_idle() or hidden_states.numel() == 0:
+    state.attn_intermediate_state = hidden_states, None
+    return
 ```
-When `compute_split_seq_index` returns None, `local_can_run_tbo` becomes False in `TboDPAttentionPreparer`, and the batch uses the regular (non-TBO) forward path.
+
+In `op_core`, check `kwargs is None` instead of `forward_mode.is_idle()` to handle both idle and 0-token uniformly:
+
+```python
+if kwargs is None:
+    state.hidden_states_after_attn = hidden_state
+    return
+```
 
 ### Bug #6: TboAttnBackend missing `forward` method (FIXED)
 
@@ -328,7 +356,7 @@ def forward(self, *args, **kwargs):
 ## 8. Test Result
 
 ```
-Ran 1 test in 439.569s
+Ran 1 test in 383.390s
 OK
-Score: 0.970 (threshold: 0.93)
+Score: 0.980 (threshold: 0.93)
 ```

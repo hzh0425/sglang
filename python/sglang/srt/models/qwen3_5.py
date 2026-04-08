@@ -495,7 +495,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor = state.pop("hidden_states_after_comm_pre_attn")
         forward_batch = state.forward_batch
 
-        if forward_batch.forward_mode.is_idle():
+        if forward_batch.forward_mode.is_idle() or hidden_states.numel() == 0:
             state.attn_intermediate_state = hidden_states, None
             return
 
@@ -551,7 +551,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def op_core(self, state):
         hidden_state, kwargs = state.pop("attn_intermediate_state")
         forward_batch = state.forward_batch
-        if forward_batch.forward_mode.is_idle():
+        if kwargs is None:
             state.hidden_states_after_attn = hidden_state
             return
 

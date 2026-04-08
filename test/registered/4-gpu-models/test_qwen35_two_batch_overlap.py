@@ -20,8 +20,8 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=600, suite="stage-c-test-4-gpu-h100")
 
-QWEN35_27B_MODEL = "/home/t4/models/Qwen/Qwen35-35B-FP8"
-ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.93}}
+QWEN35_27B_MODEL = "/home/t4/models/Qwen/Qwen3.5-397B-A17B-FP8"
+ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.95}}
 
 
 class TestQwen35(CustomTestCase):
@@ -45,7 +45,7 @@ class TestQwen35(CustomTestCase):
                 "128",
                 "--trust-remote-code",
                 "--tp",
-                "4",
+                "8",
                 "--dp",
                 "1",
                 "--enable-dp-attention",
@@ -68,8 +68,8 @@ class TestQwen35(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
-            num_examples=100,
+            num_shots=6,
+            num_examples=200,
             max_tokens=16000,
             num_threads=50,
             repeat=1,
