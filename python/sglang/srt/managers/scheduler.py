@@ -815,13 +815,16 @@ class Scheduler(
                 self.tree_cache = RadixCacheCpp(params=params, server_args=server_args)
             elif self.enable_hierarchical_cache:
                 if self.is_hybrid_ssm:
-                    from sglang.srt.mem_cache.hi_mamba_radix_cache import (
-                        HiMambaRadixCache,
+                    from sglang.srt.mem_cache.unified_cache_components import (
+                        ComponentType,
+                    )
+                    from sglang.srt.mem_cache.unified_radix_cache import (
+                        UnifiedRadixCache,
                     )
 
-                    self.tree_cache = HiMambaRadixCache(
-                        params=params, server_args=server_args
-                    )
+                    params.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+                    self.tree_cache = UnifiedRadixCache(params)
+                    self.tree_cache._init_hicache(server_args, params)
                 else:
                     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 
