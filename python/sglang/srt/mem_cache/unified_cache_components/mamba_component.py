@@ -346,22 +346,26 @@ class MambaComponent(TreeComponent):
             req = kw.get("req")
             transfers: list[PoolTransfer] = []
 
-            # Collect backed-up mamba host indices from evicted chain
+            # Walk evicted chain, collect host_values and nodes (root→leaf)
             backed_up: list[torch.Tensor] = []
+            nodes: list = []
             cur = node
             while cur.evicted:
                 cur_cd = cur.component_data[ct]
                 if cur_cd.host_value is not None:
                     backed_up.append(cur_cd.host_value)
+                    nodes.append(cur)
                 cur = cur.parent
             backed_up.reverse()
+            nodes.reverse()
 
             if backed_up:
                 transfers.append(
                     PoolTransfer(
                         name=PoolName.MAMBA,
                         host_indices=torch.cat(backed_up),
-                        device_indices=None,  # auto-allocated by controller
+                        device_indices=None,
+                        nodes_to_load=nodes,
                     )
                 )
 
@@ -388,41 +392,38 @@ class MambaComponent(TreeComponent):
         return None
 
     def commit_hicache_transfer(
-        self, node: UnifiedTreeNode, phase: HiCachePhase, **kw
+        self, node: UnifiedTreeNode, phase: HiCachePhase,
+        transfers: list[PoolTransfer] = (),
     ) -> None:
         ct = self.component_type
-        transfers = kw.get("transfers", [])
-        my_transfers = [t for t in transfers if t.name == PoolName.MAMBA]
 
         if phase == HiCachePhase.BACKUP:
-            if my_transfers and my_transfers[0].host_indices is not None:
+            if transfers and transfers[0].host_indices is not None:
                 cd = node.component_data[ct]
                 if cd.host_value is None:
-                    cd.host_value = my_transfers[0].host_indices.clone()
+                    cd.host_value = transfers[0].host_indices.clone()
                     self.cache.host_lru_lists[ct].insert_mru(node)
 
         elif phase == HiCachePhase.RESTORE:
-            if not my_transfers:
+            if not transfers:
                 return
-            nodes_to_load = kw.get("nodes_to_load", [])
-            shared = my_transfers[0]
-            if shared.device_indices is not None and nodes_to_load:
+            shared = transfers[0]
+            if shared.device_indices is not None:
                 device_indices = shared.device_indices
                 offset = 0
-                for n in nodes_to_load:
+                for n in shared.nodes_to_load or []:
                     cd_n = n.component_data[ct]
-                    if cd_n.host_value is not None:
-                        count = len(cd_n.host_value)
-                        cd_n.value = device_indices[
-                            offset : offset + count
-                        ].clone()
-                        offset += count
-                        # Move from host LRU to device LRU
-                        host_lru = self.cache.host_lru_lists[ct]
-                        if host_lru.in_list(n):
-                            host_lru.remove_node(n)
-                        self.cache.lru_lists[ct].insert_mru(n)
-                        self.cache.component_evictable_size_[ct] += count
+                    count = len(cd_n.host_value)
+                    cd_n.value = device_indices[
+                        offset : offset + count
+                    ].clone()
+                    offset += count
+                    # Move from host LRU to device LRU
+                    host_lru = self.cache.host_lru_lists[ct]
+                    if host_lru.in_list(n):
+                        host_lru.remove_node(n)
+                    self.cache.lru_lists[ct].insert_mru(n)
+                    self.cache.component_evictable_size_[ct] += count
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]

@@ -226,48 +226,55 @@ class FullComponent(TreeComponent):
             return None
 
         if phase == HiCachePhase.RESTORE:
-            # Collect host_value from the evicted chain (root→leaf order)
+            # Walk evicted chain, collect host_values and nodes (root→leaf)
             backed_up: list[torch.Tensor] = []
+            nodes: list = []
             cur = node
             while cur.evicted:
                 cd = cur.component_data[ct]
                 if cd.host_value is not None:
                     backed_up.append(cd.host_value)
+                    nodes.append(cur)
                 cur = cur.parent
             backed_up.reverse()
-            if backed_up:
-                return [
-                    PoolTransfer(
-                        name=PoolName.KV,
-                        host_indices=torch.cat(backed_up),
-                        device_indices=None,  # auto-allocated by controller
-                    )
-                ]
-            return None
+            nodes.reverse()
+            return [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    host_indices=torch.cat(backed_up) if backed_up else torch.empty((0,), dtype=torch.int64, device="cpu"),
+                    device_indices=None,
+                    nodes_to_load=nodes,
+                )
+            ]
 
         return None
 
     def commit_hicache_transfer(
-        self, node: UnifiedTreeNode, phase: HiCachePhase, **kw
+        self, node: UnifiedTreeNode, phase: HiCachePhase,
+        transfers: list[PoolTransfer] = (),
     ) -> None:
-        if phase == HiCachePhase.RESTORE:
-            ct = self.component_type
-            transfers = kw.get("transfers", [])
-            my_transfers = [t for t in transfers if t.name == PoolName.KV]
-            nodes_to_load = kw.get("nodes_to_load", [])
+        ct = self.component_type
 
-            if my_transfers and my_transfers[0].device_indices is not None and nodes_to_load:
-                device_indices = my_transfers[0].device_indices
-                offset = 0
-                for n in nodes_to_load:
-                    cd = n.component_data[ct]
-                    if cd.host_value is not None:
-                        n_len = len(cd.host_value)
-                        cd.value = device_indices[offset : offset + n_len].clone()
-                        offset += n_len
-                        self.cache.lru_lists[ct].insert_mru(n)
-                        self.cache.component_evictable_size_[ct] += n_len
-                        self.cache._update_evictable_leaf_sets(n)
+        if phase == HiCachePhase.BACKUP:
+            if transfers and transfers[0].host_indices is not None:
+                node.component_data[ct].host_value = transfers[0].host_indices.clone()
+
+        elif phase == HiCachePhase.RESTORE:
+            if not transfers or transfers[0].device_indices is None:
+                self.cache._update_device_leaf_status(node)
+                return
+
+            xfer = transfers[0]
+            device_indices = xfer.device_indices
+            offset = 0
+            for n in xfer.nodes_to_load or []:
+                cd = n.component_data[ct]
+                n_len = len(cd.host_value)
+                cd.value = device_indices[offset : offset + n_len].clone()
+                offset += n_len
+                self.cache.lru_lists[ct].insert_mru(n)
+                self.cache.component_evictable_size_[ct] += n_len
+                self.cache._update_evictable_leaf_sets(n)
 
             # Update leaf status for the target node
             self.cache._update_device_leaf_status(node)

@@ -320,7 +320,8 @@ class TreeComponent(ABC):
         return None
 
     def commit_hicache_transfer(
-        self, node: UnifiedTreeNode, phase: HiCachePhase, **kw
+        self, node: UnifiedTreeNode, phase: HiCachePhase,
+        transfers: list[PoolTransfer] = (),
     ) -> None:
         """Post-transfer bookkeeping: store host indices, update LRU, etc."""
         pass
