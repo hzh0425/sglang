@@ -60,7 +60,8 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         kv_host_hit = 0
         node = result.last_host_node
-        while node is not result.last_device_node and node is not None:
+        root_node = self.cache.root_node
+        while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
             if full_host is not None:
                 kv_host_hit += len(full_host)
@@ -257,3 +258,4 @@ class FullComponent(TreeComponent):
                 self.cache._update_evictable_leaf_sets(n)
 
             self.cache._update_evictable_leaf_sets(node)
+

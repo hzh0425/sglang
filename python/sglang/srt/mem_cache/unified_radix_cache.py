@@ -452,16 +452,6 @@ class UnifiedRadixCache(BasePrefixCache):
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
 
-        # After dec_lock_ref, sweep the unlocked path to reconcile
-        # evictable_device_leaves.  Multiple lock/unlock cycles
-        # (load_back + request + chunked prefill) can leave the set stale
-        # when _update_evictable_leaf_sets was last called at a time the
-        # node's child set or lock_ref was different.
-        cur = req.last_node
-        while cur is not None and cur is not self.root_node:
-            self._update_evictable_leaf_sets(cur)
-            cur = cur.parent
-
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
@@ -842,12 +832,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 params=params,
                 result=result,
             )
-        # After all components commit, re-evaluate D-leaf status.
-        # _add_new_node called _update_evictable_leaf_sets before aux
-        # components (e.g. mamba) attached their values, so a multi-component
-        # node would have been skipped.  Also covers is_new_leaf=False where
-        # an existing node's component data changed (e.g. mamba restored).
-        self._update_evictable_leaf_sets(target_node)
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
         return result
@@ -1293,12 +1277,6 @@ class UnifiedRadixCache(BasePrefixCache):
             for ack_id in ack_list:
                 node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node)
-                # Sweep loaded-back path: reconcile evictable_device_leaves
-                # for nodes that may not be on any request's dec_lock_ref path.
-                cur = node
-                while cur is not None and cur is not self.root_node:
-                    self._update_evictable_leaf_sets(cur)
-                    cur = cur.parent
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----

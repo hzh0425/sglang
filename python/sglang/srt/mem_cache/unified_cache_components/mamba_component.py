@@ -124,7 +124,7 @@ class MambaComponent(TreeComponent):
             return
         if node.component_data[self.component_type].value is None:
             node.component_data[self.component_type].value = params.mamba_value
-            # Transition S3→S2 or S0→S1: move from host LRU to device LRU
+            # move from host LRU to device LRU
             host_lru = self.cache.host_lru_lists[self.component_type]
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
@@ -327,21 +327,19 @@ class MambaComponent(TreeComponent):
             req = kw.get("req")
             transfers: list[PoolTransfer] = []
 
-            # Walk evicted chain (like FULL), collect ALL nodes needing
-            # MAMBA restore — not just the leaf node.
-            cur = node
-            while cur.evicted:
-                cd_cur = cur.component_data[ct]
-                if cd_cur.value is None and cd_cur.host_value is not None:
+            cd = node.component_data[ct]
+            if cd.value is not None:
+                return None
+
+            # restore single node if host_value exists and
+            if cd.host_value is not None and cd.value is None:
                     transfers.append(
                         PoolTransfer(
                             name=PoolName.MAMBA,
-                            host_indices=cd_cur.host_value,
-                            nodes_to_load=[cur],
-                        )
+                        host_indices=cd.host_value,
+                        nodes_to_load=[node],
                     )
-                cur = cur.parent
-            transfers.reverse()  # root-to-leaf order
+                )
 
             # Per-request mamba CoW (H→D copy into request's device slot)
             cd = node.component_data[ct]
@@ -382,22 +380,17 @@ class MambaComponent(TreeComponent):
         elif phase == HiCachePhase.RESTORE:
             if not transfers:
                 return
-            for transfer in transfers:
-                if transfer.device_indices is None:
-                    continue
-                # Tree-node restore: target node is in nodes_to_load
-                if transfer.nodes_to_load:
-                    target = transfer.nodes_to_load[0]
-                    cd = target.component_data[ct]
-                    cd.value = transfer.device_indices.clone()
-                    count = len(cd.value)
-                    # Move from host LRU to device LRU
-                    host_lru = self.cache.host_lru_lists[ct]
-                    if host_lru.in_list(target):
-                        host_lru.remove_node(target)
-                    self.cache.lru_lists[ct].insert_mru(target)
-                    self.cache.component_evictable_size_[ct] += count
-                    self.cache._update_evictable_leaf_sets(target)
+            transfer = transfers[0]
+            if transfer.device_indices is not None:
+                cd = node.component_data[ct]
+                cd.value = transfer.device_indices.clone()
+                count = len(cd.value)
+                # Move from host LRU to device LRU
+                host_lru = self.cache.host_lru_lists[ct]
+                if host_lru.in_list(node):
+                    host_lru.remove_node(node)
+                self.cache.lru_lists[ct].insert_mru(node)
+                self.cache.component_evictable_size_[ct] += count
 
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
@@ -428,3 +421,4 @@ class MambaComponent(TreeComponent):
                     if x.parent is not None:
                         self.cache._update_evictable_leaf_sets(x.parent)
             x = x_next
+
