@@ -60,7 +60,7 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         kv_host_hit = 0
         node = result.last_host_node
-        while node is not result.last_device_node:
+        while node is not result.last_device_node and node is not None:
             full_host = node.component_data[ct].host_value
             if full_host is not None:
                 kv_host_hit += len(full_host)

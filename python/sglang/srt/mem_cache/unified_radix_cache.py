@@ -283,6 +283,9 @@ class UnifiedRadixCache(BasePrefixCache):
         }
         self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
         self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
+        self.enable_storage = False
+        self.ongoing_prefetch: dict = {}
+        self.ongoing_backup: dict = {}
 
     def _init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -448,6 +451,16 @@ class UnifiedRadixCache(BasePrefixCache):
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
+
+        # After dec_lock_ref, sweep the unlocked path to reconcile
+        # evictable_device_leaves.  Multiple lock/unlock cycles
+        # (load_back + request + chunked prefill) can leave the set stale
+        # when _update_evictable_leaf_sets was last called at a time the
+        # node's child set or lock_ref was different.
+        cur = req.last_node
+        while cur is not None and cur is not self.root_node:
+            self._update_evictable_leaf_sets(cur)
+            cur = cur.parent
 
         # cleanup
         for comp in self._components_tuple:
@@ -829,6 +842,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 params=params,
                 result=result,
             )
+        # After all components commit, re-evaluate D-leaf status.
+        # _add_new_node called _update_evictable_leaf_sets before aux
+        # components (e.g. mamba) attached their values, so a multi-component
+        # node would have been skipped.  Also covers is_new_leaf=False where
+        # an existing node's component data changed (e.g. mamba restored).
+        self._update_evictable_leaf_sets(target_node)
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
         return result
@@ -892,6 +911,7 @@ class UnifiedRadixCache(BasePrefixCache):
         - Keep node if any layer remains complete
         - Delete node only when both layers are empty
         """
+        ct = BASE_COMPONENT_TYPE
         cur = deleted_node.parent
         while cur != self.root_node and len(cur.children) == 0:
             # Don't touch locked nodes.
@@ -900,37 +920,33 @@ class UnifiedRadixCache(BasePrefixCache):
             ):
                 break
 
-            # Check per-layer completeness for registered components.
-            device_complete = all(
-                cur.component_data[ct].value is not None for ct in self.tree_components
-            )
-            host_complete = all(
-                cur.component_data[ct].host_value is not None
-                for ct in self.tree_components
-            )
+            # Check Full component only (relaxed leaf definition).
+            has_device = cur.component_data[ct].value is not None
+            has_host = cur.component_data[ct].host_value is not None
 
-            if device_complete:
+            if has_device:
+                # Valid D-leaf (Full present on device).
+                self._update_evictable_leaf_sets(cur)
                 break
 
-            # Device incomplete → evict remaining device data
+            # Device empty → evict remaining aux device data
             for comp in self.components.values():
                 if comp.node_has_component_data(cur):
                     self._evict_component_and_detach_lru(
                         cur, comp, is_leaf=False, tracker=tracker
                     )
 
-            if host_complete:
-                # Host layer intact → valid host-only leaf, stop.
+            if has_host:
+                # Valid H-leaf (Full present on host).
                 self._update_evictable_leaf_sets(cur)
                 break
 
-            # Host also incomplete → evict remaining host data.
+            # No Full on either layer → evict remaining host data and delete.
             for comp in self.components.values():
                 cd = cur.component_data[comp.component_type]
                 if cd.host_value is not None:
                     comp.evict_component(cur, is_leaf=True)
 
-            # Both layers empty → delete node, continue cascade.
             self.evictable_host_leaves.discard(cur)
             self._remove_leaf_from_parent(cur)
             parent = cur.parent
@@ -955,7 +971,10 @@ class UnifiedRadixCache(BasePrefixCache):
     # ---- HiCache: Evict Helpers ----
 
     def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
-        """D-leaf: all-component device-complete, no device child, unlocked, not root.
+        """D-leaf: Full device value present, no device child, unlocked, not root.
+
+        Only the Full (base) component is required; auxiliary components
+        (Mamba, SWA) are not mandatory for D-leaf membership.
 
         D-leaf is a layer concept — a node may have tree children (S3 host-only)
         yet still be a D-leaf if no child has device value."""
@@ -968,22 +987,17 @@ class UnifiedRadixCache(BasePrefixCache):
             for child in node.children.values()
         ):
             return False
-        if not all(
-            node.component_data[c].value is not None for c in self.tree_components
-        ):
-            return False
         return True
 
     def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
-        """H-leaf: evicted, all-component host-complete, no children, unlocked, not root.
+        """H-leaf: evicted, Full host value present, no children, unlocked, not root.
 
+        Only the Full (base) component host_value is required; auxiliary
+        components are not mandatory for H-leaf membership.
         Unlike D-leaf (layer concept), H-leaf equals true tree leaf."""
         if node is self.root_node or not node.evicted:
             return False
-        if not all(
-            node.component_data[ct].host_value is not None
-            for ct in self.tree_components
-        ):
+        if node.component_data[BASE_COMPONENT_TYPE].host_value is None:
             return False
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return False
@@ -1279,6 +1293,12 @@ class UnifiedRadixCache(BasePrefixCache):
             for ack_id in ack_list:
                 node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node)
+                # Sweep loaded-back path: reconcile evictable_device_leaves
+                # for nodes that may not be on any request's dec_lock_ref path.
+                cur = node
+                while cur is not None and cur is not self.root_node:
+                    self._update_evictable_leaf_sets(cur)
+                    cur = cur.parent
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -1602,19 +1622,21 @@ class UnifiedRadixCache(BasePrefixCache):
             has_dev = dev[FCT]
             has_hst = hst[FCT]
 
-            # D-leaf: has Full device value, no device child
+            # D-leaf: has Full device value, no device child, UNLOCKED
             child_dev = any(
                 c.component_data[FCT].value is not None for c in node.children.values()
             )
-            is_dev_leaf = has_dev and not child_dev
+            full_locked = node.component_data[FCT].lock_ref > 0
+            is_dev_leaf = has_dev and not child_dev and not full_locked
             # H-leaf: has Full host value, true tree leaf (no children)
             is_hst_leaf = has_hst and len(node.children) == 0
 
-            # A1: Leaf layer consistency — leaf must be all-component-complete
-            if is_dev_leaf and not all(dev.values()):
-                E(f"[A1] D-leaf {nid} partial device: {dev}")
-            if is_hst_leaf and not all(hst.values()):
-                E(f"[A1] H-leaf {nid} partial host: {hst}")
+            # A1: Leaf layer consistency — Full must be present (relaxed:
+            # aux components are optional for leaf membership).
+            if is_dev_leaf and not dev[FCT]:
+                E(f"[A1] D-leaf {nid} missing Full device value")
+            if is_hst_leaf and not hst[FCT]:
+                E(f"[A1] H-leaf {nid} missing Full host value")
 
             # A2: Tombstone rules — Full is tree backbone, never tombstone
             if any(dev.values()) and not dev[FCT]:
@@ -1628,7 +1650,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             # A4: Backup continuity — parent must be backed up before child
             if node.parent is not self.root_node:
-                if has_hst and not node.parent.component_data[FCT].host_value:
+                if has_hst and node.parent.component_data[FCT].host_value is None:
                     E(
                         f"[A4] node {nid} has host but parent "
                         f"{node.parent.id} not backed up"
