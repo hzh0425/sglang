@@ -864,8 +864,9 @@ class UnifiedRadixCache(BasePrefixCache):
                         node, comp, target=target, tracker=tracker
                     )
 
-        # Tombstone trigger's device value after cascade so that SWA can
-        # still read Full.value during its free_swa call in the loop above.
+        # Now that all components (including SWA which depends on Full.value)
+        # have been freed, we can safely tombstone Full.value.
+        # This is deferred from evict_component because free_swa needs it.
         if (
             target is EvictLayer.DEVICE
             and trigger.component_type == BASE_COMPONENT_TYPE
@@ -888,10 +889,10 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[int, int]:
         device_freed, host_freed = comp.evict_component(node, target=target)
         if tracker is not None:
-            if target is EvictLayer.HOST:
-                tracker[comp.component_type] += host_freed
-            elif target is EvictLayer.DEVICE:
+            if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed
+            if EvictLayer.HOST in target:
+                tracker[comp.component_type] += host_freed
 
         # Detach from the appropriate LRU list(s)
         ct = comp.component_type
@@ -1034,17 +1035,16 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         assert not node.evicted and node.backuped
-        for comp in self._components_tuple:
-            if comp.node_has_component_data(node):
-                self._evict_component_and_detach_lru(
-                    node, comp, target=EvictLayer.DEVICE, tracker=tracker
-                )
+        trigger = self.components[BASE_COMPONENT_TYPE]
+        self._evict_component_and_detach_lru(
+            node, trigger, target=EvictLayer.DEVICE, tracker=tracker
+        )
+        self._cascade_evict(node, trigger, tracker)
 
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
-        self._update_evictable_leaf_sets(node)
         self._update_evictable_leaf_sets(node.parent)
 
     def _evict_device_leaf(
@@ -1847,3 +1847,4 @@ class UnifiedRadixCache(BasePrefixCache):
                     if cd.host_value is not None:
                         self.host_lru_lists[ct].insert_mru(node)
             stack.extend(node.children.values())
+
