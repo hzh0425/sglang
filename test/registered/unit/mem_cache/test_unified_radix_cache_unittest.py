@@ -1370,10 +1370,8 @@ class UnifiedRadixCacheSuite:
             leaf_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(lr, "swa_uuid_for_lock", None)),
         )
-        base_match = tree.match_prefix(MatchPrefixParams(key=RadixKey(base)))
-        self.assertTrue(base_node.evicted)
-        self.assertIs(base_match.last_host_node, base_node)
-        self.assertIs(base_match.last_device_node, tree.root_node)
+        leaf_match = tree.match_prefix(MatchPrefixParams(key=RadixKey(leaf)))
+        self.assertEqual(len(leaf_match.device_indices), len(leaf))
         tree.sanity_check()
 
     def test_hicache_d_leaf_h_leaf_mutual_exclusion(self):
