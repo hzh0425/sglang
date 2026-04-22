@@ -1,5 +1,6 @@
 """Unit tests for UnifiedRadixCache"""
 
+import gc
 import unittest
 from dataclasses import dataclass
 from typing import Optional
@@ -297,8 +298,19 @@ class UnifiedRadixCacheSuite:
             hicache_write_policy="write_through",
         )
         tree.init_hicache(server_args, params)
+        tree.write_through_threshold = 1 << 30
         tree.load_back_threshold = 1
+        self.addCleanup(self._cleanup_hicache, tree)
         return server_args
+
+    def _cleanup_hicache(self, tree):
+        host_pool_group = getattr(tree, "host_pool_group", None)
+        if host_pool_group is not None:
+            host_pool_group.close()
+        tree.cache_controller = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def _wait_for_write_backup(self, tree):
         cc = tree.cache_controller

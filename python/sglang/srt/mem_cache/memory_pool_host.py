@@ -204,10 +204,50 @@ class HostKVCache(abc.ABC):
             )
 
         self.kv_buffer = self.init_kv_buffer()
+        self._closed = False
 
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def _iter_registered_tensors(self):
+        def walk(value):
+            if isinstance(value, torch.Tensor):
+                yield value
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    yield from walk(item)
+
+        if hasattr(self, "kv_buffer"):
+            yield from walk(self.kv_buffer)
+        if hasattr(self, "temporal_buffer"):
+            yield from walk(self.temporal_buffer)
+        if hasattr(self, "conv_buffer"):
+            yield from walk(self.conv_buffer)
+
+    def close(self) -> None:
+        if self._closed or not self.pin_memory or not torch.cuda.is_available():
+            self._closed = True
+            return
+
+        for tensor in self._iter_registered_tensors():
+            if tensor.device.type != "cpu":
+                continue
+            try:
+                torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+            except RuntimeError:
+                logger.debug(
+                    "cudaHostUnregister failed for tensor at %s",
+                    tensor.data_ptr(),
+                    exc_info=True,
+                )
+        self._closed = True
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @abc.abstractmethod
     def get_size_per_token(self):
@@ -1724,6 +1764,12 @@ class HostPoolGroup:
     def clear(self) -> None:
         for entry in self.entries:
             entry.host_pool.clear()
+
+    def close(self) -> None:
+        for entry in self.entries:
+            close = getattr(entry.host_pool, "close", None)
+            if close is not None:
+                close()
 
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
