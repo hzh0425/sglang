@@ -226,7 +226,7 @@ class HostKVCache(abc.ABC):
             yield from walk(self.conv_buffer)
 
     def close(self) -> None:
-        if self._closed or not self.pin_memory or not torch.cuda.is_available():
+        if getattr(self, "_closed", False) or not self.pin_memory or not torch.cuda.is_available():
             self._closed = True
             return
 
