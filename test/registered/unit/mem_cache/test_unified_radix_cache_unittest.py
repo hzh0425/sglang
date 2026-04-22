@@ -295,6 +295,7 @@ class UnifiedRadixCacheSuite:
         server_args = ServerArgs(
             model_path="dummy",
             page_size=self.cfg.page_size,
+            hicache_io_backend="direct",
             hicache_write_policy="write_through",
         )
         tree.init_hicache(server_args, params)
