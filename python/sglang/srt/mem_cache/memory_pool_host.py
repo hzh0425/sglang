@@ -1654,6 +1654,236 @@ class MambaPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
+# ---- V4 Compressed KV Host Pools ----
+
+
+class LogicalHostPool:
+    """Pure-logical anchor pool for V4 HiCache.
+
+    Manages token-level index slots with alloc/free but holds no real KV buffer.
+    Used as the anchor pool for HostPoolGroup; the actual DMA is handled by
+    compressed pool entries (C4/C128/Indexer) registered as extra pools.
+    """
+
+    def __init__(self, size: int, page_size: int, device: str):
+        self.size = size
+        self.page_size = page_size
+        self.device = device
+        self.layout = "layer_first"
+        self.dtype = torch.uint8
+        self.layer_num = 0
+        self.start_layer = 0
+        self.end_layer = 0
+        self.kv_buffer = None
+        self.size_per_token = 0
+        self.allocator = None
+        self.lock = threading.RLock()
+        self.clear()
+
+    @synchronized
+    def clear(self):
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    @synchronized
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size > self.available_size():
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    @synchronized
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat(
+            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
+        )
+        return len(indices)
+
+    # DMA no-ops: logical pool has no real buffer
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        pass
+
+    def get_data_page(self, index, flat=True):
+        return torch.empty(0, dtype=torch.uint8)
+
+    def get_dummy_flat_data_page(self):
+        return torch.empty(0, dtype=torch.uint8)
+
+    def set_from_flat_data_page(self, index, data_page):
+        pass
+
+    def get_page_buffer_meta(self, indices):
+        return None
+
+    def get_ksize_per_token(self):
+        return 0
+
+
+class DeepSeekV4CompressedKVHostPool:
+    """Host pool for V4 compressed KV (C4 or C128).
+
+    Mirrors the device-side DeepSeekV4SingleKVPool paged layout:
+    per-layer [num_host_pages, bytes_per_page_padded] uint8 buffers.
+    Same class is instantiated separately for C4 and C128.
+    """
+
+    def __init__(self, device_pool, num_host_pages: int):
+        self.layer_num = device_pool.layer_num
+        self.bytes_per_page_padded = device_pool.bytes_per_page_padded
+        self.dtype = torch.uint8
+        self.device = device_pool.device
+
+        # Per-layer 2D buffer matching device layout, pinned memory
+        self.kv_buffer = [
+            torch.zeros(
+                num_host_pages,
+                self.bytes_per_page_padded,
+                dtype=self.dtype,
+                device="cpu",
+            )
+            for _ in range(self.layer_num)
+        ]
+        if _is_cuda:
+            for buf in self.kv_buffer:
+                torch.cuda.cudart().cudaHostRegister(
+                    buf.data_ptr(), buf.numel() * buf.element_size(), 0
+                )
+
+        # Device-side per-layer base pointers (for transfer_kv_all_layer_mla)
+        self.device_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in device_pool.kv_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def clear(self):
+        pass  # No allocator state; indices are derived from full
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """D->H: page-level transfer, all layers."""
+        if host_indices is None or device_indices is None:
+            return
+        transfer_kv_all_layer_mla(
+            src_layers=self.device_data_ptrs,
+            dst_layers=self.data_ptrs,
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self.bytes_per_page_padded,
+            num_layers=self.layer_num,
+        )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """H->D: page-level transfer, one layer."""
+        if host_indices is None or device_indices is None:
+            return
+        transfer_kv_per_layer_mla(
+            src=self.kv_buffer[layer_id],
+            dst=device_pool.kv_buffer[layer_id],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self.bytes_per_page_padded,
+        )
+
+
+class DeepSeekV4IndexerHostPool:
+    """Host pool for V4 C4 Indexer.
+
+    Mirrors the device-side DeepSeekV4IndexerPool paged layout:
+    per-layer [num_host_pages, page_bytes] uint8 buffers.
+    page_bytes has no 576-byte alignment (unlike C4/C128 KV).
+    """
+
+    def __init__(self, device_pool, num_host_pages: int):
+        self.layer_num = device_pool.layer_num
+        self.dtype = torch.uint8
+        self.device = device_pool.device
+
+        # Compute page_bytes matching device-side DeepSeekV4IndexerPool._create_buffer
+        num_scales_per_token = device_pool.index_head_dim // device_pool.quant_block_size
+        self.page_bytes = (
+            device_pool.page_size * device_pool.index_head_dim
+            + device_pool.page_size * num_scales_per_token * 4
+        )
+
+        # Per-layer 2D buffer, pinned memory
+        self.kv_buffer = [
+            torch.zeros(
+                num_host_pages, self.page_bytes, dtype=self.dtype, device="cpu"
+            )
+            for _ in range(self.layer_num)
+        ]
+        if _is_cuda:
+            for buf in self.kv_buffer:
+                torch.cuda.cudart().cudaHostRegister(
+                    buf.data_ptr(), buf.numel() * buf.element_size(), 0
+                )
+
+        # Device-side per-layer base pointers
+        self.device_data_ptrs = torch.tensor(
+            [x.data_ptr() for x in device_pool.index_k_with_scale_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        self.data_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.data_refs],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+
+    def clear(self):
+        pass  # No allocator state; indices are derived from full
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """D->H: page-level transfer, all layers."""
+        if host_indices is None or device_indices is None:
+            return
+        transfer_kv_all_layer_mla(
+            src_layers=self.device_data_ptrs,
+            dst_layers=self.data_ptrs,
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            item_size=self.page_bytes,
+            num_layers=self.layer_num,
+        )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """H->D: page-level transfer, one layer."""
+        if host_indices is None or device_indices is None:
+            return
+        transfer_kv_per_layer_mla(
+            src=self.kv_buffer[layer_id],
+            dst=device_pool.index_k_with_scale_buffer[layer_id],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            item_size=self.page_bytes,
+        )
+
+
 @dataclass
 class PoolEntry:
     name: PoolName
@@ -1669,6 +1899,9 @@ class PoolEntry:
     # device_evict_fn(n): evict n slots from the device pool (used by load()).
     host_evict_fn: Optional[Callable] = None
     device_evict_fn: Optional[Callable] = None
+    # Optional callback to derive compressed indices from full indices.
+    # Used by V4 compressed pools: given full indices, returns page-level indices.
+    derive_indices_fn: Optional[Callable] = None
 
 
 class HostPoolGroup:

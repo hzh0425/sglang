@@ -341,7 +341,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
 
     def alloc(self, need_size: int):
-        assert self.page_size == 1
         if need_size > self.full_attn_allocator.available_size():
             return None
         if need_size > self.swa_attn_allocator.available_size():

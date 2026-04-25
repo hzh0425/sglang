@@ -34,6 +34,7 @@ class ComponentType(int, Enum):
     FULL = 0
     SWA = 1
     MAMBA = 2
+    DSV4_COMPRESSED = 3
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()
