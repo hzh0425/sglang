@@ -542,6 +542,14 @@ class HybridCacheController(BaseHiCacheController):
                 pool.device_indices = kv_device_indices
                 pool.host_indices = kv_host_indices
                 continue
+            # Derive mode: compute indices from full indices via callback
+            # TODO: Merge this mode with the share_indices_with_anchor mode
+            if entry.derive_indices_fn is not None:
+                if alloc_host and pool.host_indices is None and kv_host_indices is not None:
+                    pool.host_indices = entry.derive_indices_fn(kv_host_indices)
+                elif not alloc_host and pool.device_indices is None and kv_device_indices is not None:
+                    pool.device_indices = entry.derive_indices_fn(kv_device_indices)
+                continue
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:
                     continue

@@ -42,6 +42,9 @@ class PoolName(str, Enum):
     KV = "kv"
     MAMBA = "mamba"
     INDEXER = "indexer"
+    DEEPSEEK_V4_C4 = "deepseek_v4_c4"
+    DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    DEEPSEEK_V4_INDEXER = "deepseek_v4_indexer"
 
     def __str__(self) -> str:
         return self.value

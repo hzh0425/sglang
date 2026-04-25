@@ -8,7 +8,9 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
     HostPoolGroup,
+    LogicalHostPool,
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
@@ -300,6 +302,135 @@ def build_shared_anchor_stack(
     return host_pool_group, cache_controller
 
 
+def build_deepseekv4_compressed_stack(
+    *,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    kvcache,
+    page_size: int,
+    tp_group,
+    load_cache_event,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    """Build a V4 compressed KV stack: LogicalHostPool (anchor) + C4/C128/Indexer host pools.
+
+    The anchor is a logical pool (no real KV DMA) that manages FULL host indices.
+    C4, C128, and C4_INDEXER are real host pools that perform page-level DMA
+    for the compressed KV data.  Their host/device indices are derived from
+    FULL indices at resolve time, not independently allocated.
+    """
+    import torch
+
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+
+    assert isinstance(kvcache, DeepSeekV4TokenToKVPool)
+
+    # --- Layer mappings ---
+    # Transfer layer num = total attention layers (covers SWA + C4 + C128)
+    transfer_layer_num = kvcache.layer_num
+
+    c4_layer_mapping: dict[int, int] = {}
+    c128_layer_mapping: dict[int, int] = {}
+    for layer_id, item in enumerate(kvcache.layer_mapping):
+        if item.compress_ratio == 4:
+            c4_layer_mapping[layer_id] = item.compress_layer_id
+        elif item.compress_ratio == 128:
+            c128_layer_mapping[layer_id] = item.compress_layer_id
+
+    # --- Host pool sizes ---
+    # All pools (anchor, C4, C128, indexer) share the same num_host_pages.
+    full_page_size = page_size
+    device_full_size = params.token_to_kv_pool_allocator.size_full
+    if server_args.hicache_size > 0:
+        logical_host_size = int(device_full_size * server_args.hicache_size)
+    else:
+        logical_host_size = int(device_full_size * server_args.hicache_ratio)
+    logical_host_size = (logical_host_size // full_page_size) * full_page_size
+    num_host_pages = logical_host_size // full_page_size
+
+    # --- Create pools ---
+    logical_host_pool = LogicalHostPool(
+        size=logical_host_size,
+        page_size=full_page_size,
+        device=kvcache.device,
+    )
+    c4_host_pool = DeepSeekV4PagedHostPool(
+        pool_name="c4_kv",
+        device_buffers=kvcache.c4_kv_pool.kv_buffer,
+        item_bytes=kvcache.c4_kv_pool.bytes_per_page_padded,
+        num_host_pages=num_host_pages,
+        device=kvcache.device,
+    )
+    c128_host_pool = DeepSeekV4PagedHostPool(
+        pool_name="c128_kv",
+        device_buffers=kvcache.c128_kv_pool.kv_buffer,
+        item_bytes=kvcache.c128_kv_pool.bytes_per_page_padded,
+        num_host_pages=num_host_pages,
+        device=kvcache.device,
+    )
+    # Compute indexer page_bytes matching DeepSeekV4IndexerPool._create_buffer
+    _idxr = kvcache.c4_indexer_kv_pool
+    _num_scales = _idxr.index_head_dim // _idxr.quant_block_size
+    indexer_page_bytes = (
+        _idxr.page_size * _idxr.index_head_dim
+        + _idxr.page_size * _num_scales * 4
+    )
+    c4_indexer_host_pool = DeepSeekV4PagedHostPool(
+        pool_name="c4_indexer",
+        device_buffers=_idxr.index_k_with_scale_buffer,
+        item_bytes=indexer_page_bytes,
+        num_host_pages=num_host_pages,
+        device=kvcache.device,
+    )
+
+    # --- Derive function: full indices → page indices ---
+    page_derive = lambda full: torch.unique(full // full_page_size)
+
+    # --- Assemble entries ---
+    anchor_entry = PoolEntry(
+        name=PoolName.KV,
+        host_pool=logical_host_pool,
+        device_pool=kvcache,
+        layer_mapper=_make_layer_mapper({}, transfer_layer_num),
+        is_primary_index_anchor=True,
+    )
+    c4_entry = PoolEntry(
+        name=PoolName.DEEPSEEK_V4_C4,
+        host_pool=c4_host_pool,
+        device_pool=kvcache.c4_kv_pool,
+        layer_mapper=_make_layer_mapper(c4_layer_mapping, transfer_layer_num),
+        derive_indices_fn=page_derive,
+    )
+    c4_indexer_entry = PoolEntry(
+        name=PoolName.DEEPSEEK_V4_INDEXER,
+        host_pool=c4_indexer_host_pool,
+        device_pool=kvcache.c4_indexer_kv_pool,
+        layer_mapper=_make_layer_mapper(c4_layer_mapping, transfer_layer_num),
+        derive_indices_fn=page_derive,
+    )
+    c128_entry = PoolEntry(
+        name=PoolName.DEEPSEEK_V4_C128,
+        host_pool=c128_host_pool,
+        device_pool=kvcache.c128_kv_pool,
+        layer_mapper=_make_layer_mapper(c128_layer_mapping, transfer_layer_num),
+        derive_indices_fn=page_derive,
+    )
+
+    entries = [anchor_entry, c4_entry, c4_indexer_entry, c128_entry]
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        page_size,
+        tp_group,
+        load_cache_event=load_cache_event,
+        write_policy=server_args.hicache_write_policy,
+        io_backend=server_args.hicache_io_backend,
+        storage_backend=None,
+        transfer_layer_num=transfer_layer_num,
+    )
+    return host_pool_group, cache_controller
+
+
 def attach_hybrid_pool_to_unified_cache(
     cache: UnifiedRadixCache,
     params: CacheInitParams,
@@ -309,6 +440,7 @@ def attach_hybrid_pool_to_unified_cache(
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
         MLATokenToKVPool,
@@ -318,6 +450,7 @@ def attach_hybrid_pool_to_unified_cache(
 
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        deepseek_v4_stack = isinstance(kvcache, DeepSeekV4TokenToKVPool)
         if isinstance(kvcache, HybridLinearKVPool):
             full_kv_pool = kvcache.full_kv_pool
             use_mla = kvcache.use_mla
@@ -325,6 +458,9 @@ def attach_hybrid_pool_to_unified_cache(
                 ComponentType.FULL,
                 ComponentType.MAMBA,
             }, "HybridLinearKVPool currently only supports FULL + MAMBA in UnifiedRadixCache."
+        elif deepseek_v4_stack:
+            full_kv_pool = kvcache
+            use_mla = True
         else:
             full_kv_pool = kvcache
             use_mla = isinstance(kvcache, MLATokenToKVPool)
@@ -334,7 +470,23 @@ def attach_hybrid_pool_to_unified_cache(
 
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
         nsa_stack = isinstance(kvcache, NSATokenToKVPool)
-        if mamba_stack:
+        if deepseek_v4_stack:
+            host_pool_group, cache_controller = build_deepseekv4_compressed_stack(
+                params=params,
+                server_args=server_args,
+                kvcache=kvcache,
+                page_size=cache.page_size,
+                tp_group=params.tp_cache_group,
+                load_cache_event=load_cache_event,
+            )
+            cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+            cache.host_pool_group = host_pool_group
+            cache.cache_controller = cache_controller
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
+            transfer_layer_num = kvcache.layer_num
+        elif mamba_stack:
             full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
             mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
             host_pool_group, cache_controller = build_hybrid_mamba_stack(
@@ -397,8 +549,6 @@ def attach_hybrid_pool_to_unified_cache(
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller
-            # Register the NSA indexer pool as sharing anchor-KV indices so
-            # HiCache backup/load emits its PoolTransfer together with KV.
             cache.register_hicache_anchor_kv_shared_indices_pool(
                 PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
@@ -438,7 +588,7 @@ def attach_hybrid_pool_to_unified_cache(
 
         logger.info(
             "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_num=%s",
-            "KV + MAMBA" if mamba_stack else "KV + INDEXER" if nsa_stack else "KV",
+            "V4 compressed" if deepseek_v4_stack else "KV + MAMBA" if mamba_stack else "KV + INDEXER" if nsa_stack else "KV",
             transfer_layer_num,
         )
     except Exception:
