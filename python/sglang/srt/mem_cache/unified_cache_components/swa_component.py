@@ -61,6 +61,10 @@ class SWAComponent(TreeComponent):
 
         def validator(node: UnifiedTreeNode) -> bool:
             if node.component_data[ct].value is None:
+                # HiCache: host-backed nodes pass validation;
+                # SWA will be rebuilt via replay after load-back.
+                if node.backuped:
+                    return True
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
@@ -249,9 +253,9 @@ class SWAComponent(TreeComponent):
 
         cur = node
         while cur != root and swa_lock_size < sliding_window_size:
-            assert (
-                cur.component_data[ct].value is not None
-            ), f"acquire_component_lock({ct}) on tombstoned node {cur.id}"
+            if cur.component_data[ct].value is None:
+                # SWA data evicted (device-only, no host backup) — stop walk
+                break
             comp = cur.component_data[ct]
             if comp.lock_ref == 0:
                 key_len = len(cur.key)
@@ -278,13 +282,13 @@ class SWAComponent(TreeComponent):
 
         cur = node
         while cur != root and dec_swa:
-            assert (
-                cur.component_data[ct].value is not None
-            ), f"release_component_lock({ct}) on tombstoned node {cur.id}"
+            if cur.component_data[ct].value is None:
+                # SWA data evicted — stop walk
+                break
             comp = cur.component_data[ct]
-            assert (
-                comp.lock_ref > 0
-            ), f"release_component_lock({ct}) on node with lock_ref=0, node {cur.id}"
+            if comp.lock_ref <= 0:
+                # Already fully unlocked (can happen if acquire stopped early)
+                break
             if comp.lock_ref == 1:
                 key_len = len(cur.key)
                 self.cache.component_evictable_size_[ct] += key_len
