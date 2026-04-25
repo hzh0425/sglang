@@ -8,15 +8,14 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
-    DeepSeekV4CompressedKVHostPool,
-    DeepSeekV4IndexerHostPool,
+    DeepSeekV4TokenToKVPoolHost,
     HostPoolGroup,
-    LogicalHostPool,
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
     NSAIndexerPoolHost,
     PoolEntry,
+    get_allocator_from_storage,
 )
 
 if TYPE_CHECKING:
@@ -311,7 +310,7 @@ def build_deepseekv4_compressed_stack(
     page_size: int,
     tp_group,
     load_cache_event,
-) -> tuple[HostPoolGroup, HybridCacheController]:
+) -> tuple[HostPoolGroup, HybridCacheController, DeepSeekV4TokenToKVPoolHost]:
     """Build a V4 compressed KV stack: LogicalHostPool (anchor) + C4/C128/Indexer host pools.
 
     The anchor is a logical pool (no real KV DMA) that manages FULL host indices.
@@ -319,23 +318,11 @@ def build_deepseekv4_compressed_stack(
     for the compressed KV data.  Their host/device indices are derived from
     FULL indices at resolve time, not independently allocated.
     """
-    import torch
-
     from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 
     assert isinstance(kvcache, DeepSeekV4TokenToKVPool)
 
-    # --- Layer mappings ---
-    # Transfer layer num = total attention layers (covers SWA + C4 + C128)
     transfer_layer_num = kvcache.layer_num
-
-    c4_layer_mapping: dict[int, int] = {}
-    c128_layer_mapping: dict[int, int] = {}
-    for layer_id, item in enumerate(kvcache.layer_mapping):
-        if item.compress_ratio == 4:
-            c4_layer_mapping[layer_id] = item.compress_layer_id
-        elif item.compress_ratio == 128:
-            c128_layer_mapping[layer_id] = item.compress_layer_id
 
     # --- Host pool sizes ---
     # Compute full host size from server_args ratio/size
@@ -349,63 +336,18 @@ def build_deepseekv4_compressed_stack(
         logical_host_size = int(device_full_size * server_args.hicache_ratio)
     # Page-align
     logical_host_size = (logical_host_size // full_page_size + 1) * full_page_size
-    num_host_pages = logical_host_size // full_page_size
 
-    # --- Create pools ---
-    logical_host_pool = LogicalHostPool(
-        size=logical_host_size,
-        page_size=full_page_size,
-        device=kvcache.device,
-    )
-    c4_host_pool = DeepSeekV4CompressedKVHostPool(
-        device_pool=kvcache.c4_kv_pool,
-        num_host_pages=num_host_pages,
-    )
-    c128_host_pool = DeepSeekV4CompressedKVHostPool(
-        device_pool=kvcache.c128_kv_pool,
-        num_host_pages=num_host_pages,
-    )
-    c4_indexer_host_pool = DeepSeekV4IndexerHostPool(
-        device_pool=kvcache.c4_indexer_kv_pool,
-        num_host_pages=num_host_pages,
-    )
-
-    # --- Derive function: full indices → page indices ---
-    page_derive = lambda full: torch.unique(full // full_page_size)
-
-    # --- Assemble entries ---
-    # Anchor: logical host pool (no layer mapping → no real DMA for anchor)
-    anchor_entry = PoolEntry(
-        name=PoolName.KV,
-        host_pool=logical_host_pool,
+    allocator = get_allocator_from_storage(server_args.hicache_storage_backend)
+    v4_host_pool = DeepSeekV4TokenToKVPoolHost(
         device_pool=kvcache,
-        layer_mapper=_make_layer_mapper({}, transfer_layer_num),
-        is_primary_index_anchor=True,
+        full_host_size=logical_host_size,
+        full_page_size=full_page_size,
+        layout=server_args.hicache_mem_layout,
+        pin_memory=True,
+        device="cpu",
+        allocator=allocator,
     )
-    c4_entry = PoolEntry(
-        name=PoolName.C4,
-        host_pool=c4_host_pool,
-        device_pool=kvcache.c4_kv_pool,
-        layer_mapper=_make_layer_mapper(c4_layer_mapping, transfer_layer_num),
-        derive_indices_fn=page_derive,
-    )
-    c4_indexer_entry = PoolEntry(
-        name=PoolName.C4_INDEXER,
-        host_pool=c4_indexer_host_pool,
-        device_pool=kvcache.c4_indexer_kv_pool,
-        layer_mapper=_make_layer_mapper(c4_layer_mapping, transfer_layer_num),
-        derive_indices_fn=page_derive,
-    )
-    c128_entry = PoolEntry(
-        name=PoolName.C128,
-        host_pool=c128_host_pool,
-        device_pool=kvcache.c128_kv_pool,
-        layer_mapper=_make_layer_mapper(c128_layer_mapping, transfer_layer_num),
-        derive_indices_fn=page_derive,
-    )
-
-    entries = [anchor_entry, c4_entry, c4_indexer_entry, c128_entry]
-    host_pool_group = HostPoolGroup(entries)
+    host_pool_group = HostPoolGroup(v4_host_pool.build_pool_entries())
     cache_controller = HybridCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
@@ -417,7 +359,7 @@ def build_deepseekv4_compressed_stack(
         storage_backend=None,
         transfer_layer_num=transfer_layer_num,
     )
-    return host_pool_group, cache_controller
+    return host_pool_group, cache_controller, v4_host_pool
 
 
 def attach_hybrid_pool_to_unified_cache(
@@ -460,7 +402,11 @@ def attach_hybrid_pool_to_unified_cache(
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
         nsa_stack = isinstance(kvcache, NSATokenToKVPool)
         if v4_stack:
-            host_pool_group, cache_controller = build_deepseekv4_compressed_stack(
+            (
+                host_pool_group,
+                cache_controller,
+                deepseek_v4_kv_pool_host,
+            ) = build_deepseekv4_compressed_stack(
                 params=params,
                 server_args=server_args,
                 kvcache=kvcache,
@@ -468,6 +414,7 @@ def attach_hybrid_pool_to_unified_cache(
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
             )
+            cache.deepseek_v4_kv_pool_host = deepseek_v4_kv_pool_host
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
             cache.cache_controller = cache_controller

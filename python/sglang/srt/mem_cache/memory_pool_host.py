@@ -6,7 +6,7 @@ import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.hicache_storage import PoolName
@@ -1729,161 +1729,6 @@ class LogicalHostPool:
         return 0
 
 
-class DeepSeekV4CompressedKVHostPool:
-    """Host pool for V4 compressed KV (C4 or C128).
-
-    Mirrors the device-side DeepSeekV4SingleKVPool paged layout:
-    per-layer [num_host_pages, bytes_per_page_padded] uint8 buffers.
-    Same class is instantiated separately for C4 and C128.
-    """
-
-    def __init__(self, device_pool, num_host_pages: int):
-        self.layer_num = device_pool.layer_num
-        self.bytes_per_page_padded = device_pool.bytes_per_page_padded
-        self.dtype = torch.uint8
-        self.device = device_pool.device
-
-        # Per-layer 2D buffer matching device layout, pinned memory
-        self.kv_buffer = [
-            torch.zeros(
-                num_host_pages,
-                self.bytes_per_page_padded,
-                dtype=self.dtype,
-                device="cpu",
-            )
-            for _ in range(self.layer_num)
-        ]
-        if _is_cuda:
-            for buf in self.kv_buffer:
-                torch.cuda.cudart().cudaHostRegister(
-                    buf.data_ptr(), buf.numel() * buf.element_size(), 0
-                )
-
-        # Device-side per-layer base pointers (for transfer_kv_all_layer_mla)
-        self.device_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in device_pool.kv_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-
-    def clear(self):
-        pass  # No allocator state; indices are derived from full
-
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        """D->H: page-level transfer, all layers."""
-        if host_indices is None or device_indices is None:
-            return
-        transfer_kv_all_layer_mla(
-            src_layers=self.device_data_ptrs,
-            dst_layers=self.data_ptrs,
-            src_indices=device_indices,
-            dst_indices=host_indices,
-            item_size=self.bytes_per_page_padded,
-            num_layers=self.layer_num,
-        )
-
-    def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        """H->D: page-level transfer, one layer."""
-        if host_indices is None or device_indices is None:
-            return
-        transfer_kv_per_layer_mla(
-            src=self.kv_buffer[layer_id],
-            dst=device_pool.kv_buffer[layer_id],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            item_size=self.bytes_per_page_padded,
-        )
-
-
-class DeepSeekV4IndexerHostPool:
-    """Host pool for V4 C4 Indexer.
-
-    Mirrors the device-side DeepSeekV4IndexerPool paged layout:
-    per-layer [num_host_pages, page_bytes] uint8 buffers.
-    page_bytes has no 576-byte alignment (unlike C4/C128 KV).
-    """
-
-    def __init__(self, device_pool, num_host_pages: int):
-        self.layer_num = device_pool.layer_num
-        self.dtype = torch.uint8
-        self.device = device_pool.device
-
-        # Compute page_bytes matching device-side DeepSeekV4IndexerPool._create_buffer
-        num_scales_per_token = device_pool.index_head_dim // device_pool.quant_block_size
-        self.page_bytes = (
-            device_pool.page_size * device_pool.index_head_dim
-            + device_pool.page_size * num_scales_per_token * 4
-        )
-
-        # Per-layer 2D buffer, pinned memory
-        self.kv_buffer = [
-            torch.zeros(
-                num_host_pages, self.page_bytes, dtype=self.dtype, device="cpu"
-            )
-            for _ in range(self.layer_num)
-        ]
-        if _is_cuda:
-            for buf in self.kv_buffer:
-                torch.cuda.cudart().cudaHostRegister(
-                    buf.data_ptr(), buf.numel() * buf.element_size(), 0
-                )
-
-        # Device-side per-layer base pointers
-        self.device_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in device_pool.index_k_with_scale_buffer],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device,
-        )
-
-    def clear(self):
-        pass  # No allocator state; indices are derived from full
-
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend
-    ):
-        """D->H: page-level transfer, all layers."""
-        if host_indices is None or device_indices is None:
-            return
-        transfer_kv_all_layer_mla(
-            src_layers=self.device_data_ptrs,
-            dst_layers=self.data_ptrs,
-            src_indices=device_indices,
-            dst_indices=host_indices,
-            item_size=self.page_bytes,
-            num_layers=self.layer_num,
-        )
-
-    def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        """H->D: page-level transfer, one layer."""
-        if host_indices is None or device_indices is None:
-            return
-        transfer_kv_per_layer_mla(
-            src=self.kv_buffer[layer_id],
-            dst=device_pool.index_k_with_scale_buffer[layer_id],
-            src_indices=host_indices,
-            dst_indices=device_indices,
-            item_size=self.page_bytes,
-        )
-
-
 @dataclass
 class PoolEntry:
     name: PoolName
@@ -1902,6 +1747,511 @@ class PoolEntry:
     # Optional callback to derive compressed indices from full indices.
     # Used by V4 compressed pools: given full indices, returns page-level indices.
     derive_indices_fn: Optional[Callable] = None
+
+
+class _DeepSeekV4CompressedKVPoolHost:
+    def __init__(
+        self,
+        *,
+        device_buffers: List[torch.Tensor],
+        layer_num: int,
+        page_size: int,
+        bytes_per_page: int,
+        full_host_size: int,
+        full_page_size: int,
+        compress_ratio: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        device_buffer_device: str,
+        allocator,
+    ):
+        self.device_buffers = device_buffers
+        self.layer_num = layer_num
+        self.compressed_page_size = page_size
+        self.page_size = full_page_size
+        self.bytes_per_page = bytes_per_page
+        self.full_page_size = full_page_size
+        self.compress_ratio = compress_ratio
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.device_buffer_device = device_buffer_device
+        self.allocator = allocator
+
+        self.page_num = full_host_size // full_page_size if self.layer_num > 0 else 0
+        self.buffer = self.init_kv_buffer()
+        self.data_refs, self.data_ptrs = self._init_host_refs()
+        self.device_ptrs = self._init_device_ptrs()
+
+    @property
+    def bytes_per_full_page(self) -> int:
+        return self.layer_num * self.bytes_per_page
+
+    def init_kv_buffer(self) -> Optional[torch.Tensor]:
+        if self.layer_num == 0:
+            return None
+        if self.layout == "layer_first":
+            dims = (self.layer_num, self.page_num, self.bytes_per_page)
+        elif self.layout == "page_first":
+            dims = (self.page_num, self.layer_num, self.bytes_per_page)
+        elif self.layout == "page_first_direct":
+            dims = (self.page_num, self.layer_num, 1, self.bytes_per_page)
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_buffer_device]
+        return alloc_func(
+            dims,
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+
+    def _init_host_refs(self) -> tuple[List[torch.Tensor], Optional[torch.Tensor]]:
+        if self.buffer is None or self.layer_num == 0:
+            return [], None
+        if self.layout == "layer_first":
+            data_refs = [self.buffer[i] for i in range(self.layer_num)]
+        elif self.layout == "page_first":
+            data_refs = [self.buffer[:, i, :] for i in range(self.layer_num)]
+        elif self.layout == "page_first_direct":
+            data_refs = []
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        if not data_refs:
+            return data_refs, None
+        data_ptrs = torch.tensor(
+            [x.data_ptr() for x in data_refs],
+            dtype=torch.uint64,
+            device=self.device_buffer_device,
+        )
+        return data_refs, data_ptrs
+
+    def _init_device_ptrs(self) -> Optional[torch.Tensor]:
+        if len(self.device_buffers) == 0:
+            return None
+        return torch.tensor(
+            [x.data_ptr() for x in self.device_buffers],
+            dtype=torch.uint64,
+            device=self.device_buffer_device,
+        )
+
+    def page_ids_from_full_indices(
+        self, indices: torch.Tensor, device: torch.device | str
+    ) -> torch.Tensor:
+        indices = indices.to(device=device, dtype=torch.int64)
+        if indices.numel() == 0:
+            return indices
+        if indices.numel() % self.full_page_size != 0:
+            raise ValueError(
+                "DeepSeek-V4 HiCache transfer expects full pages, got "
+                f"{indices.numel()} indices"
+            )
+        if self.compressed_page_size * self.compress_ratio != self.full_page_size:
+            raise ValueError(
+                "DeepSeek-V4 compressed page size mismatch: "
+                f"{self.compressed_page_size=} * {self.compress_ratio=} "
+                f"!= {self.full_page_size=}"
+            )
+
+        starts = indices[:: self.full_page_size]
+        if not torch.all(starts % self.full_page_size == 0):
+            raise ValueError("DeepSeek-V4 HiCache indices must be page aligned")
+        compressed_starts = starts // self.compress_ratio
+        if not torch.all(compressed_starts % self.compressed_page_size == 0):
+            raise ValueError(
+                "DeepSeek-V4 HiCache compressed indices must be page aligned"
+            )
+        return compressed_starts // self.compressed_page_size
+
+    def page_id_from_full_index(self, index: int) -> int:
+        if index % self.full_page_size != 0:
+            raise ValueError(
+                f"DeepSeek-V4 host page index must be page aligned: {index}"
+            )
+        compressed_start = index // self.compress_ratio
+        if compressed_start % self.compressed_page_size != 0:
+            raise ValueError(
+                "DeepSeek-V4 host compressed index must be page aligned"
+            )
+        return compressed_start // self.compressed_page_size
+
+    def clear(self) -> None:
+        pass
+
+    def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+    ) -> None:
+        if io_backend not in ("kernel", "direct"):
+            raise ValueError(
+                "DeepSeek-V4 compressed host pool supports only kernel/direct IO backend"
+            )
+        if self.buffer is None or self.layer_num == 0:
+            return
+
+        dst = self.device_buffers[layer_id]
+        index_device = dst.device if io_backend == "kernel" else host_indices.device
+        host_page_ids = self.page_ids_from_full_indices(host_indices, index_device)
+        device_page_ids = self.page_ids_from_full_indices(device_indices, index_device)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            transfer_kv_per_layer_mla(
+                src=self.data_refs[layer_id],
+                dst=dst,
+                src_indices=host_page_ids,
+                dst_indices=device_page_ids,
+                item_size=self.bytes_per_page,
+            )
+        elif io_backend == "kernel" and self.layout == "page_first":
+            transfer_kv_per_layer_mla_pf_lf(
+                src=self.buffer,
+                dst=dst,
+                src_indices=host_page_ids,
+                dst_indices=device_page_ids,
+                layer_id=layer_id,
+                item_size=self.bytes_per_page,
+                src_layout_dim=self.bytes_per_full_page,
+            )
+        elif io_backend == "direct" and self.layout == "page_first_direct":
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.buffer],
+                dst_ptrs=[dst],
+                src_indices=host_page_ids,
+                dst_indices=device_page_ids,
+                layer_id=layer_id,
+                page_size=1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported layout/backend: {self.layout}/{io_backend}"
+            )
+
+    def backup_from_device_all_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        io_backend,
+    ) -> None:
+        if io_backend not in ("kernel", "direct"):
+            raise ValueError(
+                "DeepSeek-V4 compressed host pool supports only kernel/direct IO backend"
+            )
+        if self.buffer is None or self.layer_num == 0:
+            return
+        assert self.device_ptrs is not None
+
+        index_device = (
+            self.device_buffers[0].device
+            if io_backend == "kernel"
+            else host_indices.device
+        )
+        host_page_ids = self.page_ids_from_full_indices(host_indices, index_device)
+        device_page_ids = self.page_ids_from_full_indices(device_indices, index_device)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            assert self.data_ptrs is not None
+            transfer_kv_all_layer_mla(
+                src_layers=self.device_ptrs,
+                dst_layers=self.data_ptrs,
+                src_indices=device_page_ids,
+                dst_indices=host_page_ids,
+                item_size=self.bytes_per_page,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "kernel" and self.layout == "page_first":
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=self.device_ptrs,
+                dst=self.buffer,
+                src_indices=device_page_ids,
+                dst_indices=host_page_ids,
+                item_size=self.bytes_per_page,
+                dst_layout_dim=self.bytes_per_full_page,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "direct" and self.layout == "page_first_direct":
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=self.device_buffers,
+                dst_ptrs=[self.buffer],
+                src_indices=device_page_ids,
+                dst_indices=host_page_ids,
+                page_size=1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported layout/backend: {self.layout}/{io_backend}"
+            )
+
+    def get_data_page(self, index: int, flat: bool = True) -> Optional[torch.Tensor]:
+        if self.buffer is None:
+            return None
+        page_id = self.page_id_from_full_index(index)
+        if self.layout == "layer_first":
+            data_page = self.buffer[:, page_id, :]
+        elif self.layout == "page_first":
+            data_page = self.buffer[page_id]
+        elif self.layout == "page_first_direct":
+            data_page = self.buffer[page_id]
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return data_page.flatten() if flat else data_page
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(
+            (self.bytes_per_full_page,),
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        if self.buffer is None:
+            return
+        page_id = self.page_id_from_full_index(index)
+        if self.layout == "layer_first":
+            self.buffer[:, page_id, :] = data_page.view(
+                self.layer_num, self.bytes_per_page
+            )
+        elif self.layout == "page_first":
+            self.buffer[page_id] = data_page.view(
+                self.layer_num, self.bytes_per_page
+            )
+        elif self.layout == "page_first_direct":
+            self.buffer[page_id] = data_page.view(
+                self.layer_num, 1, self.bytes_per_page
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def get_page_buffer_meta(self, indices: torch.Tensor):
+        if self.buffer is None:
+            return [], []
+        if len(indices) % self.full_page_size != 0:
+            raise ValueError("DeepSeek-V4 host indices must be full-page aligned")
+        ptr_list: List[int] = []
+        element_size_list: List[int] = []
+        for index in indices[:: self.full_page_size].tolist():
+            self.append_page_buffer_meta(index, ptr_list, element_size_list)
+        return ptr_list, element_size_list
+
+    def append_page_buffer_meta(
+        self,
+        index: int,
+        ptr_list: List[int],
+        element_size_list: List[int],
+    ) -> None:
+        if self.buffer is None:
+            return
+        page_id = self.page_id_from_full_index(index)
+        if self.layout == "layer_first":
+            for layer_ref in self.data_refs:
+                ptr_list.append(layer_ref[page_id].data_ptr())
+                element_size_list.append(self.bytes_per_page)
+        elif self.layout in ("page_first", "page_first_direct"):
+            ptr_list.append(self.buffer[page_id].data_ptr())
+            element_size_list.append(self.bytes_per_full_page)
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+
+class DeepSeekV4SingleKVPoolHost(_DeepSeekV4CompressedKVPoolHost):
+    def __init__(
+        self,
+        device_pool,
+        full_host_size: int,
+        full_page_size: int,
+        compress_ratio: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator,
+    ):
+        super().__init__(
+            device_buffers=device_pool.kv_buffer,
+            layer_num=device_pool.layer_num,
+            page_size=device_pool.page_size,
+            bytes_per_page=(
+                device_pool.bytes_per_page_padded
+                if device_pool.layer_num > 0
+                else 0
+            ),
+            full_host_size=full_host_size,
+            full_page_size=full_page_size,
+            compress_ratio=compress_ratio,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            device_buffer_device=device_pool.device,
+            allocator=allocator,
+        )
+
+
+class DeepSeekV4CompressedKVHostPool(DeepSeekV4SingleKVPoolHost):
+    pass
+
+
+class DeepSeekV4IndexerPoolHost(_DeepSeekV4CompressedKVPoolHost):
+    def __init__(
+        self,
+        device_pool,
+        full_host_size: int,
+        full_page_size: int,
+        compress_ratio: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator,
+    ):
+        bytes_per_page = (
+            device_pool.index_k_with_scale_buffer[0].shape[1]
+            if device_pool.layer_num > 0
+            else 0
+        )
+        super().__init__(
+            device_buffers=device_pool.index_k_with_scale_buffer,
+            layer_num=device_pool.layer_num,
+            page_size=device_pool.page_size,
+            bytes_per_page=bytes_per_page,
+            full_host_size=full_host_size,
+            full_page_size=full_page_size,
+            compress_ratio=compress_ratio,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            device_buffer_device=device_pool.device,
+            allocator=allocator,
+        )
+
+
+class DeepSeekV4IndexerHostPool(DeepSeekV4IndexerPoolHost):
+    pass
+
+
+class DeepSeekV4TokenToKVPoolHost:
+    """Host-side organization for DeepSeek-V4 compressed KV HiCache.
+
+    This mirrors the device-side DeepSeekV4TokenToKVPool at the ownership level:
+    one logical full-token host pool is used as the index anchor, while C4,
+    C128, and C4 indexer host pools own the real host buffers and DMA.
+    """
+
+    def __init__(
+        self,
+        device_pool,
+        full_host_size: int,
+        full_page_size: int,
+        layout: str,
+        pin_memory: bool,
+        device: str,
+        allocator,
+    ):
+        self.device_pool = device_pool
+        self.size = full_host_size
+        self.page_size = full_page_size
+        self.layout = layout
+        self.pin_memory = pin_memory
+        self.device = device
+        self.allocator = allocator
+
+        self.logical_host_pool = LogicalHostPool(
+            size=full_host_size,
+            page_size=full_page_size,
+            device=device_pool.device,
+        )
+        self.c4_kv_pool = DeepSeekV4CompressedKVHostPool(
+            device_pool=device_pool.c4_kv_pool,
+            full_host_size=full_host_size,
+            full_page_size=full_page_size,
+            compress_ratio=4,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator=allocator,
+        )
+        self.c128_kv_pool = DeepSeekV4CompressedKVHostPool(
+            device_pool=device_pool.c128_kv_pool,
+            full_host_size=full_host_size,
+            full_page_size=full_page_size,
+            compress_ratio=128,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator=allocator,
+        )
+        self.c4_indexer_kv_pool = DeepSeekV4IndexerHostPool(
+            device_pool=device_pool.c4_indexer_kv_pool,
+            full_host_size=full_host_size,
+            full_page_size=full_page_size,
+            compress_ratio=4,
+            layout=layout,
+            pin_memory=pin_memory,
+            device=device,
+            allocator=allocator,
+        )
+
+    @staticmethod
+    def _make_layer_mapper(layer_mapping: dict[int, int], transfer_layer_num: int):
+        def mapper(layer_id: int):
+            if not 0 <= layer_id < transfer_layer_num:
+                return None
+            return layer_mapping.get(layer_id)
+
+        return mapper
+
+    def build_pool_entries(self) -> list[PoolEntry]:
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        transfer_layer_num = self.device_pool.layer_num
+        c4_layer_mapping: dict[int, int] = {}
+        c128_layer_mapping: dict[int, int] = {}
+        for layer_id, item in enumerate(self.device_pool.layer_mapping):
+            if item.compress_ratio == 4:
+                c4_layer_mapping[layer_id] = item.compress_layer_id
+            elif item.compress_ratio == 128:
+                c128_layer_mapping[layer_id] = item.compress_layer_id
+
+        full_derive = lambda full: full
+        return [
+            PoolEntry(
+                name=PoolName.KV,
+                host_pool=self.logical_host_pool,
+                device_pool=self.device_pool,
+                layer_mapper=self._make_layer_mapper({}, transfer_layer_num),
+                is_primary_index_anchor=True,
+            ),
+            PoolEntry(
+                name=PoolName.C4,
+                host_pool=self.c4_kv_pool,
+                device_pool=self.device_pool.c4_kv_pool,
+                layer_mapper=self._make_layer_mapper(
+                    c4_layer_mapping, transfer_layer_num
+                ),
+                derive_indices_fn=full_derive,
+            ),
+            PoolEntry(
+                name=PoolName.C4_INDEXER,
+                host_pool=self.c4_indexer_kv_pool,
+                device_pool=self.device_pool.c4_indexer_kv_pool,
+                layer_mapper=self._make_layer_mapper(
+                    c4_layer_mapping, transfer_layer_num
+                ),
+                derive_indices_fn=full_derive,
+            ),
+            PoolEntry(
+                name=PoolName.C128,
+                host_pool=self.c128_kv_pool,
+                device_pool=self.device_pool.c128_kv_pool,
+                layer_mapper=self._make_layer_mapper(
+                    c128_layer_mapping, transfer_layer_num
+                ),
+                derive_indices_fn=full_derive,
+            ),
+        ]
 
 
 class HostPoolGroup:

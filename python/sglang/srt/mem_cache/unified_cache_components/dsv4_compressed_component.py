@@ -100,19 +100,16 @@ class DeepSeekV4CompressedComponent(TreeComponent):
     def build_hicache_transfers(
         self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
     ) -> Optional[list[PoolTransfer]]:
-        fps = self.full_page_size
-
         if phase == CacheTransferPhase.BACKUP_HOST:
             full_device = node.component_data[BASE_COMPONENT_TYPE].value
             if full_device is None:
                 return None
-            page_dev = torch.unique(full_device // fps)
             return [
-                PoolTransfer(name=PoolName.C4, device_indices=page_dev),
+                PoolTransfer(name=PoolName.C4, device_indices=full_device),
                 PoolTransfer(
-                    name=PoolName.C4_INDEXER, device_indices=page_dev.clone()
+                    name=PoolName.C4_INDEXER, device_indices=full_device.clone()
                 ),
-                PoolTransfer(name=PoolName.C128, device_indices=page_dev.clone()),
+                PoolTransfer(name=PoolName.C128, device_indices=full_device.clone()),
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -128,13 +125,12 @@ class DeepSeekV4CompressedComponent(TreeComponent):
             if not full_host_parts:
                 return None
             full_host = torch.cat(full_host_parts)
-            page_host = torch.unique(full_host // fps)
             return [
-                PoolTransfer(name=PoolName.C4, host_indices=page_host),
+                PoolTransfer(name=PoolName.C4, host_indices=full_host),
                 PoolTransfer(
-                    name=PoolName.C4_INDEXER, host_indices=page_host.clone()
+                    name=PoolName.C4_INDEXER, host_indices=full_host.clone()
                 ),
-                PoolTransfer(name=PoolName.C128, host_indices=page_host.clone()),
+                PoolTransfer(name=PoolName.C128, host_indices=full_host.clone()),
             ]
 
         return None

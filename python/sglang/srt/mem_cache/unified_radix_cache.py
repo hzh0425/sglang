@@ -393,6 +393,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
         key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return MatchResult(
+                device_indices=torch.empty(
+                    (0,),
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+            )
 
         (
             value,

@@ -677,6 +677,19 @@ class Scheduler(
                     tree_components.append(
                         ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
+                if self.enable_hierarchical_cache:
+                    try:
+                        from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                            DeepSeekV4TokenToKVPool,
+                        )
+
+                        if isinstance(
+                            self.token_to_kv_pool_allocator.get_kvcache(),
+                            DeepSeekV4TokenToKVPool,
+                        ):
+                            tree_components.append(ComponentType.DSV4_COMPRESSED)
+                    except ImportError:
+                        pass
                 params.tree_components = tuple(tree_components)
                 self.tree_cache = UnifiedRadixCache(params)
                 if self.enable_hierarchical_cache:
