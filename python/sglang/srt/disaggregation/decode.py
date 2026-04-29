@@ -217,6 +217,21 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
                 )
         else:
             effective_mamba_size = max_slots_needed
+        logger.info(
+            "HybridMambaDecodeReqToTokenPool init: size=%d, pre_alloc_size=%d, "
+            "req_slots=%d, enable_mamba_extra_buffer=%s, "
+            "mamba_ping_pong_track_buffer_size=%d, slots_per_req=%d, "
+            "mamba_size=%s, effective_mamba_size=%d, mamba_spec_state_size=%d",
+            size,
+            pre_alloc_size,
+            size + pre_alloc_size,
+            enable_mamba_extra_buffer,
+            self.mamba_ping_pong_track_buffer_size,
+            slots_per_req,
+            mamba_size,
+            effective_mamba_size,
+            size + pre_alloc_size,
+        )
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
