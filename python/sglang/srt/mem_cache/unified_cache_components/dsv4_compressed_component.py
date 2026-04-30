@@ -103,16 +103,22 @@ class DeepSeekV4CompressedComponent(TreeComponent):
     def build_hicache_transfers(
         self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
     ) -> Optional[list[PoolTransfer]]:
-        transfers = self._available_full_derived_transfers()
+        transfers = []
 
         if phase == CacheTransferPhase.BACKUP_HOST:
+            if node.component_data[ComponentType.FULL].value is not None:
+                transfers.extend(self._available_full_derived_transfers())
             if node.component_data[ComponentType.SWA].value is not None:
                 transfers.extend(self._available_state_transfers())
+            
             return transfers or None
 
         if phase == CacheTransferPhase.LOAD_BACK:
+            if node.component_data[ComponentType.FULL].host_value is not None:
+                logger.info(f"Loading back full state transfers, full len:{len(node.component_data[ComponentType.FULL].host_value)}")
+                transfers.extend(self._available_full_derived_transfers()) 
             if node.component_data[ComponentType.SWA].host_value is not None:
-                logger.debug(f"Loading back state transfers, swa len:{len(node.component_data[ComponentType.SWA].host_value)}, sliding window size:{self.sliding_window_size}")
+                logger.info(f"Loading back state transfers, swa len:{len(node.component_data[ComponentType.SWA].host_value)}, sliding window size:{self.sliding_window_size}")
                 transfers.extend(self._available_state_transfers())
             return transfers or None
 

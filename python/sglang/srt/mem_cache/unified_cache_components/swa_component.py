@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -10,6 +11,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InsertParams,
     InsertResult,
+    MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
@@ -28,6 +31,13 @@ if TYPE_CHECKING:
         UnifiedRadixCache,
         UnifiedTreeNode,
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+def _debug_len(value) -> str:
+    return "none" if value is None else str(len(value))
 
 
 class SWAComponent(TreeComponent):
@@ -53,6 +63,36 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
+    def _debug_node_state(self, node: UnifiedTreeNode) -> str:
+        full = node.component_data[BASE_COMPONENT_TYPE]
+        swa = node.component_data[self.component_type]
+        parent_id = None if node.parent is None else node.parent.id
+        key_len = 0 if node.key is None else len(node.key)
+        return (
+            f"node_id={node.id}, key_len={key_len}, parent={parent_id}, "
+            f"children={len(node.children)}, evicted={node.evicted}, "
+            f"full_dev={_debug_len(full.value)}, full_host={_debug_len(full.host_value)}, "
+            f"full_lock={full.lock_ref}, swa_dev={_debug_len(swa.value)}, "
+            f"swa_host={_debug_len(swa.host_value)}, swa_lock={swa.lock_ref}, "
+            f"swa_host_lock={swa.host_lock_ref}, swa_uuid={swa.metadata.get('uuid')}, "
+            f"dev_lru={self.cache.lru_lists[self.component_type].in_list(node)}, "
+            f"host_lru={self.cache.host_lru_lists[self.component_type].in_list(node)}, "
+            f"device_leaf={node in self.cache.evictable_device_leaves}, "
+            f"host_leaf={node in self.cache.evictable_host_leaves}"
+        )
+
+    def _log_if_gap_created(self, node: UnifiedTreeNode, op: str) -> None:
+        full = node.component_data[BASE_COMPONENT_TYPE]
+        swa = node.component_data[self.component_type]
+        if (
+            full.value is not None
+            and swa.value is None
+            and swa.host_value is None
+            and not swa.metadata.get("debug_gap_logged", False)
+        ):
+            swa.metadata["debug_gap_logged"] = True
+            logger.warning("swa gap created: op=%s, %s", op, self._debug_node_state(node))
+
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
             full_indices
@@ -61,6 +101,7 @@ class SWAComponent(TreeComponent):
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type
         node.component_data[ct].value = value
+        node.component_data[ct].metadata.pop("debug_gap_logged", None)
         host_lru = self.cache.host_lru_lists[ct]
         if host_lru.in_list(node):
             host_lru.remove_node(node)
@@ -74,15 +115,57 @@ class SWAComponent(TreeComponent):
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
-            # HiCache: a host-only tombstone is a valid match boundary too
-            # — load_back will restore SWA from host before use.
-            if cd.value is None and cd.host_value is None:
+            if cd.value is None and (not node.evicted or cd.host_value is None):
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
 
         return validator
+
+    def _collect_load_back_nodes(
+        self, node: UnifiedTreeNode
+    ) -> tuple[list[torch.Tensor], list[UnifiedTreeNode], int]:
+        ct = self.component_type
+        collected_leaf_first: list[torch.Tensor] = []
+        nodes_leaf_first: list[UnifiedTreeNode] = []
+        n_swa = 0
+        covered = 0
+        cur = node
+
+        while cur is not self.cache.root_node and covered < self.sliding_window_size:
+            cd = cur.component_data[ct]
+            if cd.value is not None:
+                covered += len(cd.value)
+                cur = cur.parent
+                continue
+            if not cur.evicted or cd.host_value is None:
+                break
+            collected_leaf_first.append(cd.host_value)
+            nodes_leaf_first.append(cur)
+            n_swa += len(cd.host_value)
+            covered += len(cd.host_value)
+            cur = cur.parent
+
+        return collected_leaf_first, nodes_leaf_first, n_swa
+
+    def finalize_match_result(
+        self,
+        result: MatchResult,
+        params: MatchPrefixParams,
+        value_chunks: list[torch.Tensor],
+        best_value_len: int,
+    ) -> MatchResult:
+        return result
+
+    def _update_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        mapping = getattr(
+            self.cache.token_to_kv_pool_allocator, "full_to_swa_index_mapping", None
+        )
+        if mapping is not None:
+            mapping[full_indices.to(torch.int64)] = swa_indices.to(torch.int64)
 
     def update_component_on_insert_overlap(
         self,
@@ -124,7 +207,8 @@ class SWAComponent(TreeComponent):
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
             )
-            self.cache._split_node(node.key, node, start_idx)
+            new_parent = self.cache._split_node(node.key, node, start_idx)
+            self._log_if_gap_created(new_parent, "overlap_split_parent")
             node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
                 start_idx:
             ].clone()
@@ -135,6 +219,7 @@ class SWAComponent(TreeComponent):
             return start_idx
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
+            self._log_if_gap_created(node, "overlap_skip")
             return prefix_len
 
     def should_skip_leaf_creation(
@@ -168,10 +253,12 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(full_value)
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             start_idx = swa_evicted_seqlen - total_prefix_len
-            self.cache._split_node(node.key, node, start_idx)
+            new_parent = self.cache._split_node(node.key, node, start_idx)
+            self._log_if_gap_created(new_parent, "unevict_split_parent")
             full_value = node.component_data[BASE_COMPONENT_TYPE].value
             swa_value = self._translate_full_to_swa(full_value)
         else:
+            self._log_if_gap_created(node, "unevict_skip")
             return
         self._restore_device_value(node, swa_value)
 
@@ -199,13 +286,16 @@ class SWAComponent(TreeComponent):
             # Node straddles the SWA eviction boundary
             # Split into parent (tombstone, no SWA) and child (with SWA)
             # After _split_node, `node` becomes the child
-            self.cache._split_node(node.key, node, split_pos)
+            new_parent = self.cache._split_node(node.key, node, split_pos)
+            self._log_if_gap_created(new_parent, "insert_split_parent")
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+        else:
+            self._log_if_gap_created(node, "insert_skip")
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -271,6 +361,8 @@ class SWAComponent(TreeComponent):
             freed = len(cd.value)
             self.cache.component_evictable_size_[ct] -= freed
             cd.value = None
+            if target is EvictLayer.DEVICE:
+                self._log_if_gap_created(node, "device_evict")
 
         # Host layer
         host_lru = self.cache.host_lru_lists[ct]
@@ -281,6 +373,8 @@ class SWAComponent(TreeComponent):
             cd.host_value = None
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
+            if EvictLayer.DEVICE not in target:
+                self._log_if_gap_created(node, "host_evict")
 
         # After device tombstone: if host_value remains, move into host LRU
         if (
@@ -361,6 +455,9 @@ class SWAComponent(TreeComponent):
         root = self.cache.root_node
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
         dec_swa = True
+        dec_tokens = 0
+        dec_nodes: list[str] = []
+        stopped_by_uuid = False
 
         # lock_ref == 0 means acquire_component_lock skipped this node
         # (tombstone at acquire time) or load_back revived a tombstone between
@@ -376,9 +473,35 @@ class SWAComponent(TreeComponent):
                 self.cache.component_evictable_size_[ct] += key_len
                 self.cache.component_protected_size_[ct] -= key_len
             comp.lock_ref -= 1
+            dec_tokens += len(cur.key)
+            if len(dec_nodes) < 8:
+                dec_nodes.append(
+                    f"{cur.id}:{len(cur.key)}:{comp.lock_ref}:"
+                    f"{comp.metadata.get('uuid')}"
+                )
             if swa_uuid_for_lock and comp.metadata.get("uuid") == swa_uuid_for_lock:
+                stopped_by_uuid = True
                 dec_swa = False
             cur = cur.parent
+
+        if (
+            (swa_uuid_for_lock is None and dec_tokens >= self.sliding_window_size)
+            or (
+                swa_uuid_for_lock is not None
+                and dec_tokens > 0
+                and not stopped_by_uuid
+            )
+        ):
+            logger.warning(
+                "swa suspicious release: boundary_uuid=%s, stopped_by_uuid=%s, "
+                "dec_tokens=%d, window=%d, dec_path=%s, %s",
+                swa_uuid_for_lock,
+                stopped_by_uuid,
+                dec_tokens,
+                self.sliding_window_size,
+                dec_nodes,
+                self._debug_node_state(node),
+            )
 
     def prepare_for_caching_req(
         self,
@@ -412,23 +535,9 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # Walk the evicted chain leaf to root, collecting SWA host_values
-            # until they cover sliding_window_size. SWA host data is always a
-            # contiguous suffix, so the first None ends the walk.
-            collected_leaf_first: list[torch.Tensor] = []
-            nodes_leaf_first: list = []
-            n_swa = 0
-            cur = node
-            while cur.evicted:
-                cd = cur.component_data[ct]
-                if cd.host_value is None:
-                    break
-                collected_leaf_first.append(cd.host_value)
-                nodes_leaf_first.append(cur)
-                n_swa += len(cd.host_value)
-                if n_swa >= self.sliding_window_size:
-                    break
-                cur = cur.parent
+            collected_leaf_first, nodes_leaf_first, n_swa = (
+                self._collect_load_back_nodes(node)
+            )
             if not collected_leaf_first:
                 return None
             collected_leaf_first.reverse()
@@ -458,6 +567,7 @@ class SWAComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                cd.metadata.pop("debug_gap_logged", None)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -465,12 +575,25 @@ class SWAComponent(TreeComponent):
                 return
             xfer = transfers[0]
             device_indices = xfer.device_indices
+            assert (
+                len(device_indices) == xfer.swa_suffix_tokens
+            ), (
+                "SWA loadback device indices mismatch: "
+                f"{len(device_indices)=}, {xfer.swa_suffix_tokens=}"
+            )
             offset = 0
             for n in xfer.nodes_to_load or []:
                 cd_n = n.component_data[ct]
                 n_tokens = len(cd_n.host_value)
+                full_value = n.component_data[BASE_COMPONENT_TYPE].value
+                assert (
+                    full_value is not None and len(full_value) == n_tokens
+                ), f"SWA loadback requires matching Full device value on node {n.id}"
+                swa_value = device_indices[offset : offset + n_tokens].clone()
+                self._update_full_to_swa_mapping(full_value, swa_value)
                 self._restore_device_value(
-                    n, device_indices[offset : offset + n_tokens].clone()
+                    n,
+                    swa_value,
                 )
                 offset += n_tokens
             assert offset == xfer.swa_suffix_tokens

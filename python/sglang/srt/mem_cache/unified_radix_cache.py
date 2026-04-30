@@ -196,6 +196,10 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+def _debug_len(value) -> str:
+    return "none" if value is None else str(len(value))
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -325,8 +329,10 @@ class UnifiedRadixCache(BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
-        self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
-        self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
+        self.ongoing_write_through: dict[
+            int, tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
+        ] = {}
+        self.ongoing_load_back: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
         self.enable_storage = False
         self.ongoing_prefetch: dict = {}
         self.ongoing_backup: dict = {}
@@ -451,6 +457,17 @@ class UnifiedRadixCache(BasePrefixCache):
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
+
+    @staticmethod
+    def _dec_params_for(lock_result: IncLockRefResult) -> DecLockRefParams:
+        return DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock)
+
+    def _dec_ongoing_lock(
+        self, entry: tuple[UnifiedTreeNode, Optional[DecLockRefParams]]
+    ) -> None:
+        node, params = entry
+        if params is not None:
+            self.dec_lock_ref(node, params)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
         kv_committed_len = req.pop_committed_kv_cache()
@@ -580,9 +597,35 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
+        if req.cache_protected_len > len(new_indices) + self.page_size - 1:
+            logger.error(
+                "cache_unfinished_req mismatch: %s, effective_len=%d, "
+                "page_len=%d, insert_prefix=%d, rematch_device=%d, "
+                "rematch_host_hit=%d, diagnosis={%s}",
+                self._debug_req_summary(req),
+                effective_cache_len,
+                page_aligned_len,
+                new_prefix_len,
+                len(new_indices),
+                match_result.host_hit_length,
+                self._debug_match_diagnosis(radix_key),
+            )
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        if new_prefix_len > len(new_indices):
+            logger.error(
+                "cache_unfinished_req insert not matchable: %s, effective_len=%d, "
+                "page_len=%d, insert_prefix=%d, rematch_device=%d, "
+                "rematch_host_hit=%d, diagnosis={%s}",
+                self._debug_req_summary(req),
+                effective_cache_len,
+                page_aligned_len,
+                new_prefix_len,
+                len(new_indices),
+                match_result.host_hit_length,
+                self._debug_match_diagnosis(radix_key),
+            )
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
@@ -704,6 +747,183 @@ class UnifiedRadixCache(BasePrefixCache):
             if len(key):
                 child_key = key.child_key(self.page_size)
         return value, best_node, best_value_len
+
+    def _debug_node_id(self, node: Optional[UnifiedTreeNode]) -> str:
+        return "none" if node is None else str(node.id)
+
+    def _debug_req_summary(self, req: Req) -> str:
+        last_node = getattr(req, "last_node", None)
+        last_host_node = getattr(req, "last_host_node", None)
+        rid = getattr(req, "rid", None)
+        if rid is None:
+            rid = getattr(req, "request_id", None)
+        return (
+            f"rid={rid}, fill_len={len(getattr(req, 'fill_ids', []))}, "
+            f"prefix_len={len(getattr(req, 'prefix_indices', []))}, "
+            f"extend_input_len={getattr(req, 'extend_input_len', None)}, "
+            f"cache_protected_len={getattr(req, 'cache_protected_len', None)}, "
+            f"swa_evicted_seqlen={getattr(req, 'swa_evicted_seqlen', None)}, "
+            f"host_hit_length={getattr(req, 'host_hit_length', None)}, "
+            f"last_node={self._debug_node_id(last_node)}, "
+            f"last_host_node={self._debug_node_id(last_host_node)}"
+        )
+
+    def _debug_node_brief(self, node: UnifiedTreeNode) -> str:
+        full = node.component_data[BASE_COMPONENT_TYPE]
+        parts = [
+            f"id={node.id}",
+            f"key={len(node.key)}",
+            f"evicted={node.evicted}",
+            f"backuped={node.backuped}",
+            f"full(dev={_debug_len(full.value)},host={_debug_len(full.host_value)},"
+            f"lock={full.lock_ref})",
+        ]
+        if ComponentType.SWA in self.tree_components:
+            swa = node.component_data[ComponentType.SWA]
+            parts.append(
+                f"swa(dev={_debug_len(swa.value)},host={_debug_len(swa.host_value)},"
+                f"lock={swa.lock_ref},dev_lru="
+                f"{self.lru_lists[ComponentType.SWA].in_list(node)},host_lru="
+                f"{self.host_lru_lists[ComponentType.SWA].in_list(node)})"
+            )
+        return " ".join(parts)
+
+    def _debug_match_diagnosis(self, key: RadixKey, max_nodes: int = 64) -> str:
+        node = self.root_node
+        consumed = 0
+        device_tokens = 0
+        best_device_tokens = 0
+        best_node = self.root_node
+        validators = tuple(
+            comp.create_match_validator() for comp in self._components_tuple
+        )
+
+        swa_window = self.sliding_window_size if self.supports_swa() else None
+        swa_suffix_after_gap: Optional[int] = None
+        first_swa_gap = None
+        last_swa_gap = None
+        stop_reason = "end"
+        depth = 0
+
+        while len(key) > 0 and depth < max_nodes:
+            child_key = key.child_key(self.page_size)
+            child = node.children.get(child_key)
+            if child is None:
+                stop_reason = (
+                    f"missing_child(parent={node.id}, consumed={consumed}, "
+                    f"remaining={len(key)})"
+                )
+                break
+
+            if child.evicted and not child.backuped:
+                stop_reason = (
+                    f"dead_node(node={child.id}, consumed={consumed}, "
+                    f"remaining={len(key)})"
+                )
+                break
+
+            prefix_len = child.key.match(key, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                stop_reason = (
+                    f"partial(node={child.id}, matched={prefix_len}, "
+                    f"node_key={len(child.key)}, consumed={consumed})"
+                )
+
+            if not child.evicted:
+                full = child.component_data[BASE_COMPONENT_TYPE]
+                device_tokens += len(full.value) if full.value is not None else 0
+
+            if self.supports_swa():
+                swa = child.component_data[ComponentType.SWA]
+                if swa.value is None and swa.host_value is None:
+                    gap = f"node={child.id},pos={consumed},key={len(child.key)}"
+                    first_swa_gap = first_swa_gap or gap
+                    last_swa_gap = gap
+                    swa_suffix_after_gap = 0
+                elif swa_suffix_after_gap is not None:
+                    swa_suffix_after_gap += len(child.key)
+
+            if all(v(child) for v in validators):
+                best_device_tokens = device_tokens
+                best_node = child
+
+            if prefix_len < len(child.key):
+                break
+
+            key = key[prefix_len:]
+            consumed += prefix_len
+            depth += 1
+            node = child
+
+        if len(key) > 0 and depth >= max_nodes:
+            stop_reason = f"truncated(remaining={len(key)})"
+        issue = stop_reason
+        if last_swa_gap is not None and (
+            swa_suffix_after_gap is None or swa_suffix_after_gap < (swa_window or 0)
+        ):
+            issue = (
+                f"swa_gap({last_swa_gap}, suffix_after_gap={swa_suffix_after_gap}, "
+                f"window={swa_window})"
+            )
+        return (
+            f"traversed={consumed}, full_device={device_tokens}, "
+            f"best_device={best_device_tokens}@{best_node.id}, issue={issue}, "
+            f"first_swa_gap={first_swa_gap}"
+        )
+
+    def _debug_swa_loadback_status(self, node: UnifiedTreeNode) -> str:
+        if not self.supports_swa():
+            return "no_swa_component"
+        window = self.sliding_window_size
+        collected = 0
+        cur = node
+        while cur is not self.root_node and cur.evicted:
+            swa = cur.component_data[ComponentType.SWA]
+            if swa.host_value is None:
+                return (
+                    f"missing_host(node={cur.id}, host_tokens={collected}, "
+                    f"window={window}, state={self._debug_node_brief(cur)})"
+                )
+            collected += len(swa.host_value)
+            if collected >= window:
+                return f"host_window_ok(host_tokens={collected}, window={window})"
+            cur = cur.parent
+        if (
+            cur is not self.root_node
+            and cur.component_data[ComponentType.SWA].value is not None
+        ):
+            return (
+                f"device_ancestor(host_tokens={collected}, window={window}, "
+                f"ancestor={cur.id})"
+            )
+        return (
+            f"reached_ancestor(host_tokens={collected}, window={window}, "
+            f"ancestor={self._debug_node_id(cur)})"
+        )
+
+    def _debug_loadback_hit_summary(
+        self,
+        node: UnifiedTreeNode,
+        kv_xfer: PoolTransfer,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ) -> str:
+        full_tokens = len(kv_xfer.host_indices)
+        full_nodes = len(kv_xfer.nodes_to_load or [])
+        swa_xfers = comp_xfers.get(ComponentType.SWA) or []
+        if swa_xfers:
+            swa_xfer = swa_xfers[0]
+            swa_tokens = swa_xfer.swa_suffix_tokens
+            swa_nodes = len(swa_xfer.nodes_to_load or [])
+            swa_status = "host_transfer"
+        else:
+            swa_tokens = 0
+            swa_nodes = 0
+            swa_status = self._debug_swa_loadback_status(node)
+        return (
+            f"full_tokens={full_tokens}, full_nodes={full_nodes}, "
+            f"swa_tokens={swa_tokens}, swa_nodes={swa_nodes}, "
+            f"swa_window={self.sliding_window_size}, swa_status={swa_status}"
+        )
 
     def _match_post_processor(
         self,
@@ -1235,9 +1455,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 transfers=xfers,
             )
 
-        self.ongoing_write_through[node.id] = node
+        lock_params = None
         if not write_back:
-            self.inc_lock_ref(node)
+            lock_params = self._dec_params_for(self.inc_lock_ref(node))
+        self.ongoing_write_through[node.id] = (node, lock_params)
         return len(host_indices)
 
     def load_back(
@@ -1260,6 +1481,7 @@ class UnifiedRadixCache(BasePrefixCache):
         nodes_to_load = kv_xfer.nodes_to_load
         ancestor_node = nodes_to_load[0].parent if nodes_to_load else last_hit_node
         result = self.inc_lock_ref(ancestor_node)
+        ancestor_lock_params = self._dec_params_for(result)
         kv_tokens = len(kv_xfer.host_indices)
 
         # Build aux transfers, keyed per component.
@@ -1272,32 +1494,39 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if t:
                 comp_xfers[comp.component_type] = t
+        swa_tokens = sum(
+            xfer.swa_suffix_tokens
+            for xfer in comp_xfers.get(ComponentType.SWA, [])
+        )
         anchor_kv_shared_indices_xfers = [
             PoolTransfer(name=pool_name, hit_policy=hit_policy)
             for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
         ]
 
-        # Skip if there is nothing to load, or if the Full-KV transfer is too
-        # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        if self.supports_swa() and (kv_tokens == 0 or swa_tokens == 0):
+            self.dec_lock_ref(ancestor_node, ancestor_lock_params)
+            return None
+        if kv_tokens == 0 and swa_tokens == 0:
+            self.dec_lock_ref(ancestor_node, ancestor_lock_params)
+            return None
+        if (kv_tokens < self.load_back_threshold and swa_tokens == 0) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
-            self.dec_lock_ref(ancestor_node)
+            self.dec_lock_ref(ancestor_node, ancestor_lock_params)
             return None
 
         avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
-            result = self.evict(EvictParams(num_tokens=needed))
-            if result.num_tokens_evicted < needed:
-                self.dec_lock_ref(ancestor_node)
+            evict_result = self.evict(EvictParams(num_tokens=needed))
+            if evict_result.num_tokens_evicted < needed:
+                self.dec_lock_ref(ancestor_node, ancestor_lock_params)
                 return None
 
         logger.info(
-            "load_back: kv_tokens=%d, node_id=%d",
-            kv_tokens,
+            "load_back hit: node_id=%d, %s",
             last_hit_node.id,
+            self._debug_loadback_hit_summary(last_hit_node, kv_xfer, comp_xfers),
         )
 
         # Load H→D
@@ -1309,7 +1538,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
 
-        self.dec_lock_ref(ancestor_node)
+        self.dec_lock_ref(ancestor_node, ancestor_lock_params)
         if device_indices is None:
             return None
 
@@ -1326,10 +1555,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 CacheTransferPhase.LOAD_BACK,
                 xfers,
             )
-
         self._update_evictable_leaf_sets(ancestor_node)
-        self.inc_lock_ref(last_hit_node)
-        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        self.ongoing_load_back[last_hit_node.id] = (
+            last_hit_node,
+            self._dec_params_for(self.inc_lock_ref(last_hit_node)),
+        )
         return device_indices
 
     def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
@@ -1358,9 +1588,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        node = self.ongoing_write_through.pop(ack_id, None)
-                        if node is not None:
-                            self.dec_lock_ref(node)
+                        entry = self.ongoing_write_through.pop(ack_id, None)
+                        if entry is not None:
+                            self._dec_ongoing_lock(entry)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1387,8 +1617,7 @@ class UnifiedRadixCache(BasePrefixCache):
             _, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node = self.ongoing_write_through.pop(ack_id)
-                self.dec_lock_ref(node)
+                self._dec_ongoing_lock(self.ongoing_write_through.pop(ack_id))
             finish_count -= 1
 
     def loading_check(self, blocking: bool = False) -> None:
@@ -1405,8 +1634,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     break
             finish_count += 1
             for ack_id in ack_list:
-                node = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(node)
+                node, lock_params = self.ongoing_load_back.pop(ack_id)
+                self.dec_lock_ref(node, lock_params)
         del cc.ack_load_queue[:finish_count]
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -1647,6 +1876,19 @@ class UnifiedRadixCache(BasePrefixCache):
             nid = node.id
             full_dev = node.component_data[FCT].value is not None
             full_hst = node.component_data[FCT].host_value is not None
+            key_len = len(node.key)
+
+            full_cd = node.component_data[FCT]
+            if full_cd.value is not None and len(full_cd.value) != key_len:
+                E(
+                    f"node {nid} Full value len={len(full_cd.value)} "
+                    f"!= key len={key_len}"
+                )
+            if full_cd.host_value is not None and len(full_cd.host_value) != key_len:
+                E(
+                    f"node {nid} Full host_value len={len(full_cd.host_value)} "
+                    f"!= key len={key_len}"
+                )
 
             # Full is the tree backbone, so aux data requires Full data.
             for ct in self.tree_components:
@@ -1801,14 +2043,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
 
         # ── PART 5: Ongoing Operations ──
-        for nid, n in self.ongoing_write_through.items():
+        for nid, (n, _) in self.ongoing_write_through.items():
             if n not in all_node_set:
                 E(f"[Ongoing] write_through node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
                 E(
                     f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
-        for nid, n in self.ongoing_load_back.items():
+        for nid, (n, _) in self.ongoing_load_back.items():
             if n not in all_node_set:
                 E(f"[Ongoing] load_back node {nid} not in tree")
             elif n.component_data[FCT].lock_ref <= 0:
