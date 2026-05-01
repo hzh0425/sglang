@@ -766,6 +766,7 @@ class DecodePreallocQueue:
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
                 prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
+                matched_prefix_len = prefix_len
                 # Align prefix_len down to page boundary so both prefill and
                 # decode agree on the page-aligned split point for KV transfer.
                 page_size = self.token_to_kv_pool_allocator.page_size
@@ -787,6 +788,7 @@ class DecodePreallocQueue:
                 )
             else:
                 prefix_indices = None
+                matched_prefix_len = 0
                 prefix_len = 0
                 required_alloc_tokens = origin_input_len
 
@@ -807,11 +809,11 @@ class DecodePreallocQueue:
                 )
                 > allocatable_tokens
             ):
-                if prefix_len > 0:
+                if decode_req.req.last_node is not None:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
             if required_tokens_for_request > allocatable_tokens:
-                if prefix_len > 0:
+                if decode_req.req.last_node is not None:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
@@ -892,11 +894,32 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                transfer_delta_len = origin_input_len - prefix_len
+                logger.info(
+                    "DECODE_RADIX_PREFIX "
+                    "rid=%s origin_input_len=%d raw_prefix_len=%d "
+                    "aligned_prefix_len=%d delta_len=%d delta_pages=%d "
+                    "full_hit=%s zero_page=%s backend=%s",
+                    decode_req.req.rid,
+                    origin_input_len,
+                    matched_prefix_len,
+                    prefix_len,
+                    transfer_delta_len,
+                    len(page_indices),
+                    prefix_len >= origin_input_len,
+                    len(page_indices) == 0,
+                    self.scheduler.server_args.disaggregation_transfer_backend,
+                )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=prefix_len,
+                decode_prefix_len=(
+                    prefix_len
+                    if self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+                    else None
+                ),
             )
             if (
                 self.transfer_queue.enable_staging

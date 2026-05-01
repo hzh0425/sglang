@@ -63,6 +63,12 @@ class TransferInfo:
         else:
             dst_state_indices = []
 
+        decode_prefix_len = (
+            int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+        )
+        if decode_prefix_len is not None and decode_prefix_len < 0:
+            decode_prefix_len = None
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -72,9 +78,7 @@ class TransferInfo:
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
-            decode_prefix_len=(
-                int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
-            ),  # hacky just add it into the message that will be sent
+            decode_prefix_len=decode_prefix_len,
         )
 
 
@@ -1051,14 +1055,16 @@ class NixlKVManager(CommonKVManager):
                 ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.req_to_decode_prefix_len[room] = next(
+                    decode_prefix_len = next(
                         (
                             info.decode_prefix_len
                             for info in self.transfer_infos[room].values()
                             if info.decode_prefix_len is not None
                         ),
-                        0,
+                        None,
                     )
+                    if decode_prefix_len is not None:
+                        self.req_to_decode_prefix_len[room] = decode_prefix_len
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -1079,8 +1085,8 @@ class NixlKVSender(CommonKVSender):
         self.has_sent = False
         self.chunk_id = 0
 
-    def pop_decode_prefix_len(self) -> int:
-        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+    def pop_decode_prefix_len(self) -> Optional[int]:
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
@@ -1193,7 +1199,9 @@ class NixlKVReceiver(CommonKVReceiver):
                             if not is_dummy and state_indices is not None
                             else b""
                         ),
-                        str(decode_prefix_len or 0).encode("ascii"),
+                        str(
+                            decode_prefix_len if decode_prefix_len is not None else -1
+                        ).encode("ascii"),
                     ]
                 )
 
