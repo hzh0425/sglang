@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     CacheTransferPhase,
     ComponentData,
     ComponentType,
+    DeepSeekV4CompressedComponent,
     EvictLayer,
     FullComponent,
     MambaComponent,
@@ -189,6 +190,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
     ComponentType.SWA: SWAComponent,
+    ComponentType.DSV4_COMPRESSED: DeepSeekV4CompressedComponent,
 }
 
 logger = logging.getLogger(__name__)
@@ -210,6 +212,7 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             self.device = torch.device("cpu")
 
+        self.metrics_collector = None
         if params.enable_metrics:
             self.init_metrics_collector()
 
@@ -460,6 +463,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
+            self.req_to_token_pool.free(req.req_pool_idx)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
@@ -513,6 +517,9 @@ class UnifiedRadixCache(BasePrefixCache):
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
+
+        # Free the req slot
+        self.req_to_token_pool.free(req.req_pool_idx)
 
         # cleanup
         for comp in self._components_tuple:
@@ -1186,12 +1193,19 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             return 0
 
-        # Build aux transfers, keyed per component
+        # Pre-compute FULL device value (used both for transfer and host eviction)
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+            t = comp.build_hicache_transfers(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                kv_xfer=kv_xfer,
+                peer_transfers=comp_xfers,
+            )
             if t:
                 comp_xfers[comp.component_type] = t
         anchor_kv_shared_indices_xfers = [
@@ -1200,7 +1214,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
 
         # Pre-evict host if insufficient
-        device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
@@ -1261,12 +1274,17 @@ class UnifiedRadixCache(BasePrefixCache):
         kv_tokens = len(kv_xfer.host_indices)
 
         # Build aux transfers, keyed per component.
+        # Pass kv_xfer + peer_transfers so DSV4 can decide derived pools.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
             t = comp.build_hicache_transfers(
-                last_hit_node, CacheTransferPhase.LOAD_BACK, req=req
+                last_hit_node,
+                CacheTransferPhase.LOAD_BACK,
+                req=req,
+                kv_xfer=kv_xfer,
+                peer_transfers=comp_xfers,
             )
             if t:
                 comp_xfers[comp.component_type] = t
@@ -1292,8 +1310,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_lock_ref(ancestor_node, ancestor_lock_params)
                 return None
 
+        aux_summary = ", ".join(
+            f"{x.name}:{x.host_indices.numel() if x.host_indices is not None else 0}"
+            for xfers in comp_xfers.values()
+            for x in xfers
+        )
         logger.info(
-            f"load_back: kv_tokens={kv_tokens}, node_id={last_hit_node.id}, transfers={comp_xfers}",
+            f"load_back: kv_tokens={kv_tokens}, node_id={last_hit_node.id}, aux=[{aux_summary}]",
         )
 
         # Load H→D
@@ -1391,7 +1414,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_lock_ref(node, params)
             finish_count -= 1
 
-    def loading_check(self) -> None:
+    def loading_check(self, blocking: bool = False) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
         if cc is None or not self.ongoing_load_back:
@@ -1399,7 +1422,10 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_count = 0
         for _, finish_event, ack_list in cc.ack_load_queue:
             if not finish_event.query():
-                break
+                if blocking:
+                    finish_event.synchronize()
+                else:
+                    break
             finish_count += 1
             for ack_id in ack_list:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
@@ -1410,10 +1436,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_load_back(
         self,
-        params: InitLoadBackParams,
+        params_or_node,
+        host_hit_length: int = 0,
     ) -> tuple[torch.Tensor, UnifiedTreeNode]:
         """Prepare KV cache loading from host to device.
-        Returns (device_indices, last_node) tuple."""
+        Returns (device_indices, last_node) tuple.
+
+        Accepts either InitLoadBackParams or (last_host_node, host_hit_length).
+        """
+        if isinstance(params_or_node, InitLoadBackParams):
+            params = params_or_node
+        else:
+            params = InitLoadBackParams(
+                last_host_node=params_or_node,
+                host_hit_length=host_hit_length,
+            )
         last_node = params.last_host_node
         mem_quota = params.mem_quota
         req = params.req
@@ -1627,6 +1664,19 @@ class UnifiedRadixCache(BasePrefixCache):
             nid = node.id
             full_dev = node.component_data[FCT].value is not None
             full_hst = node.component_data[FCT].host_value is not None
+            key_len = len(node.key)
+
+            full_cd = node.component_data[FCT]
+            if full_cd.value is not None and len(full_cd.value) != key_len:
+                E(
+                    f"node {nid} Full value len={len(full_cd.value)} "
+                    f"!= key len={key_len}"
+                )
+            if full_cd.host_value is not None and len(full_cd.host_value) != key_len:
+                E(
+                    f"node {nid} Full host_value len={len(full_cd.host_value)} "
+                    f"!= key len={key_len}"
+                )
 
             # Full is the tree backbone, so aux data requires Full data.
             for ct in self.tree_components:
@@ -1734,7 +1784,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     )
                 # Aux host-only states must match the host LRU.
                 host_lru = self.host_lru_lists[ct]
-                s3_ids = {
+                host_only_ids = {
                     n.id
                     for n in all_nodes
                     if n is not self.root_node
@@ -1742,10 +1792,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     and n.component_data[ct].host_value is not None
                 }
                 host_lru_ids = set(host_lru.cache.keys())
-                if s3_ids != host_lru_ids:
+                if host_only_ids != host_lru_ids:
                     E(
                         f"{ct} host LRU: "
-                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                        f"+host_only={host_only_ids - host_lru_ids}, "
+                        f"+lru={host_lru_ids - host_only_ids}"
                     )
                 # The same aux node must not appear in both device and host LRU.
                 inv5_overlap = lru_ids & host_lru_ids
@@ -1886,3 +1937,31 @@ class UnifiedRadixCache(BasePrefixCache):
                     if cd.host_value is not None:
                         self.host_lru_lists[ct].insert_mru(node)
             stack.extend(node.children.values())
+
+    def _prune_l1_only_leaves_after_reset(self) -> int:
+        """Drop suffix nodes that lost L1 device data and have no L2 Full data."""
+        postorder = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            postorder.append(node)
+            stack.extend(node.children.values())
+
+        pruned = 0
+        for node in reversed(postorder):
+            if node is self.root_node or node.children:
+                continue
+            if node.component_data[BASE_COMPONENT_TYPE].host_value is not None:
+                continue
+
+            for comp in self._components_tuple:
+                if comp.node_has_component_data(node, target=EvictLayer.HOST):
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.HOST
+                    )
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            self._remove_leaf_from_parent(node)
+            pruned += 1
+
+        return pruned

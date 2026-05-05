@@ -34,6 +34,7 @@ class ComponentType(int, Enum):
     FULL = 0
     SWA = 1
     MAMBA = 2
+    DSV4_COMPRESSED = 3
 
     def __str__(self) -> str:  # keep human-readable logging
         return self.name.lower()
@@ -50,6 +51,9 @@ class ComponentType(int, Enum):
     def is_mamba(self) -> bool:
         return self == ComponentType.MAMBA
 
+    @property
+    def is_dsv4_compressed(self) -> bool:
+        return self == ComponentType.DSV4_COMPRESSED
 
 BASE_COMPONENT_TYPE = ComponentType.FULL
 _NUM_COMPONENT_TYPES = len(ComponentType)
