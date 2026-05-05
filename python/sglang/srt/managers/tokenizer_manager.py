@@ -1653,6 +1653,10 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         meta_info["input_token_logprobs"] = state.input_token_logprobs
         meta_info["output_token_logprobs"] = state.output_token_logprobs
+        meta_info["output_token_logprobs_val"] = state.output_token_logprobs_val
+        meta_info["output_token_logprobs_idx"] = state.output_token_logprobs_idx
+        meta_info["output_top_logprobs_val"] = state.output_top_logprobs_val
+        meta_info["output_top_logprobs_idx"] = state.output_top_logprobs_idx
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:
