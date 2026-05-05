@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
@@ -199,6 +200,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
         # State tracking for streaming
         stream_buffers = {}
+        output_id_buffers = {}
         n_prev_tokens = {}
 
         # Usage tracking
@@ -215,6 +217,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 index = content.get("index", 0)
 
                 text = content["text"]
+                output_ids = content["output_ids"]
                 prompt_tokens[index] = content["meta_info"]["prompt_tokens"]
                 completion_tokens[index] = content["meta_info"]["completion_tokens"]
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
@@ -222,6 +225,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 stream_buffer = stream_buffers.get(index, "")
+                output_id_buffer = output_id_buffers.get(index, [])
                 # Handle echo for first chunk
                 if not stream_buffer:  # The first chunk
                     if request.echo:
@@ -276,6 +280,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
 
+                if self.tokenizer_manager.server_args.stream_output:
+                    delta_output_ids = output_ids
+                else:
+                    delta_output_ids = output_ids[len(output_id_buffer) :]
+                    output_id_buffers[index] = output_id_buffer + delta_output_ids
+
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
@@ -287,6 +297,29 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         else None
                     ),
                 )
+                on_dash_scope = "DS_LLM_ENGINE" in os.environ
+                if on_dash_scope:
+                    choice_data.token_ids = delta_output_ids
+                    choice_data.stop_reason = choice_data.matched_stop
+                    if request.logprobs is not None:
+                        output_token_logprobs_val = content["meta_info"]["output_token_logprobs_val"][
+                                                    -len(delta_output_ids):]
+                        output_token_logprobs_idx = content["meta_info"]["output_token_logprobs_idx"][
+                                                    -len(delta_output_ids):]
+                        output_top_logprobs_val = content["meta_info"]["output_top_logprobs_val"][
+                                                  -len(delta_output_ids):]
+                        output_top_logprobs_idx = content["meta_info"]["output_top_logprobs_idx"][
+                                                  -len(delta_output_ids):]
+                        if request.logprobs == 0:
+                            choice_data.logprobs.top_logprobs_token_ids_keys = [
+                                {output_token_logprobs_idx[i]: output_token_logprobs_val[i]} for i in
+                                range(len(output_token_logprobs_idx))
+                            ]
+                        else:
+                            choice_data.logprobs.top_logprobs_token_ids_keys = [
+                                dict(zip(output_top_logprobs_idx[i], output_top_logprobs_val[i])) for i in
+                                range(len(output_top_logprobs_idx))
+                            ]
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=created,

@@ -37,6 +37,8 @@ from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.managers.schedule_batch import DllmStagingReqs, Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    DecLockRefParams,
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
 )
@@ -580,8 +582,12 @@ class PrefillAdder:
 
     def _req_inc_lock_ref(self, req: Req):
         if self.is_hybrid_swa:
-            swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
-            req.swa_uuid_for_lock = swa_uuid_for_lock
+            lock_result = self.tree_cache.inc_lock_ref(req.last_node)
+            req.swa_uuid_for_lock = (
+                lock_result.swa_uuid_for_lock
+                if isinstance(lock_result, IncLockRefResult)
+                else lock_result
+            )
         else:
             self.tree_cache.inc_lock_ref(req.last_node)
 
@@ -619,15 +625,22 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        dec_lock_params = None
         try:
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = self.tree_cache.inc_lock_ref(last_node)
+                lock_result = self.tree_cache.inc_lock_ref(last_node)
+                if isinstance(lock_result, IncLockRefResult):
+                    dec_lock_params = DecLockRefParams(
+                        swa_uuid_for_lock=lock_result.swa_uuid_for_lock
+                    )
+                else:
+                    dec_lock_params = lock_result
             else:
                 self.tree_cache.inc_lock_ref(last_node)
             yield None
         finally:
             if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(last_node, swa_uuid_for_lock)
+                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 

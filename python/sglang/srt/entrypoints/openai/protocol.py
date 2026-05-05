@@ -315,6 +315,9 @@ class CompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     sgl_ext: Optional[SglExt] = None
+    # for dashscope spectrum
+    token_ids: list[int] = None
+    stop_reason: Union[None, int, str] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -344,6 +347,9 @@ class CompletionResponseStreamChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     sgl_ext: Optional[SglExt] = None
+    # for dashscope spectrum
+    token_ids: list[int] = None
+    stop_reason: Union[None, int, str] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
