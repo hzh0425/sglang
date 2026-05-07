@@ -1,8 +1,8 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
+import json
 import logging
 import os
-import json
 from pathlib import Path
 from typing import List, NamedTuple
 
@@ -156,7 +156,7 @@ class HiSparseCoordinator:
         self._swap_layer_seen = [False] * layer_num
         self._swap_seen_layers = 0
         self._swap_step_counter = 0
-        self._swap_step_records: list[dict[str, float | int]] = []
+        self._req_rid_by_pool_idx: dict[int, str] = {}
         self._swap_log_hit_rate_sum = 0.0
         self._swap_log_miss_count_sum = 0.0
         self._swap_log_count = 0
@@ -180,35 +180,82 @@ class HiSparseCoordinator:
         self._swap_layer_seen = [False] * self._num_layers
         self._swap_seen_layers = 0
         self._swap_step_counter = 0
-        self._swap_step_records = []
         self._swap_log_hit_rate_sum = 0.0
         self._swap_log_miss_count_sum = 0.0
         self._swap_log_count = 0
         self.last_swap_hit_rate = 0.0
 
-    def _dump_swap_hit_rate_stats_to_file(self, req: Req) -> None:
-        """Persist per-step hit-rate stats to a file at request end."""
-        if (
-            self.tp_rank != 0
-            or not self.hit_rate_file_enabled
-            or not self._swap_step_records
-        ):
-            return
+    def _clear_request_hit_rate_stats(self, req: Req) -> None:
+        """Clear request metadata used by streaming hit-rate stats."""
+        self._req_rid_by_pool_idx.pop(req.req_pool_idx, None)
+
+    def _hit_rate_output_path(self) -> Path:
         self.hit_rate_output_dir.mkdir(parents=True, exist_ok=True)
         filename = (
             f"hisparse_hit_rate_{self.eviction_policy_name}_{self.device_buffer_size}.jsonl"
         )
-        output_path = self.hit_rate_output_dir / filename
-        with output_path.open("a", encoding="utf-8") as f:
-            for row in self._swap_step_records:
+        return self.hit_rate_output_dir / filename
+
+    def _num_real_requests(self, num_reqs: int) -> int:
+        """Return the non-padded request count for the current forward batch."""
+        num_real_reqs = int(self.num_real_reqs.item())
+        if num_real_reqs <= 0:
+            return num_reqs
+        return min(num_reqs, num_real_reqs)
+
+    def _record_layer_swap_stats(
+        self,
+        req_pool_indices: torch.Tensor,
+        top_k_result: torch.Tensor,
+        top_k_hit_counts: torch.Tensor,
+        top_k_valid_counts: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        """Record per-request, per-layer hit-rate stats and raw indexer topk."""
+        if self.tp_rank != 0 or not self.hit_rate_file_enabled:
+            return
+
+        num_reqs = self._num_real_requests(req_pool_indices.size(0))
+        num_reqs = min(
+            num_reqs,
+            top_k_result.size(0),
+            top_k_hit_counts.size(0),
+            top_k_valid_counts.size(0),
+        )
+        if num_reqs == 0:
+            return
+
+        req_pool_indices_cpu = req_pool_indices[:num_reqs].detach().to("cpu").tolist()
+        hit_counts_cpu = top_k_hit_counts[:num_reqs].detach().to("cpu").tolist()
+        valid_counts_cpu = top_k_valid_counts[:num_reqs].detach().to("cpu").tolist()
+        topk_cpu = top_k_result[:num_reqs].detach().to("cpu")
+        current_step = self._swap_step_counter + 1
+
+        with self._hit_rate_output_path().open("a", encoding="utf-8") as f:
+            for row_idx, req_pool_idx in enumerate(req_pool_indices_cpu):
+                req_pool_idx = int(req_pool_idx)
+                valid_count = int(valid_counts_cpu[row_idx])
+                hit_count = int(hit_counts_cpu[row_idx])
+                miss_count = max(valid_count - hit_count, 0)
+                hit_rate = hit_count / valid_count if valid_count > 0 else 0.0
+                indexer_topk = [
+                    int(token_idx)
+                    for token_idx in topk_cpu[row_idx].tolist()
+                    if int(token_idx) >= 0
+                ]
+
                 row_out = {
-                    "req_rid": req.rid,
-                    "req_pool_idx": req.req_pool_idx,
+                    "req_rid": self._req_rid_by_pool_idx.get(req_pool_idx),
+                    "req_pool_idx": req_pool_idx,
                     "policy_name": self.eviction_policy_name,
                     "device_buffer_size": self.device_buffer_size,
-                    "step": row["step"],
-                    "hit_rate": row["hit_rate"],
-                    "miss_count": row["miss_count"],
+                    "step": current_step,
+                    "layer_id": layer_id,
+                    "hit_rate": hit_rate,
+                    "miss_count": miss_count,
+                    "hit_count": hit_count,
+                    "valid_count": valid_count,
+                    "indexer_topk": indexer_topk,
                 }
                 f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
 
@@ -280,6 +327,7 @@ class HiSparseCoordinator:
 
         self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
         self.req_device_buffer_size[req.req_pool_idx] = alloc_size
+        self._req_rid_by_pool_idx[req.req_pool_idx] = req.rid
 
         self.req_device_buffer_tokens[
             :, req.req_pool_idx, : self.device_buffer_size
@@ -604,7 +652,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self._skip_first_backup[req.req_pool_idx] = False
         req.staging = False
-        self._dump_swap_hit_rate_stats_to_file(req)
+        self._clear_request_hit_rate_stats(req)
         self._reset_swap_hit_rate_stats()
 
     def retract_req(self, req: Req) -> None:
@@ -642,7 +690,7 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
-        self._dump_swap_hit_rate_stats_to_file(req)
+        self._clear_request_hit_rate_stats(req)
         self._reset_swap_hit_rate_stats()
 
     def swap_in_selected_pages(
@@ -694,6 +742,13 @@ class HiSparseCoordinator:
         total_hits = int(top_k_hit_counts.sum().item())
         total_valid = int(top_k_valid_counts.sum().item())
         hit_rate = (total_hits / total_valid) if total_valid > 0 else 0.0
+        self._record_layer_swap_stats(
+            req_pool_indices=req_pool_indices,
+            top_k_result=top_k_result,
+            top_k_hit_counts=top_k_hit_counts,
+            top_k_valid_counts=top_k_valid_counts,
+            layer_id=layer_id,
+        )
         if not self._swap_layer_seen[layer_id]:
             self._swap_layer_seen[layer_id] = True
             self._swap_seen_layers += 1
@@ -708,14 +763,6 @@ class HiSparseCoordinator:
             agg_valid = sum(self._swap_layer_valid)
             avg_miss_count = max(agg_valid - agg_hits, 0) / self._num_layers
             self.last_swap_hit_rate = avg_hit_rate
-            if self.hit_rate_file_enabled:
-                self._swap_step_records.append(
-                    {
-                        "step": self._swap_step_counter,
-                        "hit_rate": avg_hit_rate,
-                        "miss_count": avg_miss_count,
-                    }
-                )
             if self.hit_rate_log_enabled:
                 self._swap_log_hit_rate_sum += avg_hit_rate
                 self._swap_log_miss_count_sum += avg_miss_count
