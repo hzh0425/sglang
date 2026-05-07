@@ -68,6 +68,8 @@ class InsertResult:
 
     prefix_len: int
     mamba_exist: bool = False
+    total_len: int = 0
+    inserted_host_node: Any = None
 
 
 @dataclasses.dataclass
@@ -94,10 +96,14 @@ class IncLockRefResult:
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_host_lock: Optional[int] = None
 
     def to_dec_params(self) -> "DecLockRefParams":
         """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
-        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+        return DecLockRefParams(
+            swa_uuid_for_lock=self.swa_uuid_for_lock,
+            swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
+        )
 
 
 @dataclasses.dataclass
@@ -105,6 +111,7 @@ class DecLockRefParams:
     """Parameters for dec_lock_ref operation."""
 
     swa_uuid_for_lock: Optional[int] = None
+    swa_uuid_for_host_lock: Optional[int] = None
 
 
 @dataclasses.dataclass
@@ -203,6 +210,18 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
         pass
+
+    def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support host lock acquisition"
+        )
+
+    def dec_host_lock_ref(
+        self, node: Any, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support host lock release"
+        )
 
     def evictable_size(self):
         return 0

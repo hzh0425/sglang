@@ -2,6 +2,8 @@
 
 import unittest
 from dataclasses import dataclass
+from queue import Queue
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -15,13 +17,22 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -368,6 +379,18 @@ class UnifiedRadixCacheSuite:
         result = tree.evict(EvictParams(num_tokens=len(seq_a)))
         self.assertGreaterEqual(result.num_tokens_evicted, len(seq_a))
         tree.sanity_check()
+
+    def test_lock_result_to_dec_params_preserves_host_uuid(self):
+        result = IncLockRefResult(
+            delta=7,
+            swa_uuid_for_lock=11,
+            swa_uuid_for_host_lock=13,
+        )
+
+        params = result.to_dec_params()
+
+        self.assertEqual(params.swa_uuid_for_lock, 11)
+        self.assertEqual(params.swa_uuid_for_host_lock, 13)
 
     def test_evict_empty_tree(self):
         tree, _, _ = build_fixture(self.cfg)
@@ -951,8 +974,6 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq)
 
         full_before = tree.full_evictable_size()
-        mamba_before = tree.mamba_evictable_size() if self.cfg.has_mamba else 0
-        swa_before = tree.swa_evictable_size() if self.cfg.has_swa else 0
         self.assertGreater(full_before, 0)
 
         result = tree.evict(EvictParams(num_tokens=full_before * 2))
@@ -977,7 +998,7 @@ class UnifiedRadixCacheSuite:
         lock_result = tree.inc_lock_ref(m_base.last_device_node)
 
         # Evict the leaf — parent (base) should become D-leaf after unlock
-        result = tree.evict(EvictParams(num_tokens=len(leaf)))
+        tree.evict(EvictParams(num_tokens=len(leaf)))
         tree.sanity_check()
 
         tree.dec_lock_ref(
@@ -1014,7 +1035,6 @@ class UnifiedRadixCacheSuite:
     def test_evict_respects_lru_order(self):
         """Older (less recently accessed) nodes are evicted first."""
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)
-        ps = self.cfg.page_size
         seq_old = self._make_seq(1, 2)
         seq_new = self._make_seq(500, 2)
 
@@ -1111,7 +1131,7 @@ class UnifiedRadixCacheSuite:
 
         # Try to evict everything
         total = tree.full_evictable_size() + tree.full_protected_size()
-        result = tree.evict(EvictParams(num_tokens=total))
+        tree.evict(EvictParams(num_tokens=total))
 
         # seq_a should still be matchable (protected)
         m2 = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq_a)))
@@ -1135,7 +1155,7 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, seq_long)
 
         # Evict only mamba
-        result = tree.evict(EvictParams(num_tokens=0, mamba_num=10))
+        tree.evict(EvictParams(num_tokens=0, mamba_num=10))
         self.assertEqual(tree.mamba_evictable_size(), 0)
 
         # Full should still be accessible for at least the long seq base
@@ -1168,7 +1188,7 @@ class UnifiedRadixCacheSuite:
         self._insert(tree, allocator, req_to_token_pool, leaf)
 
         swa_before = tree.swa_evictable_size()
-        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
         self.assertEqual(tree.swa_evictable_size(), 0)
         tree.sanity_check()
 
@@ -1295,6 +1315,527 @@ class UnifiedRadixCacheSuite:
             finish_event.synchronize()
         tree.loading_check()
         return device_indices
+
+    def test_hicache_full_host_lock_is_single_node(self):
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        base = self._make_seq(1, 1)
+        leaf = base + self._make_seq(100, 1)
+        self._insert(tree, allocator, req_to_token_pool, base)
+        self._insert(tree, allocator, req_to_token_pool, leaf)
+
+        node = tree.match_prefix(MatchPrefixParams(key=RadixKey(leaf))).last_device_node
+        parent = node.parent
+        self._simulate_backup(tree, node)
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_to_host(node, tracker)
+        self.assertIn(node, tree.evictable_host_leaves)
+
+        lock_result = tree.inc_host_lock_ref(node)
+
+        self.assertIsNone(lock_result.swa_uuid_for_host_lock)
+        self.assertEqual(node.component_data[ComponentType.FULL].host_lock_ref, 1)
+        self.assertEqual(parent.component_data[ComponentType.FULL].host_lock_ref, 0)
+        self.assertNotIn(node, tree.evictable_host_leaves)
+
+        tree.dec_host_lock_ref(node, lock_result.to_dec_params())
+        self.assertEqual(node.component_data[ComponentType.FULL].host_lock_ref, 0)
+        self.assertEqual(parent.component_data[ComponentType.FULL].host_lock_ref, 0)
+        self.assertIn(node, tree.evictable_host_leaves)
+        tree.sanity_check()
+
+    def test_hicache_insert_helper_host_returns_insert_result(self):
+        tree, _, _ = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        host_value = torch.arange(len(seq), dtype=torch.int64)
+        hash_value = [f"h{i}" for i in range(len(seq) // self.cfg.page_size)]
+
+        result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(seq),
+            host_value,
+            hash_value,
+        )
+
+        self.assertEqual(result.prefix_len, 0)
+        self.assertEqual(result.total_len, len(seq))
+        self.assertIsNotNone(result.inserted_host_node)
+        self.assertFalse(result.mamba_exist)
+
+        node = result.inserted_host_node
+        self.assertIsNone(node.component_data[ComponentType.FULL].value)
+        self.assertEqual(
+            node.component_data[ComponentType.FULL].host_value.tolist(),
+            host_value.tolist(),
+        )
+        self.assertEqual(node.hash_value, hash_value)
+        self.assertIn(node, tree.evictable_host_leaves)
+
+        result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(seq),
+            host_value,
+            hash_value,
+        )
+        self.assertEqual(result.prefix_len, len(seq))
+        self.assertEqual(result.total_len, len(seq))
+        self.assertIsNone(result.inserted_host_node)
+        self.assertTrue(result.mamba_exist)
+        tree.sanity_check()
+
+    def test_hicache_mamba_host_lock_moves_host_lru(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        node = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq))).last_device_node
+        self._simulate_backup(tree, node)
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_to_host(node, tracker)
+        host_lru = tree.host_lru_lists[ComponentType.MAMBA]
+        self.assertTrue(host_lru.in_list(node))
+
+        lock_result = tree.inc_host_lock_ref(node)
+
+        self.assertIsNone(lock_result.swa_uuid_for_host_lock)
+        self.assertEqual(node.component_data[ComponentType.MAMBA].host_lock_ref, 1)
+        self.assertFalse(host_lru.in_list(node))
+
+        tree.dec_host_lock_ref(node, lock_result.to_dec_params())
+        self.assertEqual(node.component_data[ComponentType.MAMBA].host_lock_ref, 0)
+        self.assertTrue(host_lru.in_list(node))
+        tree.sanity_check()
+
+    def test_hicache_swa_host_lock_uses_host_uuid(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        pages = max(1, (self.cfg.sliding_window_size + self.cfg.page_size - 1) // self.cfg.page_size)
+        seq = self._make_seq(1, pages)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+
+        node = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq))).last_device_node
+        self._simulate_backup(tree, node)
+        tracker = {ct: 0 for ct in tree.tree_components}
+        tree._evict_to_host(node, tracker)
+        host_lru = tree.host_lru_lists[ComponentType.SWA]
+        self.assertTrue(host_lru.in_list(node))
+
+        lock_result = tree.inc_host_lock_ref(node)
+        swa_cd = node.component_data[ComponentType.SWA]
+
+        self.assertIsNotNone(lock_result.swa_uuid_for_host_lock)
+        self.assertEqual(
+            swa_cd.metadata.get("host_uuid"),
+            lock_result.swa_uuid_for_host_lock,
+        )
+        self.assertEqual(swa_cd.host_lock_ref, 1)
+        self.assertFalse(host_lru.in_list(node))
+
+        tree.dec_host_lock_ref(node, lock_result.to_dec_params())
+        self.assertEqual(swa_cd.host_lock_ref, 0)
+        self.assertTrue(host_lru.in_list(node))
+        tree.sanity_check()
+
+    def test_hicache_apply_storage_runtime_config_uses_controller_cp_query(self):
+        tree, _, _ = build_fixture(self.cfg)
+        tree.cache_controller = mock.Mock(
+            tp_rank=1,
+            dp_rank=2,
+            pp_rank=3,
+            pp_size=4,
+        )
+        tree.cache_controller.get_attn_cp_rank_and_size.return_value = (5, 6)
+
+        with mock.patch(
+            "sglang.srt.mem_cache.unified_radix_cache.StorageMetricsCollector"
+        ) as collector_cls:
+            tree._apply_storage_runtime_config(
+                storage_backend="file",
+                prefetch_threshold=64,
+                prefetch_timeout_base=1.5,
+                prefetch_timeout_per_ki_token=0.25,
+                hicache_storage_pass_prefix_keys=True,
+                enable_storage=True,
+                enable_storage_metrics=True,
+                extra_metric_labels={"role": "test"},
+            )
+
+        collector_cls.assert_called_once()
+        labels = collector_cls.call_args.kwargs["labels"]
+        self.assertEqual(labels["tp_rank"], 1)
+        self.assertEqual(labels["dp_rank"], 2)
+        self.assertEqual(labels["pp_rank"], 3)
+        self.assertEqual(labels["pp_size"], 4)
+        self.assertEqual(labels["attn_cp_rank"], 5)
+        self.assertEqual(labels["attn_cp_size"], 6)
+        self.assertEqual(labels["role"], "test")
+
+    def test_hicache_runtime_attach_is_not_supported(self):
+        tree, _, _ = build_fixture(self.cfg)
+
+        ok, msg = tree.attach_storage_backend(
+            storage_backend="file",
+            storage_backend_extra_config_json='{"prefetch_threshold": 64}',
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("does not support runtime HiCache storage attach", msg)
+
+    def test_hicache_runtime_detach_is_not_supported(self):
+        tree, _, _ = build_fixture(self.cfg)
+
+        ok, msg = tree.detach_storage_backend()
+
+        self.assertFalse(ok)
+        self.assertIn("does not support runtime HiCache storage detach", msg)
+
+    def test_hicache_prefetch_from_storage_includes_anchor_shared_pool(self):
+        tree, _, _ = build_fixture(self.cfg)
+        seq = self._make_seq(1, 1)
+        host_value = torch.arange(len(seq), dtype=torch.int64)
+        hash_value = [f"h{i}" for i in range(len(seq) // self.cfg.page_size)]
+        insert_result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(seq),
+            host_value,
+            hash_value,
+        )
+        node = insert_result.inserted_host_node
+        host_indices = torch.arange(len(seq), dtype=torch.int64)
+        operation = mock.Mock(host_indices=host_indices)
+        mem_pool_host = mock.Mock()
+        mem_pool_host.alloc.return_value = host_indices
+        cache_controller = mock.Mock(
+            mem_pool_host=mem_pool_host,
+            prefetch_rate_limited=mock.Mock(return_value=False),
+            prefetch=mock.Mock(return_value=operation),
+            prefetch_tokens_occupied=0,
+        )
+        tree.cache_controller = cache_controller
+        tree.enable_storage = True
+        tree.prefetch_threshold = len(seq)
+        tree.register_hicache_anchor_kv_shared_indices_pool(PoolName.INDEXER)
+
+        prefetch_tokens = self._make_seq(1000, 1)
+        tree.prefetch_from_storage(
+            "req-1",
+            node,
+            prefetch_tokens,
+            last_hash="seed",
+            prefix_keys=["p0"],
+        )
+
+        extra_pools = cache_controller.prefetch.call_args.kwargs["extra_pools"]
+        self.assertEqual(len(extra_pools), 1)
+        self.assertEqual(extra_pools[0].name, PoolName.INDEXER)
+        self.assertEqual(
+            extra_pools[0].hit_policy,
+            PoolHitPolicy.ALL_PAGES,
+        )
+
+    def test_hicache_mamba_prefetch_commit_adopts_host_slot(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba")
+
+        tree, _, _ = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        host_value = torch.arange(len(seq), dtype=torch.int64)
+        hash_value = [f"h{i}" for i in range(len(seq) // self.cfg.page_size)]
+        insert_result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(seq),
+            host_value,
+            hash_value,
+        )
+
+        mamba_comp = tree.components[ComponentType.MAMBA]
+        mamba_comp._mamba_pool_host = mock.Mock()
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.tensor([999], dtype=torch.int64),
+            keys=["tail"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        pool_storage_result = PoolTransferResult(
+            kv_hit_pages=len(hash_value),
+            extra_pool_hit_pages={PoolName.MAMBA: 1},
+        )
+
+        mamba_comp.commit_hicache_transfer(
+            tree.root_node,
+            CacheTransferPhase.PREFETCH,
+            transfers=[transfer],
+            insert_result=insert_result,
+            pool_storage_result=pool_storage_result,
+        )
+
+        target = insert_result.inserted_host_node
+        self.assertFalse(insert_result.mamba_exist)
+        self.assertEqual(
+            target.component_data[ComponentType.MAMBA].host_value.tolist(),
+            [999],
+        )
+        self.assertTrue(tree.host_lru_lists[ComponentType.MAMBA].in_list(target))
+        mamba_comp._mamba_pool_host.free.assert_not_called()
+
+    def test_hybrid_cache_controller_append_host_mem_release_uses_pool_page_size(self):
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_host = SimpleNamespace(
+            page_size=2,
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(
+                    share_indices_with_anchor=False,
+                    host_pool=SimpleNamespace(page_size=1),
+                ),
+                PoolName.SWA: SimpleNamespace(
+                    share_indices_with_anchor=False,
+                    host_pool=SimpleNamespace(page_size=2),
+                ),
+            }
+        )
+        controller.extra_host_mem_release_queues = {
+            PoolName.MAMBA: Queue(),
+            PoolName.SWA: Queue(),
+        }
+        controller.host_mem_release_queue = Queue()
+
+        controller.append_host_mem_release(
+            host_indices=torch.tensor([20, 21, 22, 23], dtype=torch.int64),
+            extra_pools=[
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=torch.tensor([1, 2, 3], dtype=torch.int64),
+                ),
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [
+                controller.host_mem_release_queue.get_nowait().tolist(),
+                controller.host_mem_release_queue.get_nowait().tolist(),
+            ],
+            [[20, 21], [22, 23]],
+        )
+        self.assertEqual(
+            [
+                controller.extra_host_mem_release_queues[PoolName.MAMBA].get_nowait().tolist(),
+                controller.extra_host_mem_release_queues[PoolName.MAMBA].get_nowait().tolist(),
+                controller.extra_host_mem_release_queues[PoolName.MAMBA].get_nowait().tolist(),
+            ],
+            [[1], [2], [3]],
+        )
+        self.assertEqual(
+            [
+                controller.extra_host_mem_release_queues[PoolName.SWA].get_nowait().tolist(),
+                controller.extra_host_mem_release_queues[PoolName.SWA].get_nowait().tolist(),
+            ],
+            [[10, 11], [12, 13]],
+        )
+
+    def test_hicache_mamba_prefetch_commit_queues_unadopted_host_slot(self):
+        if not self.cfg.has_mamba:
+            self.skipTest("requires Mamba")
+
+        tree, _, _ = build_fixture(self.cfg)
+        tree.cache_controller = mock.Mock()
+        seq = self._make_seq(1, 2)
+        host_value = torch.arange(len(seq), dtype=torch.int64)
+        hash_value = [f"h{i}" for i in range(len(seq) // self.cfg.page_size)]
+        insert_result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(seq),
+            host_value,
+            hash_value,
+        )
+        insert_result.inserted_host_node = None
+
+        mamba_comp = tree.components[ComponentType.MAMBA]
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA,
+            host_indices=torch.tensor([999], dtype=torch.int64),
+            keys=["tail"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        pool_storage_result = PoolTransferResult(
+            kv_hit_pages=len(hash_value),
+            extra_pool_hit_pages={PoolName.MAMBA: 1},
+        )
+
+        mamba_comp.commit_hicache_transfer(
+            tree.root_node,
+            CacheTransferPhase.PREFETCH,
+            transfers=[transfer],
+            insert_result=insert_result,
+            pool_storage_result=pool_storage_result,
+        )
+
+        self.assertTrue(insert_result.mamba_exist)
+        extra_pools = tree.cache_controller.append_host_mem_release.call_args.kwargs[
+            "extra_pools"
+        ]
+        self.assertEqual(len(extra_pools), 1)
+        self.assertEqual(extra_pools[0].name, PoolName.MAMBA)
+        self.assertEqual(
+            extra_pools[0].host_indices.tolist(),
+            transfer.host_indices.tolist(),
+        )
+
+    def test_hicache_swa_prefetch_commit_splits_new_host_leaf(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+
+        tree, _, _ = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        base = self._make_seq(1, 2)
+        extended = base + self._make_seq(1000, 2)
+        tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(base),
+            torch.arange(len(base), dtype=torch.int64),
+            [f"b{i}" for i in range(len(base) // ps)],
+        )
+        insert_result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(extended),
+            torch.arange(len(extended), dtype=torch.int64),
+            [f"e{i}" for i in range(len(extended) // ps)],
+        )
+        target = insert_result.inserted_host_node
+        self.assertEqual(len(target.key), 2 * ps)
+
+        swa_comp = tree.components[ComponentType.SWA]
+        swa_comp._swa_kv_pool_host = mock.Mock()
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=torch.arange(ps, dtype=torch.int64) + 500,
+            keys=["tail"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        pool_storage_result = PoolTransferResult(
+            kv_hit_pages=len(extended) // ps,
+            extra_pool_hit_pages={PoolName.SWA: 1},
+        )
+
+        swa_comp.commit_hicache_transfer(
+            tree.root_node,
+            CacheTransferPhase.PREFETCH,
+            transfers=[transfer],
+            insert_result=insert_result,
+            pool_storage_result=pool_storage_result,
+        )
+
+        self.assertEqual(len(target.key), ps)
+        self.assertIsNotNone(target.parent)
+        self.assertEqual(len(target.parent.key), ps)
+        self.assertIsNone(target.parent.component_data[ComponentType.SWA].host_value)
+        self.assertEqual(
+            target.component_data[ComponentType.SWA].host_value.tolist(),
+            transfer.host_indices.tolist(),
+        )
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(target))
+        swa_comp._swa_kv_pool_host.free.assert_not_called()
+
+    def test_hicache_swa_prefetch_commit_trims_matched_prefix(self):
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+
+        tree, _, _ = build_fixture(self.cfg)
+        tree.cache_controller = mock.Mock()
+        ps = self.cfg.page_size
+        base = self._make_seq(1, 3)
+        extended = base + self._make_seq(1000, 1)
+        tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(base),
+            torch.arange(len(base), dtype=torch.int64),
+            [f"b{i}" for i in range(len(base) // ps)],
+        )
+        insert_result = tree._insert_helper_host(
+            tree.root_node,
+            RadixKey(extended),
+            torch.arange(len(extended), dtype=torch.int64),
+            [f"e{i}" for i in range(len(extended) // ps)],
+        )
+
+        swa_comp = tree.components[ComponentType.SWA]
+        swa_comp._swa_kv_pool_host = mock.Mock()
+        host_indices = torch.arange(2 * ps, dtype=torch.int64) + 700
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            host_indices=host_indices,
+            keys=["t0", "t1"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        pool_storage_result = PoolTransferResult(
+            kv_hit_pages=len(extended) // ps,
+            extra_pool_hit_pages={PoolName.SWA: 2},
+        )
+
+        swa_comp.commit_hicache_transfer(
+            tree.root_node,
+            CacheTransferPhase.PREFETCH,
+            transfers=[transfer],
+            insert_result=insert_result,
+            pool_storage_result=pool_storage_result,
+        )
+
+        extra_pools = tree.cache_controller.append_host_mem_release.call_args.kwargs[
+            "extra_pools"
+        ]
+        self.assertEqual(len(extra_pools), 1)
+        self.assertEqual(extra_pools[0].name, PoolName.SWA)
+        self.assertEqual(
+            extra_pools[0].host_indices.tolist(),
+            host_indices[:ps].tolist(),
+        )
+        target = insert_result.inserted_host_node
+        self.assertEqual(
+            target.component_data[ComponentType.SWA].host_value.tolist(),
+            host_indices[ps:].tolist(),
+        )
+        self.assertTrue(tree.host_lru_lists[ComponentType.SWA].in_list(target))
+
+    def test_hicache_drain_storage_control_queues_releases_extra_pools(self):
+        tree, _, _ = build_fixture(self.cfg)
+        extra_host_pool = mock.Mock()
+        cc = mock.Mock()
+        cc.prefetch_revoke_queue = Queue()
+        cc.ack_backup_queue = Queue()
+        cc.host_mem_release_queue = Queue()
+        cc.extra_host_mem_release_queues = {PoolName.MAMBA: Queue()}
+        cc.mem_pool_host = SimpleNamespace(
+            free=mock.Mock(),
+            entry_map={
+                PoolName.MAMBA: SimpleNamespace(host_pool=extra_host_pool),
+            },
+        )
+
+        cc.host_mem_release_queue.put(torch.tensor([1, 2], dtype=torch.int64))
+        cc.extra_host_mem_release_queues[PoolName.MAMBA].put(
+            torch.tensor([7], dtype=torch.int64)
+        )
+        tree.cache_controller = cc
+
+        tree.drain_storage_control_queues()
+
+        cc.mem_pool_host.free.assert_called_once()
+        self.assertEqual(
+            cc.mem_pool_host.free.call_args.args[0].tolist(),
+            [1, 2],
+        )
+        extra_host_pool.free.assert_called_once()
+        self.assertEqual(
+            extra_host_pool.free.call_args.args[0].tolist(),
+            [7],
+        )
 
     def _get_full_kv_pool(self, allocator):
         kv_pool = allocator.get_kvcache()
