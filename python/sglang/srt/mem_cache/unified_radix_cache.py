@@ -23,7 +23,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -1555,6 +1560,71 @@ class UnifiedRadixCache(BasePrefixCache):
             if transfer.host_indices.numel() > 0:
                 entry.host_pool.free(transfer.host_indices)
 
+    def _get_tp_rank_for_log(self) -> int:
+        if self.tp_group is None:
+            return 0
+        return torch.distributed.get_rank(group=self.tp_group)
+
+    def _get_pool_page_size_for_log(self, pool_name: PoolName) -> int:
+        if self.host_pool_group is None:
+            return self.page_size
+        entry = self.host_pool_group.entry_map.get(pool_name)
+        if entry is None:
+            return self.page_size
+        return entry.host_pool.page_size
+
+    def _summarize_prefetch_component_stats(
+        self,
+        comp_xfers: dict[ComponentType, list[PoolTransfer]],
+        pool_storage_result: Optional[PoolTransferResult] = None,
+    ) -> str:
+        if not comp_xfers:
+            return "none"
+
+        parts = []
+        for ct, xfers in comp_xfers.items():
+            requested_tokens = sum(
+                len(xfer.host_indices)
+                for xfer in xfers
+                if xfer.host_indices is not None
+            )
+            requested_pages = 0
+            loaded_pages = 0
+            loaded_tokens = 0
+            seen_pool_names = set()
+            for xfer in xfers:
+                page_size = self._get_pool_page_size_for_log(xfer.name)
+                if xfer.host_indices is not None and page_size > 0:
+                    requested_pages += len(xfer.host_indices) // page_size
+                if pool_storage_result is None or xfer.name in seen_pool_names:
+                    continue
+                hit_pages = pool_storage_result.extra_pool_hit_pages.get(xfer.name, 0)
+                loaded_pages += hit_pages
+                loaded_tokens += hit_pages * page_size
+                seen_pool_names.add(xfer.name)
+            if pool_storage_result is None:
+                parts.append(
+                    f"{ct.name}(req_tokens={requested_tokens},req_pages={requested_pages})"
+                )
+            else:
+                parts.append(
+                    f"{ct.name}(req_tokens={requested_tokens},req_pages={requested_pages},"
+                    f"hit_pages={loaded_pages},hit_tokens={min(requested_tokens, loaded_tokens)})"
+                )
+        return ", ".join(parts)
+
+    def _format_drain_qsizes_for_log(
+        self, extra_pool_names: list[PoolName], qsize_list: list[int]
+    ) -> str:
+        parts = [
+            f"revoke={qsize_list[0]}",
+            f"backup={qsize_list[1]}",
+            f"full_release={qsize_list[2]}",
+        ]
+        for pool_name, count in zip(extra_pool_names, qsize_list[3:]):
+            parts.append(f"{pool_name.value}_release={count}")
+        return ", ".join(parts)
+
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         if not self.enable_storage or self.cache_controller is None or not node.backuped:
             return
@@ -1703,6 +1773,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self._free_transfer_host_indices(
                 [x for xfers in comp_xfers.values() for x in xfers]
             )
+            logger.info(
+                "HiCache prefetch alloc failed req=%s tp_rank=%d full_tokens=%d node=%d components=%s",
+                req_id,
+                self._get_tp_rank_for_log(),
+                len(prefetch_key),
+                last_host_node.id,
+                self._summarize_prefetch_component_stats(comp_xfers),
+            )
             self.dec_host_lock_ref(last_host_node, host_lock_params)
             return
 
@@ -1725,6 +1803,16 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        logger.info(
+            "HiCache prefetch queued req=%s tp_rank=%d full_tokens=%d node=%d last_hash=%s components=%s occupied=%d",
+            req_id,
+            self._get_tp_rank_for_log(),
+            len(prefetch_key),
+            last_host_node.id,
+            last_hash,
+            self._summarize_prefetch_component_stats(comp_xfers),
+            self.cache_controller.prefetch_tokens_occupied,
+        )
 
     def check_prefetch_progress(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
@@ -1783,6 +1871,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        logger.info(
+            "HiCache prefetch success req=%s tp_rank=%d full_completed_local=%d full_completed_synced=%d full_matched=%d full_loaded=%d full_tail_release=%d full_inserted=%d components=%s occupied=%d",
+            req_id,
+            self._get_tp_rank_for_log(),
+            completed_tokens,
+            min_completed_tokens,
+            insert_result.prefix_len,
+            loaded_from_storage,
+            completed_tokens - min_completed_tokens,
+            max(0, insert_result.total_len - insert_result.prefix_len),
+            self._summarize_prefetch_component_stats(
+                comp_xfers, operation.pool_storage_result
+            ),
+            self.cache_controller.prefetch_tokens_occupied,
+        )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
@@ -1846,10 +1949,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 yield item
 
         def _drain_revoke():
+            drained = 0
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is None:
                     continue
+                drained += 1
                 (
                     last_host_node,
                     prefetch_key,
@@ -1865,9 +1970,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 cc.prefetch_tokens_occupied -= len(prefetch_key)
                 if cc.prefetch_tokens_occupied < 0:
                     cc.prefetch_tokens_occupied = 0
+            return drained
 
         def _drain_backup():
+            drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
+                drained += 1
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
@@ -1877,48 +1985,78 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+            return drained
 
         def _drain_release():
             host_indices_list = []
+            released_tokens = 0
             for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
                 host_indices_list.append(host_indices)
+                released_tokens += len(host_indices)
             if host_indices_list:
                 cc.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+            return len(host_indices_list), released_tokens
 
         def _drain_extra_release():
+            drained: dict[PoolName, tuple[int, int]] = {}
             if not extra_release_counts:
-                return
+                return drained
             for pool_name, limit in extra_release_counts.items():
                 release_queue = cc.extra_host_mem_release_queues.get(pool_name)
                 if release_queue is None:
                     continue
                 host_indices_list = []
+                released_tokens = 0
                 for host_indices in _drain_queue(release_queue, limit):
                     host_indices_list.append(host_indices)
+                    released_tokens += len(host_indices)
                 if host_indices_list:
                     entry = cc.mem_pool_host.entry_map.get(pool_name)
                     if entry is not None:
                         entry.host_pool.free(torch.cat(host_indices_list, dim=0))
+                drained[pool_name] = (len(host_indices_list), released_tokens)
+            return drained
 
-        _drain_revoke()
-        _drain_backup()
-        _drain_release()
-        _drain_extra_release()
+        revoke_count = _drain_revoke()
+        backup_count = _drain_backup()
+        full_release_items, full_release_tokens = _drain_release()
+        extra_release_stats = _drain_extra_release()
+        if (
+            revoke_count > 0
+            or backup_count > 0
+            or full_release_items > 0
+            or any(item_count > 0 for item_count, _ in extra_release_stats.values())
+        ):
+            extra_release_summary = ", ".join(
+                f"{pool_name.value}(items={item_count},tokens={token_count})"
+                for pool_name, (item_count, token_count) in extra_release_stats.items()
+            )
+            logger.info(
+                "HiCache drain applied tp_rank=%d revoke=%d backup=%d full_release_items=%d full_release_tokens=%d extra_release=%s occupied=%d",
+                self._get_tp_rank_for_log(),
+                revoke_count,
+                backup_count,
+                full_release_items,
+                full_release_tokens,
+                extra_release_summary or "none",
+                cc.prefetch_tokens_occupied,
+            )
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
-        qsizes = torch.tensor(
-            [
-                cc.prefetch_revoke_queue.qsize(),
-                cc.ack_backup_queue.qsize(),
-                cc.host_mem_release_queue.qsize(),
-                *[
-                    extra_release_queues[pool_name].qsize()
-                    for pool_name in extra_pool_names
-                ],
+        local_qsize_list = [
+            cc.prefetch_revoke_queue.qsize(),
+            cc.ack_backup_queue.qsize(),
+            cc.host_mem_release_queue.qsize(),
+            *[
+                extra_release_queues[pool_name].qsize()
+                for pool_name in extra_pool_names
             ],
+        ]
+        qsizes = torch.tensor(
+            local_qsize_list,
             dtype=torch.int,
         )
         if self.tp_world_size > 1:
@@ -1926,6 +2064,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
         qsize_list = list(map(int, qsizes.tolist()))
+        if any(local_qsize_list) or any(qsize_list):
+            logger.info(
+                "HiCache drain queues tp_rank=%d local={%s} synced={%s}",
+                self._get_tp_rank_for_log(),
+                self._format_drain_qsizes_for_log(extra_pool_names, local_qsize_list),
+                self._format_drain_qsizes_for_log(extra_pool_names, qsize_list),
+            )
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
