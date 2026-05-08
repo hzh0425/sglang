@@ -250,11 +250,96 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller = None
         self.write_through_threshold = 256
 
+        self._reset_full()
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def reset(self) -> None:
-        self._reset_full()
+        self._reset_l1_only()
+
+    def _reset_l1_only(self) -> None:
+        # TODO: This is a temporary method for debugging L2 HiCache, will be removed
+        # 1. Drain pending async operations
+        self.writing_check(write_back=True)
+        if self.cache_controller is not None:
+            self.cache_controller.ack_write_queue.clear()
+            self.cache_controller.ack_load_queue.clear()
+            self.cache_controller.write_queue.clear()
+            self.cache_controller.load_queue.clear()
+        self.ongoing_write_through.clear()
+        self.ongoing_load_back.clear()
+
+        # 2. Walk tree: release all device resources, keep component host_values
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            for ct in self.tree_components:
+                cd = node.component_data[ct]
+                if node is not self.root_node:
+                    cd.value = None  # Release device reference
+                cd.lock_ref = 1 if node is self.root_node else 0
+                # cd.host_value / cd.host_lock_ref are preserved
+            stack.extend(node.children.values())
+        pruned_nodes = self._prune_l1_only_leaves_after_reset()
+
+        # Root keeps its empty-list value marker
+        self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
+
+        # 3. Reset bookkeeping
+        self.component_evictable_size_ = {ct: 0 for ct in self.tree_components}
+        self.component_protected_size_ = {ct: 0 for ct in self.tree_components}
+        self.lru_lists = {
+            ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
+        }
+
+        # 4. Reset device leaf set
+        self.evictable_device_leaves.clear()
+
+        # 5. Rebuild host leaf sets (all non-root backuped nodes are now evictable host leaves)
+        self.evictable_host_leaves = set()
+        self._rebuild_host_leaf_sets()
+
+        # 6. Rebuild host LRU lists for extra components
+        self.host_lru_lists = {
+            ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
+            for ct in self.tree_components
+        }
+        self._rebuild_host_lru_lists()
+
+        logger.info(
+            "UnifiedRadixCache L1-only reset completed: "
+            "tree structure and L2 host data preserved, pruned_l1_only_nodes=%d",
+            pruned_nodes,
+        )
+
+    def _prune_l1_only_leaves_after_reset(self) -> int:
+        """Drop suffix nodes that lost L1 device data and have no L2 Full data."""
+        postorder = []
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            postorder.append(node)
+            stack.extend(node.children.values())
+
+        pruned = 0
+        for node in reversed(postorder):
+            if node is self.root_node or node.children:
+                continue
+            if node.component_data[BASE_COMPONENT_TYPE].host_value is not None:
+                continue
+
+            for comp in self._components_tuple:
+                if comp.node_has_component_data(node, target=EvictLayer.HOST):
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.HOST
+                    )
+            self.evictable_device_leaves.discard(node)
+            self.evictable_host_leaves.discard(node)
+            self._remove_leaf_from_parent(node)
+            pruned += 1
+
+        return pruned
+
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
@@ -1258,6 +1343,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_lock_ref(ancestor_node, ancestor_lock_params)
                 return None
 
+        aux_summary = ", ".join(
+            f"{x.name}:{x.host_indices.numel() if x.host_indices is not None else 0}"
+            for xfers in comp_xfers.values()
+            for x in xfers
+        )
+        logger.info(
+            f"load_back: kv_tokens={kv_tokens}, node_id={last_hit_node.id}, aux=[{aux_summary}]",
+        )
+
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1429,7 +1523,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if last_node.evicted or params.host_hit_length > 0:
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
-                logger.debug(
+                logger.info(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(loading_values),
                     last_node.id,
@@ -1923,3 +2017,4 @@ class UnifiedRadixCache(BasePrefixCache):
                     if cd.host_value is not None:
                         self.host_lru_lists[ct].insert_mru(node)
             stack.extend(node.children.values())
+

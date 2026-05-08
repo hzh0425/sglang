@@ -1886,6 +1886,8 @@ class DeepSeekV4PagedHostPool(HostKVCache):
         self._check_io_backend(io_backend)
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+        if layer_id == 0:
+            logger.info(f"{self.pool_name} Transferring layer {layer_id}, indices size:{device_rows.numel()}")
         transfer_kv_direct(
             src_layers=[self.kv_buffer[layer_id]],
             dst_layers=[self.device_buffers[layer_id]],
@@ -2103,6 +2105,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self._check_io_backend(io_backend)
         host_rows = self._to_page_indices(host_indices)
         device_rows = self._to_page_indices(device_indices)
+        if layer_id == 0:
+            logger.info(f"{self.pool_name} Transferring layer {layer_id}, indices size:{device_rows}")        
+        
         transfer_kv_direct(
             src_layers=[self.kv_buffer[layer_id]],
             dst_layers=[self.device_page_views[layer_id]],
@@ -2590,3 +2595,4 @@ class NSAIndexerPoolHost(HostKVCache):
             page_index = int(indices[i]) // self.page_size
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
+
