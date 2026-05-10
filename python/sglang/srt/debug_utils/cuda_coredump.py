@@ -14,6 +14,7 @@ CUDA_* env vars in the shell before launching Python.
 
 import glob
 import os
+import time
 import warnings
 
 from sglang.srt.environ import envs
@@ -82,6 +83,18 @@ def report():
         print(f"Download from CI: gh run download {run_id} --repo {repo}")
 
     print(f"{'='*60}\n")
+
+
+def wait_before_process_exit(reason: str) -> None:
+    wait_secs = envs.SGLANG_CUDA_COREDUMP_WAIT_SECS.get()
+    if not is_enabled() or wait_secs <= 0:
+        return
+    print(
+        f"Waiting {wait_secs:.1f}s before process exit for CUDA coredump "
+        f"completion ({reason}, pid={os.getpid()})",
+        flush=True,
+    )
+    time.sleep(wait_secs)
 
 
 # Auto-inject CUDA coredump env vars at import time.

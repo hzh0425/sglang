@@ -1886,7 +1886,10 @@ class UnifiedRadixCache(BasePrefixCache):
         while stack:
             node, indent = stack.pop()
             component_str = " ".join(
-                f"{ct}={'yes' if node.component_data[ct].value is not None else 'no'}"
+                f"{ct}(val={'y' if node.component_data[ct].value is not None else 'n'}"
+                f",host={'y' if node.component_data[ct].host_value is not None else 'n'}"
+                f",lock={node.component_data[ct].lock_ref}"
+                f",hlock={node.component_data[ct].host_lock_ref})"
                 for ct in self.tree_components
             )
             print(

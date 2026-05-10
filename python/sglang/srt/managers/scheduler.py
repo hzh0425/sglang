@@ -20,7 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -494,6 +494,37 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def dump_tree_cache_before_exit(self, reason: str) -> Optional[str]:
+        dump_dir = envs.SGLANG_HACK_DEBUG_DUMP_FP8_PAGED_MQA_LOGITS.get()
+        if not dump_dir and envs.SGLANG_CUDA_COREDUMP.get():
+            dump_dir = envs.SGLANG_CUDA_COREDUMP_DIR.get()
+        if not dump_dir:
+            return None
+
+        tree_cache = getattr(self, "tree_cache", None)
+        pretty_print = getattr(tree_cache, "pretty_print", None)
+        if pretty_print is None:
+            return None
+
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(
+                dump_dir,
+                f"scheduler_tree_cache_pid{os.getpid()}_{timestamp}.txt",
+            )
+            with open(path, "w", encoding="utf-8") as f, redirect_stdout(f):
+                print(
+                    f"reason={reason} pid={os.getpid()} tp_rank={self.tp_rank} "
+                    f"pp_rank={self.pp_rank} dp_rank={self.dp_rank}"
+                )
+                pretty_print()
+            logger.error("Dumped scheduler tree cache before exit to %s", path)
+            return path
+        except Exception:
+            logger.exception("Failed to dump scheduler tree cache before exit")
+            return None
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -3897,6 +3928,14 @@ def configure_scheduler_process(
     setproctitle.setproctitle(f"sglang::scheduler{prefix.replace(' ', '_')}")
     faulthandler.enable()
 
+    def _sigterm_handler(signum, frame):
+        from sglang.srt.debug_utils.cuda_coredump import wait_before_process_exit
+
+        wait_before_process_exit("scheduler SIGTERM")
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     # Configure the logger
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
@@ -3951,6 +3990,7 @@ def run_scheduler_process(
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
+    scheduler = None
     try:
         scheduler = Scheduler(
             server_args,
@@ -3964,6 +4004,15 @@ def run_scheduler_process(
             dp_rank,
         )
 
+        def _sigterm_handler(signum, frame):
+            scheduler.dump_tree_cache_before_exit("scheduler SIGTERM")
+            from sglang.srt.debug_utils.cuda_coredump import wait_before_process_exit
+
+            wait_before_process_exit("scheduler SIGTERM")
+            sys.exit(128 + signum)
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
@@ -3973,4 +4022,9 @@ def run_scheduler_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
+        if scheduler is not None:
+            scheduler.dump_tree_cache_before_exit("scheduler exception")
+        from sglang.srt.debug_utils.cuda_coredump import wait_before_process_exit
+
+        wait_before_process_exit("scheduler exception")
         parent_process.send_signal(signal.SIGQUIT)

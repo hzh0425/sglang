@@ -179,6 +179,7 @@ class Envs:
     SGLANG_IS_IN_CI_AMD = EnvBool(False)
     SGLANG_CUDA_COREDUMP = EnvBool(False)
     SGLANG_CUDA_COREDUMP_DIR = EnvStr("/tmp/sglang_cuda_coredumps")
+    SGLANG_CUDA_COREDUMP_WAIT_SECS = EnvFloat(120)
     SGLANG_TEST_MAX_RETRY = EnvInt(None)
 
     # Constrained Decoding (Grammar)
@@ -573,6 +574,7 @@ class Envs:
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    SGLANG_HACK_DEBUG_DUMP_FP8_PAGED_MQA_LOGITS = EnvStr("/sgl-wrokspace/sglang/dump-kernel")
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
 
     # SWA radix cache

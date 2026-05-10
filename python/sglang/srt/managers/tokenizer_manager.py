@@ -2347,6 +2347,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.dump_requests_before_crash()
                 break
 
+        from sglang.srt.debug_utils.cuda_coredump import wait_before_process_exit
+
+        wait_before_process_exit("tokenizer manager SIGTERM")
         kill_process_tree(os.getpid(), include_parent=True)
         sys.exit(0)
 
@@ -2754,6 +2757,9 @@ class SignalHandler:
         if self.tokenizer_manager._subprocess_watchdog is not None:
             self.tokenizer_manager._subprocess_watchdog.stop()
         self.tokenizer_manager.dump_requests_before_crash()
+        from sglang.srt.debug_utils.cuda_coredump import wait_before_process_exit
+
+        wait_before_process_exit("tokenizer manager SIGQUIT")
         kill_process_tree(os.getpid())
 
 

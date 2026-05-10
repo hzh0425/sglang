@@ -62,7 +62,7 @@ def fp8_paged_mqa_logits_torch(
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
     for i in range(batch_size):
@@ -229,6 +229,99 @@ def fused_scale(
     return out
 
 
+_fp8_paged_mqa_logits_dumper = None
+_fp8_paged_mqa_logits_call_count = 0
+_fp8_paged_mqa_logits_last_meta = None
+
+
+def _get_fp8_paged_mqa_logits_dumper():
+    global _fp8_paged_mqa_logits_dumper
+    if _fp8_paged_mqa_logits_dumper is None:
+        from sglang.srt.debug_utils.mmap_dumper import MmapDumper
+
+        dump_dir = envs.SGLANG_HACK_DEBUG_DUMP_FP8_PAGED_MQA_LOGITS.get()
+        _fp8_paged_mqa_logits_dumper = MmapDumper(dump_dir or None)
+    return _fp8_paged_mqa_logits_dumper
+
+
+def _tensor_meta(tensor: Optional[torch.Tensor]) -> Optional[dict[str, Any]]:
+    if tensor is None:
+        return None
+    return {
+        "shape": list(tensor.shape),
+        "stride": list(tensor.stride()),
+        "dtype": str(tensor.dtype),
+        "device": str(tensor.device),
+        "is_contiguous": tensor.is_contiguous(),
+        "data_ptr": tensor.data_ptr(),
+    }
+
+
+def _maybe_capture_fp8_paged_mqa_logits_meta(
+    *,
+    kernel_impl: str,
+    layer_id: int,
+    q_fp8: torch.Tensor,
+    c4_indexer_kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    c4_seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_c4_seq_len: int,
+    clean_logits: bool,
+) -> None:
+    d = _get_fp8_paged_mqa_logits_dumper()
+    if not d.is_active():
+        return
+
+    global _fp8_paged_mqa_logits_call_count, _fp8_paged_mqa_logits_last_meta
+    _fp8_paged_mqa_logits_call_count += 1
+    _fp8_paged_mqa_logits_last_meta = {
+        "fp8_paged_mqa_call_count": _fp8_paged_mqa_logits_call_count,
+        "fp8_paged_mqa_kernel_impl": kernel_impl,
+        "fp8_paged_mqa_layer_id": layer_id,
+        "fp8_paged_mqa_max_c4_seq_len": max_c4_seq_len,
+        "fp8_paged_mqa_clean_logits": clean_logits,
+        "fp8_paged_mqa_current_device": torch.cuda.current_device(),
+        "fp8_paged_mqa_current_stream": torch.cuda.current_stream().cuda_stream,
+        "fp8_paged_mqa_q_meta": _tensor_meta(q_fp8),
+        "fp8_paged_mqa_kv_meta": _tensor_meta(c4_indexer_kv_cache),
+        "fp8_paged_mqa_weights_meta": _tensor_meta(weights),
+        "fp8_paged_mqa_seq_lens_meta": _tensor_meta(c4_seq_lens),
+        "fp8_paged_mqa_page_table_meta": _tensor_meta(page_table),
+        "fp8_paged_mqa_deep_gemm_metadata_meta": _tensor_meta(
+            deep_gemm_metadata if isinstance(deep_gemm_metadata, torch.Tensor) else None
+        ),
+        "fp8_paged_mqa_page_table_partial_cols": min(4096, page_table.shape[1]),
+    }
+
+
+def _maybe_sync_after_fp8_paged_mqa_logits(
+    *,
+    kernel_impl: str,
+    layer_id: int,
+    logits: torch.Tensor,
+) -> None:
+    d = _get_fp8_paged_mqa_logits_dumper()
+    if not d.is_active():
+        return
+
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        items = {
+            "fp8_paged_mqa_kernel_impl": kernel_impl,
+            "fp8_paged_mqa_layer_id": layer_id,
+            "fp8_paged_mqa_logits_meta": _tensor_meta(logits),
+            "fp8_paged_mqa_sync_status": "failed",
+            "fp8_paged_mqa_sync_exception": repr(exc),
+        }
+        if _fp8_paged_mqa_logits_last_meta is not None:
+            items.update(_fp8_paged_mqa_logits_last_meta)
+        d.dump(items)
+        raise
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -381,14 +474,31 @@ class C4IndexerBackendMixin:
             from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
+
+            kernel_impl = "tilelang"
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
+            kernel_impl = "torch"
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
+
+            kernel_impl = "deep_gemm"
 
         _c4sl = indexer_metadata.c4_seq_lens
         if _c4sl.dim() == 1:
             _c4sl = _c4sl.unsqueeze(-1)
+        _maybe_capture_fp8_paged_mqa_logits_meta(
+            kernel_impl=kernel_impl,
+            layer_id=c4_indexer.layer_id,
+            q_fp8=q_fp8,
+            c4_indexer_kv_cache=c4_indexer_kv_cache,
+            weights=weights,
+            c4_seq_lens=_c4sl,
+            page_table=indexer_metadata.page_table,
+            deep_gemm_metadata=indexer_metadata.deep_gemm_metadata,
+            max_c4_seq_len=indexer_metadata.max_c4_seq_len,
+            clean_logits=False,
+        )
         logits = fn(
             q_fp8,
             c4_indexer_kv_cache,
@@ -398,6 +508,11 @@ class C4IndexerBackendMixin:
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_c4_seq_len,
             False,
+        )
+        _maybe_sync_after_fp8_paged_mqa_logits(
+            kernel_impl=kernel_impl,
+            layer_id=c4_indexer.layer_id,
+            logits=logits,
         )
 
         assert indexer_metadata.page_table is core_metadata.page_table
