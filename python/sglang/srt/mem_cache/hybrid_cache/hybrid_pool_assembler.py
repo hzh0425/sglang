@@ -422,6 +422,19 @@ def attach_hybrid_pool_to_unified_cache(
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
     try:
+        storage_backend = server_args.hicache_storage_backend
+        storage_extra_config = None
+        storage_prefetch_threshold = 256
+        if storage_backend is not None:
+            (
+                storage_extra_config,
+                storage_prefetch_threshold,
+                _prefetch_timeout_base,
+                _prefetch_timeout_per_ki_token,
+                _pass_prefix_keys,
+            ) = HybridCacheController.parse_storage_backend_extra_config(
+                server_args.hicache_storage_backend_extra_config
+            )
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         swa_stack = isinstance(kvcache, SWAKVPool)
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
@@ -463,12 +476,16 @@ def attach_hybrid_pool_to_unified_cache(
                 load_cache_event=load_cache_event,
                 attn_cp_group=attn_cp_group,
                 attn_tp_group=attn_tp_group,
-                storage_backend=None,
+                storage_backend=storage_backend,
                 use_mla=use_mla,
                 host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
                 device_mamba_evict_fn=lambda n: cache.evict(EvictParams(mamba_num=n)),
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=storage_extra_config,
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
+                enable_storage_metrics=cache._enable_metrics_flag,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
@@ -505,14 +522,18 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
-                storage_backend=None,
+                storage_backend=storage_backend,
                 use_mla=False,
                 host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
                 device_swa_evict_fn=lambda n: cache.evict(
                     EvictParams(swa_num_tokens=n)
                 ),
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=storage_extra_config,
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
+                enable_storage_metrics=cache._enable_metrics_flag,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
@@ -538,7 +559,7 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
-                storage_backend=None,
+                storage_backend=storage_backend,
                 use_mla=use_mla,
                 shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                     full_kv_pool,
@@ -546,10 +567,14 @@ def attach_hybrid_pool_to_unified_cache(
                     server_args.hicache_mem_layout,
                     allocator_type=server_args.hicache_storage_backend,
                 ),
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=storage_extra_config,
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
                 attn_cp_rank=params.attn_cp_rank,
                 attn_cp_size=params.attn_cp_size,
+                enable_storage_metrics=cache._enable_metrics_flag,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
@@ -578,10 +603,14 @@ def attach_hybrid_pool_to_unified_cache(
                 load_cache_event=load_cache_event,
                 attn_cp_group=attn_cp_group,
                 attn_tp_group=attn_tp_group,
-                storage_backend=None,
+                storage_backend=storage_backend,
                 use_mla=use_mla,
+                prefetch_threshold=storage_prefetch_threshold,
+                model_name=server_args.served_model_name,
+                storage_backend_extra_config=storage_extra_config,
                 pp_rank=params.pp_rank,
                 pp_size=params.pp_size,
+                enable_storage_metrics=cache._enable_metrics_flag,
             )
             cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
             cache.host_pool_group = host_pool_group
