@@ -203,12 +203,20 @@ class MambaComponent(TreeComponent):
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal: tombstone Mamba + cascade.
+                #
+                # A no-child node can still be absent from evictable_device_leaves
+                # when another component (usually Full) is locked by an active
+                # request. In that case only Mamba is evictable: cascading would
+                # try to evict locked Full KV and violate lock_ref invariants.
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
-                self.cache._cascade_evict(x, self, tracker)
+                if len(x.children) > 0:
+                    self.cache._cascade_evict(x, self, tracker)
+                else:
+                    self.cache._update_evictable_leaf_sets(x)
                 x = x_next
 
     def acquire_component_lock(
@@ -517,10 +525,17 @@ class MambaComponent(TreeComponent):
                 # Host leaf: atomic eviction (all components host + delete)
                 self.cache._evict_host_leaf(x, tracker)
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal: tombstone Mamba + cascade. If this is a host leaf
+                # protected by another component's host lock, only host Mamba is
+                # evictable.
                 assert cd.host_value is not None
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.HOST, tracker=tracker
                 )
-                self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
+                if len(x.children) > 0:
+                    self.cache._cascade_evict(
+                        x, self, tracker, target=EvictLayer.HOST
+                    )
+                else:
+                    self.cache._update_evictable_leaf_sets(x)
             x = x_next
