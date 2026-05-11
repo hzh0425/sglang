@@ -148,9 +148,20 @@ class FullComponent(TreeComponent):
                 heapq.heappush(heap, (x.parent.last_access_time, x.parent))
 
     def acquire_component_lock(
-        self, node: UnifiedTreeNode, result: IncLockRefResult
+        self,
+        node: UnifiedTreeNode,
+        result: IncLockRefResult,
+        lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                return result
+            cd.host_lock_ref += 1
+            self.cache._update_evictable_leaf_sets(node)
+            return result
+
         root = self.cache.root_node
         delta = 0
         cur = node
@@ -170,9 +181,20 @@ class FullComponent(TreeComponent):
         return result
 
     def release_component_lock(
-        self, node: UnifiedTreeNode, params: Optional[DecLockRefParams]
+        self,
+        node: UnifiedTreeNode,
+        params: Optional[DecLockRefParams],
+        lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+        if lock_host:
+            cd = node.component_data[ct]
+            if cd.host_value is None or cd.host_lock_ref == 0:
+                return
+            cd.host_lock_ref -= 1
+            self.cache._update_evictable_leaf_sets(node)
+            return
+
         root = self.cache.root_node
         cur = node
         while cur != root:
@@ -235,6 +257,7 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         phase: CacheTransferPhase,
         transfers: list[PoolTransfer] = (),
+        **kw,
     ) -> None:
         ct = self.component_type
 
