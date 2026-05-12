@@ -115,6 +115,12 @@ def parse_args():
         help="If set, only send i-th turn requests after all (i-1)-th turn requests finished.",
     )
     parser.add_argument(
+        "--round-barrier-sleep",
+        type=float,
+        default=10.0,
+        help="Seconds to wait after a barrier round completes before releasing the next round.",
+    )
+    parser.add_argument(
         "--sub-question-input-length",
         type=int,
         default=0,
@@ -369,6 +375,7 @@ class WorkloadGenerator:
             "generated_len": [],
         }
         self.enable_round_barrier = args.enable_round_barrier
+        self.round_barrier_sleep = args.round_barrier_sleep
         if self.enable_round_barrier:
             # Add round-specific metrics while preserving the original structure
             for i in range(self.max_rounds):
@@ -530,7 +537,7 @@ class WorkloadGenerator:
                             f"requests for round {current_barrier_round + 1}"
                         )
                         self._send_heartbeat(input_len=100, output_len=100)
-                        time.sleep(10)
+                        time.sleep(self.round_barrier_sleep)
                         for req in next_round_reqs:
                             self.ready_queue.append(req)
                         next_round_reqs = []
