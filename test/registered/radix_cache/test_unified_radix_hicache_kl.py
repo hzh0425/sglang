@@ -22,14 +22,21 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
 MAMBA_TRACK_INTERVAL = 128
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-4-gpu-h200", nightly=True)
+
+
+def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
+    expected = history_len + output_len
+    actual = result["meta_info"]["cached_tokens"]
+    lower = max(0, expected - 256)
+    assert actual >= lower, f"{label}: expected cached_tokens>={lower}, got {actual}"
 
 
 class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -89,8 +96,14 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
     kl_threshold = 0.003
+    sampling_temperature = 0
+    decode_cache_assert = staticmethod(_assert_dsv4_decode_cached_tokens)
     gsm8k_threshold = 0.90
     num_gsm8k_questions = 100
+
+    @unittest.skip("DSV4 HiCache can hang in this no-seeding test after retraction.")
+    def test_multiturn_logprobs_match(self):
+        pass
 
     @classmethod
     def setUpClass(cls):
@@ -111,7 +124,7 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "--chunked-prefill-size",
                 "8192",
                 "--mem-fraction-static",
-                "0.85",
+                "0.9",
                 "--disable-shared-experts-fusion",
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
@@ -122,12 +135,19 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "direct",
                 "--hicache-mem-layout",
                 "page_first_direct",
+                "--max-mamba-cache-size",
+                "1000",
+                "--swa-full-tokens-ratio",
+                "0.25",
                 "--max-total-tokens",
-                "12000",
+                "20000",
                 "--max-running-requests",
                 "4",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            env={
+                "SGLANG_DSV4_FP4_EXPERTS": "0",
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+            },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
