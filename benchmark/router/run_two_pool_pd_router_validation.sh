@@ -1,214 +1,207 @@
+#!/usr/bin/env bash
 
+set -euo pipefail
 
-真实验收部署使用 `Qwen/Qwen3-32B`，不经过 GMS，只启动最新的 lightweight router：
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROUTER_MANIFEST="${ROOT_DIR}/rust/sglang-light-router/Cargo.toml"
 
-```text
-lightweight router
-  -> short PD：1 个 short prefill + 1 个 short decode，共 2 GPU
-  -> long PD：1 个 long prefill + 1 个 long decode，共 2 GPU
-```
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-32B}"
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-32B}"
+TP="${TP:-1}"
+RDMA_DEVICES="${RDMA_DEVICES:-}"
 
-也就是整体验收形态是 1 个 router 进程 + 2 套 PD pool，共 4 张 GPU。这里默认每个 prefill/decode role 使用 `TP=1`。如果某台机器上 `Qwen/Qwen3-32B` 需要单 role `TP=2` 才能放下，脚本允许覆盖 TP，但那会变成每套 PD 4 GPU、两套共 8 GPU，不再是本阶段的 4 GPU 验收形态。
+SHORT_PREFILL_PORT="${SHORT_PREFILL_PORT:-30000}"
+SHORT_DECODE_PORT="${SHORT_DECODE_PORT:-31000}"
+LONG_PREFILL_PORT="${LONG_PREFILL_PORT:-30001}"
+LONG_DECODE_PORT="${LONG_DECODE_PORT:-31001}"
+SHORT_BOOTSTRAP_PORT="${SHORT_BOOTSTRAP_PORT:-8998}"
+LONG_BOOTSTRAP_PORT="${LONG_BOOTSTRAP_PORT:-8999}"
+ROUTER_PORT="${ROUTER_PORT:-20000}"
 
-Router 按请求特征先选池，再在池内选 engine：
+SHORT_PREFILL_CUDA_VISIBLE_DEVICES="${SHORT_PREFILL_CUDA_VISIBLE_DEVICES:-0}"
+SHORT_DECODE_CUDA_VISIBLE_DEVICES="${SHORT_DECODE_CUDA_VISIBLE_DEVICES:-1}"
+LONG_PREFILL_CUDA_VISIBLE_DEVICES="${LONG_PREFILL_CUDA_VISIBLE_DEVICES:-2}"
+LONG_DECODE_CUDA_VISIBLE_DEVICES="${LONG_DECODE_CUDA_VISIBLE_DEVICES:-3}"
 
-另外需要增加一个调试统计接口，供 `bench_serving` 后做自动验收：
+PREFILL_LONG_THRESHOLD="${PREFILL_LONG_THRESHOLD:-512}"
+DECODE_LONG_THRESHOLD="${DECODE_LONG_THRESHOLD:-512}"
+GSM8K_MIN_ACCURACY="${GSM8K_MIN_ACCURACY:-0.50}"
+MMLU_MIN_SCORE="${MMLU_MIN_SCORE:-0.50}"
+RUN_ACCURACY_EVALS="${RUN_ACCURACY_EVALS:-1}"
 
-```text
-GET /debug/routing_stats
-```
+LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/router/light_router_logs}"
+mkdir -p "$LOG_DIR"
 
-建议返回结构：
+pids=()
 
-```json
-{
-  "route_counts": {
-    "prefill=short,decode=short": 128,
-    "prefill=long,decode=long": 128
-  },
-  "policy_counts": {
-    "prefill": {
-      "sticky_hit": 1,
-      "load_based_fallback": 255
-    },
-    "decode": {
-      "sticky_hit": 1,
-      "load_based_fallback": 255
-    }
-  },
-  "engines": [
-    {
-      "id": "short-prefill-0",
-      "role": "prefill",
-      "group": "short",
-      "url": "http://127.0.0.1:30000",
-      "local_dispatch_total": 128,
-      "in_flight_requests": 0,
-      "reported_total_tokens": 1024,
-      "reported_token_usage": 0.01,
-      "last_load_poll_ok": true
-    }
-  ]
+die() {
+  echo "error: $*" >&2
+  exit 1
 }
-```
 
-`bench_serving` 默认不会保留每个响应的 routing debug header，所以批量压测后的正确性不要靠人工读日志，而是靠这个接口断言：
+cleanup() {
+  for pid in "${pids[@]:-}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+}
+trap cleanup EXIT
 
-- short benchmark 的增量主要落在 `prefill=short,decode=short`。
-- long benchmark 的增量主要落在 `prefill=long,decode=long`。
-- `sticky_hit` 和 `load_based_fallback` 都至少出现过。
-- 每个 engine 都有 dispatch 计数和最近一次 workload snapshot。
+split_gpu_ids() {
+  local raw="$1"
+  tr ',' '\n' <<<"$raw" | sed '/^[[:space:]]*$/d'
+}
 
-## Qwen32B 双池 PD 启动方式
+check_gpu_ids_unique() {
+  local all_ids duplicate
+  all_ids="$(
+    split_gpu_ids "$SHORT_PREFILL_CUDA_VISIBLE_DEVICES"
+    split_gpu_ids "$SHORT_DECODE_CUDA_VISIBLE_DEVICES"
+    split_gpu_ids "$LONG_PREFILL_CUDA_VISIBLE_DEVICES"
+    split_gpu_ids "$LONG_DECODE_CUDA_VISIBLE_DEVICES"
+  )"
+  duplicate="$(sort <<<"$all_ids" | uniq -d | head -n 1)"
+  [[ -z "$duplicate" ]] || die "GPU id ${duplicate} is assigned to multiple roles"
+}
 
-本节是写完 router 代码后的自验证部署方式，不包括 GMS。启动顺序必须是：
+wait_http() {
+  local name="$1"
+  local url="$2"
+  local timeout_secs="${3:-600}"
+  local start
+  start="$(date +%s)"
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( "$(date +%s)" - start > timeout_secs )); then
+      die "${name} did not become ready at ${url}"
+    fi
+    sleep 2
+  done
+}
 
-```text
-short prefill -> short decode -> long prefill -> long decode -> lightweight router -> smoke test -> bench_serving
-```
+common_sglang_args() {
+  local args=(
+    python3 -m sglang.launch_server
+    --model-path "$MODEL_PATH"
+    --served-model-name "$MODEL_NAME"
+    --trust-remote-code
+    --page-size 64
+    --tp "$TP"
+    --mem-fraction-static 0.85
+    --nnodes 1
+    --node-rank 0
+  )
+  if [[ -n "$RDMA_DEVICES" ]]; then
+    args+=(--disaggregation-ib-device "$RDMA_DEVICES")
+  fi
+  printf '%q ' "${args[@]}"
+}
 
-推荐直接使用脚本：
+start_prefill() {
+  local name="$1"
+  local gpu="$2"
+  local port="$3"
+  local bootstrap_port="$4"
+  local dist_init_addr="$5"
+  local log_file="${LOG_DIR}/${name}.log"
+  local common
+  common="$(common_sglang_args)"
+  CUDA_VISIBLE_DEVICES="$gpu" bash -lc "${common} --port ${port} --prefill-round-robin-balance --disaggregation-mode prefill --disaggregation-bootstrap-port ${bootstrap_port} --dist-init-addr ${dist_init_addr}" >"$log_file" 2>&1 &
+  pids+=("$!")
+}
 
-```bash
-SHORT_PREFILL_CUDA_VISIBLE_DEVICES=0 \
-SHORT_DECODE_CUDA_VISIBLE_DEVICES=1 \
-LONG_PREFILL_CUDA_VISIBLE_DEVICES=2 \
-LONG_DECODE_CUDA_VISIBLE_DEVICES=3 \
-bash benchmark/router/run_two_pool_pd_router_validation.sh
-```
+start_decode() {
+  local name="$1"
+  local gpu="$2"
+  local port="$3"
+  local dist_init_addr="$4"
+  local prefill_url="$5"
+  local log_file="${LOG_DIR}/${name}.log"
+  local common
+  common="$(common_sglang_args)"
+  CUDA_VISIBLE_DEVICES="$gpu" bash -lc "${common} --port ${port} --disaggregation-mode decode --dist-init-addr ${dist_init_addr} --prefill-server-url ${prefill_url}" >"$log_file" 2>&1 &
+  pids+=("$!")
+}
 
-上面的 GPU id 只是示例。实际运行前必须先用 `nvidia-smi` 确认这 4 张卡空闲。
+start_router() {
+  local log_file="${LOG_DIR}/router.log"
+  cargo run --release --manifest-path "$ROUTER_MANIFEST" --bin sglang-light-router -- \
+    --pd-disaggregation \
+    --prefill "short=http://127.0.0.1:${SHORT_PREFILL_PORT},bootstrap=${SHORT_BOOTSTRAP_PORT}" \
+    --decode "short=http://127.0.0.1:${SHORT_DECODE_PORT}" \
+    --prefill "long=http://127.0.0.1:${LONG_PREFILL_PORT},bootstrap=${LONG_BOOTSTRAP_PORT}" \
+    --decode "long=http://127.0.0.1:${LONG_DECODE_PORT}" \
+    --prefill-long-threshold "$PREFILL_LONG_THRESHOLD" \
+    --decode-long-threshold "$DECODE_LONG_THRESHOLD" \
+    --enable-routing-debug-headers \
+    --port "$ROUTER_PORT" >"$log_file" 2>&1 &
+  pids+=("$!")
+}
 
-脚本默认模型：
+chat_request() {
+  local prompt="$1"
+  local max_tokens="$2"
+  curl -fsS "http://127.0.0.1:${ROUTER_PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -H 'X-SGLang-Routing-Key: validation' \
+    -d "{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}],\"max_tokens\":${max_tokens}}"
+}
 
-```text
-MODEL_PATH=Qwen/Qwen3-32B
-MODEL_NAME=Qwen/Qwen3-32B
-```
+run_smoke_tests() {
+  chat_request "short validation request" 16 >/dev/null
+  chat_request "$(printf 'long %.0s' {1..700})" 32 >/dev/null
+}
 
-脚本默认端口：
+run_accuracy_evals() {
+  [[ "$RUN_ACCURACY_EVALS" == "1" ]] || return 0
+  python3 "${ROOT_DIR}/benchmark/gsm8k/bench_sglang.py" \
+    --port "$ROUTER_PORT" \
+    --num-questions 500 \
+    --num-shots 24 \
+    --parallel 50 >"${LOG_DIR}/gsm8k.out" 2>&1
+  python3 -m sglang.test.run_eval \
+    --eval-name mmlu \
+    --port "$ROUTER_PORT" \
+    --num-examples 200 \
+    --max-tokens 4096 \
+    --repeat 4 >"${LOG_DIR}/mmlu.out" 2>&1
+  python3 - "$GSM8K_MIN_ACCURACY" "$MMLU_MIN_SCORE" "${LOG_DIR}/gsm8k.out" "${LOG_DIR}/mmlu.out" <<'PY'
+import re
+import sys
 
-```text
-short prefill: 30000
-short decode : 31000
-long prefill : 30001
-long decode  : 31001
-router       : 20000
-```
+gsm_min = float(sys.argv[1])
+mmlu_min = float(sys.argv[2])
+gsm_text = open(sys.argv[3], encoding="utf-8").read()
+mmlu_text = open(sys.argv[4], encoding="utf-8").read()
 
-单套 PD 的启动命令形态如下。short 和 long 的区别只有端口、bootstrap port、dist init addr 和 GPU 绑定不同。
+gsm_match = re.search(r"Accuracy:\s*([0-9.]+)", gsm_text)
+if not gsm_match or float(gsm_match.group(1)) < gsm_min:
+    raise SystemExit("GSM8K accuracy below threshold or missing")
 
-Prefill：
+mmlu_match = re.search(r"(?:Score|mean):\s*([0-9.]+)", mmlu_text)
+if not mmlu_match or float(mmlu_match.group(1)) < mmlu_min:
+    raise SystemExit("MMLU score below threshold or missing")
+PY
+}
 
-```bash
-CUDA_VISIBLE_DEVICES=<PREFILL_GPU> python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3-32B \
-  --trust-remote-code \
-  --page-size 64 \
-  --port <PREFILL_PORT> \
-  --tp 1 \
-  --mem-fraction-static 0.85 \
-  --prefill-round-robin-balance \
-  --disaggregation-mode prefill \
-  --disaggregation-bootstrap-port <BOOTSTRAP_PORT> \
-  --disaggregation-ib-device <RDMA_DEVICES> \
-  --dist-init-addr <DIST_INIT_ADDR> \
-  --nnodes 1 \
-  --node-rank 0
-```
+main() {
+  [[ -f "$ROUTER_MANIFEST" ]] || die "router manifest not found: ${ROUTER_MANIFEST}"
+  check_gpu_ids_unique
 
-Decode：
+  start_prefill "short-prefill" "$SHORT_PREFILL_CUDA_VISIBLE_DEVICES" "$SHORT_PREFILL_PORT" "$SHORT_BOOTSTRAP_PORT" "127.0.0.1:26000"
+  wait_http "short prefill" "http://127.0.0.1:${SHORT_PREFILL_PORT}/health"
+  start_decode "short-decode" "$SHORT_DECODE_CUDA_VISIBLE_DEVICES" "$SHORT_DECODE_PORT" "127.0.0.1:26100" "http://127.0.0.1:${SHORT_PREFILL_PORT}"
+  wait_http "short decode" "http://127.0.0.1:${SHORT_DECODE_PORT}/health"
 
-```bash
-CUDA_VISIBLE_DEVICES=<DECODE_GPU> python3 -m sglang.launch_server \
-  --model-path Qwen/Qwen3-32B \
-  --trust-remote-code \
-  --page-size 64 \
-  --port <DECODE_PORT> \
-  --tp 1 \
-  --mem-fraction-static 0.85 \
-  --disaggregation-mode decode \
-  --load-balance-method round_robin \
-  --prefill-round-robin-balance \
-  --disaggregation-bootstrap-port <BOOTSTRAP_PORT> \
-  --disaggregation-ib-device <RDMA_DEVICES> \
-  --dist-init-addr <DIST_INIT_ADDR> \
-  --nnodes 1 \
-  --node-rank 0
-```
+  start_prefill "long-prefill" "$LONG_PREFILL_CUDA_VISIBLE_DEVICES" "$LONG_PREFILL_PORT" "$LONG_BOOTSTRAP_PORT" "127.0.0.1:26200"
+  wait_http "long prefill" "http://127.0.0.1:${LONG_PREFILL_PORT}/health"
+  start_decode "long-decode" "$LONG_DECODE_CUDA_VISIBLE_DEVICES" "$LONG_DECODE_PORT" "127.0.0.1:26300" "http://127.0.0.1:${LONG_PREFILL_PORT}"
+  wait_http "long decode" "http://127.0.0.1:${LONG_DECODE_PORT}/health"
 
-Router：
+  start_router
+  wait_http "router" "http://127.0.0.1:${ROUTER_PORT}/health"
+  run_smoke_tests
+  run_accuracy_evals
+}
 
-```bash
-python3 -m sglang_router.launch_lightweight_router \
-  --pd-disaggregation \
-  --prefill short=http://127.0.0.1:30000:8998 \
-  --decode short=http://127.0.0.1:31000 \
-  --prefill long=http://127.0.0.1:30001:8999 \
-  --decode long=http://127.0.0.1:31001 \
-  --prefill-routing-policy-chain sticky,power_of_two \
-  --decode-routing-policy-chain sticky,power_of_two \
-  --prefill-long-threshold 512 \
-  --decode-long-threshold 512 \
-  --balance-abs-threshold 32 \
-  --balance-relative-upper-bound-limit 3.0 \
-  --load-score-token-usage-weight 1.0 \
-  --enable-routing-debug-headers \
-  --port 20000
-```
-
-这里的 threshold 故意设成 `512`，是为了让真实验证里用较短的 random benchmark 也能稳定打到 long pool。生产默认值可以再调回 `32768` 或由部署配置决定。
-
-写完 router 代码后，开发者必须自行完成以下验证：
-
-```bash
-SHORT_PREFILL_CUDA_VISIBLE_DEVICES=<GPU0> \
-SHORT_DECODE_CUDA_VISIBLE_DEVICES=<GPU1> \
-LONG_PREFILL_CUDA_VISIBLE_DEVICES=<GPU2> \
-LONG_DECODE_CUDA_VISIBLE_DEVICES=<GPU3> \
-bash benchmark/router/run_two_pool_pd_router_validation.sh
-```
-
-验证脚本会做三类检查：
-
-- smoke test：通过 `/v1/chat/completions` 检查 short/long group dispatch 和 sticky repeat。
-- benchmark test：用 `python3 -m sglang.bench_serving` 分别发短负载和长负载。
-- stats test：读取 `/debug/routing_stats`，检查 policy chain、group dispatch 和 engine workload 采集是否正确。
-
-## 验收标准
-
-- AC-9：真实 Qwen32B 双池部署可以启动。
-  - 正向测试：`Qwen/Qwen3-32B` 下启动 lightweight router + short PD + long PD。
-  - 正向测试：short PD 占 2 GPU，long PD 占 2 GPU，总共 4 GPU。
-  - 反向测试：任意 GPU id 重叠时，验证脚本必须在 server launch 前失败。
-
-- AC-10：`bench_serving` 可以验证长短负载分发。
-  - 正向测试：短负载 benchmark 后，`/debug/routing_stats` 中 `prefill=short,decode=short` 计数增加。
-  - 正向测试：长负载 benchmark 后，`/debug/routing_stats` 中 `prefill=long,decode=long` 计数增加。
-  - 反向测试：长负载在 long pool 健康时不能主要落到 short pool。
-
-- AC-11：policy chain 和 workload collection 可观测。
-  - 正向测试：同一 sticky key 的第二次请求出现 `sticky_hit`。
-  - 正向测试：无 sticky key 或 sticky 被拒绝时出现 `load_based_fallback`。
-  - 正向测试：每个 engine 都能看到 dispatch 计数、本地 in-flight 计数和最近一次 `/v1/loads?include=core` 轮询结果。
-  - 反向测试：缺少 `/debug/routing_stats` 时，真实验证脚本必须失败。
-
-## 路径边界
-- 通过 `/v1/chat/completions` 做基础正确性 smoke test。
-- 通过 `bench_serving` 分别压 short workload 和 long workload。
-- 通过 `/debug/routing_stats` 验证 route counts、policy counts 和 engine workload snapshots。
-
-- 检查 debug routing headers
-- 运行 short `bench_serving`
-- 运行 long `bench_serving`
-- 检查 `/debug/routing_stats`
-
-
-- `MODEL_PATH`
-- 各角色 GPU ids
-
-这些需要在真实机器上替换或通过环境变量导入。
-`MODEL_PATH` 默认是 `Qwen/Qwen3-32B`。GPU ids 需要在真实机器上替换或通过环境变量导入。
-
-- 优先兼容现有 `X-SMG-Routing-Key`。
-
+main "$@"
