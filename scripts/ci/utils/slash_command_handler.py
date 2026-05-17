@@ -589,6 +589,20 @@ def _extract_runner_config(content):
     return None, None
 
 
+def _extract_legacy_cuda_suite(args_str):
+    if not args_str:
+        return None
+    m = re.search(r'suite\s*=\s*["\']([^"\']+)["\']', args_str)
+    return m.group(1) if m else None
+
+
+def _runner_config_from_legacy_cuda_suite(suite):
+    if not suite or "-test-" not in suite:
+        return None
+    stage, runner_config = suite.split("-test-", 1)
+    return runner_config if stage and runner_config else None
+
+
 def detect_suite(file_path_from_test):
     """
     Read a test file and extract dispatch info from register_cuda_ci or
@@ -620,6 +634,11 @@ def detect_suite(file_path_from_test):
         }
 
     rc, args_str = _extract_runner_config(content)
+    legacy_suite = None
+    if not rc:
+        legacy_suite = _extract_legacy_cuda_suite(args_str)
+        rc = _runner_config_from_legacy_cuda_suite(legacy_suite)
+
     if rc:
         configs = _runner_configs.load()
         cfg = configs.get(rc)
@@ -645,8 +664,11 @@ def detect_suite(file_path_from_test):
         # so always pick the non-kernel b200 pool.
         if runs_on == "$b200_runner":
             runs_on = _B200_DEFAULT_RUNNER
-        stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
-        suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
+        if legacy_suite:
+            suite = legacy_suite
+        else:
+            stage_m = re.search(r'stage\s*=\s*["\']([^"\']+)["\']', args_str)
+            suite = f"{stage_m.group(1)}-test-{rc}" if stage_m else rc
         return {
             "suite": suite,
             "runner_label": runs_on,
@@ -656,6 +678,15 @@ def detect_suite(file_path_from_test):
             "is_cpu": False,
             "error": None,
         }
+
+    if legacy_suite:
+        return _err(
+            legacy_suite,
+            f"Unsupported legacy CUDA suite `{legacy_suite}` in `{full_path}`. "
+            "Only PR suites shaped like `<stage>-test-<runner_config>` can be "
+            "resolved by /rerun-test; nightly/weekly suites are not dispatchable "
+            "through this command.",
+        )
 
     if re.search(r"^[^#\n]*register_cpu_ci\s*\(", content, re.MULTILINE):
         return {
@@ -670,9 +701,10 @@ def detect_suite(file_path_from_test):
 
     return _err(
         None,
-        f"No `register_cuda_ci(runner_config=...)` or `register_cpu_ci()` "
+        f"No `register_cuda_ci(runner_config=...)`, supported legacy "
+        f"`register_cuda_ci(suite=...)`, or `register_cpu_ci()` "
         f"found in `{full_path}`. /rerun-test only supports tests registered "
-        f"via the new-style yml-driven API; nightly/weekly tests aren't "
+        f"via the new-style yml-driven API or PR-shaped legacy suites; nightly/weekly tests aren't "
         f"dispatchable through this command.",
     )
 

@@ -660,7 +660,6 @@ class SamplingParams:
                 raise
 
         user_kwargs = dict(kwargs)
-        user_kwargs.pop("diffusers_kwargs", None)
 
         user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor

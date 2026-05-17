@@ -279,6 +279,34 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertIn("width", explicit_fields)
         self.assertIn("height", explicit_fields)
 
+    def test_cli_path_preserves_diffusers_kwargs(self):
+        server_args = MagicMock()
+        server_args.backend = "sglang"
+        server_args.model_id = None
+        server_args.pipeline_config = MagicMock()
+        diffusers_kwargs = {"output_type": "latent", "clip_skip": 2}
+
+        with patch.object(
+            SamplingParams,
+            "from_pretrained",
+            side_effect=lambda *args, **kwargs: DiffusersGenericSamplingParams(),
+        ):
+            params = SamplingParams.from_user_sampling_params_args(
+                "dummy-model",
+                server_args=server_args,
+                prompt="p",
+                image_path="/tmp/in.png",
+                diffusers_kwargs=diffusers_kwargs,
+            )
+
+        self.assertEqual(params.diffusers_kwargs, diffusers_kwargs)
+        self.assertEqual(
+            params.build_request_extra()["diffusers_kwargs"], diffusers_kwargs
+        )
+        self.assertIn(
+            "diffusers_kwargs", set(params.build_request_extra()["explicit_fields"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
