@@ -27,6 +27,9 @@ PREFILL_LONG_THRESHOLD="${PREFILL_LONG_THRESHOLD:-512}"
 DECODE_LONG_THRESHOLD="${DECODE_LONG_THRESHOLD:-512}"
 GSM8K_MIN_ACCURACY="${GSM8K_MIN_ACCURACY:-0.50}"
 MMLU_MIN_SCORE="${MMLU_MIN_SCORE:-0.50}"
+BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-32}"
+BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-4}"
+RUN_BENCH_SERVING="${RUN_BENCH_SERVING:-1}"
 RUN_ACCURACY_EVALS="${RUN_ACCURACY_EVALS:-1}"
 
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/benchmark/router/light_router_logs}"
@@ -115,11 +118,10 @@ start_decode() {
   local gpu="$2"
   local port="$3"
   local dist_init_addr="$4"
-  local prefill_url="$5"
   local log_file="${LOG_DIR}/${name}.log"
   local common
   common="$(common_sglang_args)"
-  CUDA_VISIBLE_DEVICES="$gpu" bash -lc "${common} --port ${port} --disaggregation-mode decode --dist-init-addr ${dist_init_addr} --prefill-server-url ${prefill_url}" >"$log_file" 2>&1 &
+  CUDA_VISIBLE_DEVICES="$gpu" bash -lc "${common} --port ${port} --disaggregation-mode decode --dist-init-addr ${dist_init_addr}" >"$log_file" 2>&1 &
   pids+=("$!")
 }
 
@@ -141,15 +143,156 @@ start_router() {
 chat_request() {
   local prompt="$1"
   local max_tokens="$2"
+  local headers_file="$3"
+  local body_file="$4"
   curl -fsS "http://127.0.0.1:${ROUTER_PORT}/v1/chat/completions" \
+    -D "$headers_file" \
+    -o "$body_file" \
     -H 'Content-Type: application/json' \
     -H 'X-SGLang-Routing-Key: validation' \
     -d "{\"model\":\"${MODEL_NAME}\",\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}],\"max_tokens\":${max_tokens}}"
 }
 
+header_value() {
+  local headers_file="$1"
+  local header_name="$2"
+  grep -i "^${header_name}:" "$headers_file" | tail -n 1 | sed -E 's/^[^:]+:[[:space:]]*//; s/\r$//'
+}
+
+assert_header_equals() {
+  local headers_file="$1"
+  local header_name="$2"
+  local expected="$3"
+  local actual
+  actual="$(header_value "$headers_file" "$header_name")"
+  [[ "$actual" == "$expected" ]] || die "expected ${header_name}=${expected}, got ${actual:-<missing>}"
+}
+
 run_smoke_tests() {
-  chat_request "short validation request" 16 >/dev/null
-  chat_request "$(printf 'long %.0s' {1..700})" 32 >/dev/null
+  local short_headers="${LOG_DIR}/short_smoke.headers"
+  local short_body="${LOG_DIR}/short_smoke.json"
+  local long_headers="${LOG_DIR}/long_smoke.headers"
+  local long_body="${LOG_DIR}/long_smoke.json"
+
+  chat_request "short validation request" 16 "$short_headers" "$short_body"
+  assert_header_equals "$short_headers" "x-sglang-prefill-group" "short"
+  assert_header_equals "$short_headers" "x-sglang-decode-group" "short"
+  assert_header_equals "$short_headers" "x-sglang-prefill-policy-branch" "load_based_fallback"
+  assert_header_equals "$short_headers" "x-sglang-decode-policy-branch" "load_based_fallback"
+
+  chat_request "$(printf 'long %.0s' {1..700})" 32 "$long_headers" "$long_body"
+  assert_header_equals "$long_headers" "x-sglang-prefill-group" "long"
+  assert_header_equals "$long_headers" "x-sglang-decode-group" "long"
+}
+
+fetch_stats() {
+  local output_file="$1"
+  curl -fsS "http://127.0.0.1:${ROUTER_PORT}/debug/routing_stats" -o "$output_file"
+}
+
+assert_stats_contract() {
+  local stats_file="$1"
+  local min_short_routes="$2"
+  local min_long_routes="$3"
+  python3 - "$stats_file" "$min_short_routes" "$min_long_routes" <<'PY'
+import json
+import sys
+
+stats_path = sys.argv[1]
+min_short = int(sys.argv[2])
+min_long = int(sys.argv[3])
+stats = json.load(open(stats_path, encoding="utf-8"))
+
+routes = stats.get("route_counts", {})
+if routes.get("prefill=short,decode=short", 0) < min_short:
+    raise SystemExit("short route count below expected minimum")
+if routes.get("prefill=long,decode=long", 0) < min_long:
+    raise SystemExit("long route count below expected minimum")
+unexpected_routes = {
+    key: value
+    for key, value in routes.items()
+    if key not in {"prefill=short,decode=short", "prefill=long,decode=long"}
+    and value > 0
+}
+if unexpected_routes:
+    raise SystemExit(f"unexpected route counts indicate wrong-group routing: {unexpected_routes}")
+
+policy_counts = stats.get("policy_counts", {})
+for role in ("prefill", "decode"):
+    if role not in policy_counts:
+        raise SystemExit(f"missing policy counts for {role}")
+    if not policy_counts[role]:
+        raise SystemExit(f"empty policy counts for {role}")
+
+engines = stats.get("engines", [])
+required_ids = {
+    "short-prefill-0",
+    "short-decode-0",
+    "long-prefill-1",
+    "long-decode-1",
+}
+seen = {engine.get("id"): engine for engine in engines}
+missing = required_ids - set(seen)
+if missing:
+    raise SystemExit(f"missing engine stats: {sorted(missing)}")
+
+for engine_id, engine in seen.items():
+    if engine_id in required_ids and engine.get("local_dispatch_total", 0) <= 0:
+        raise SystemExit(f"{engine_id} has no local dispatches")
+    if engine_id in required_ids and "last_load_poll_ok" not in engine:
+        raise SystemExit(f"{engine_id} missing last_load_poll_ok")
+    if engine_id in required_ids and engine.get("last_load_poll_ok") is not True:
+        raise SystemExit(f"{engine_id} load polling has not succeeded")
+    if engine_id in required_ids and "reported_token_usage" not in engine:
+        raise SystemExit(f"{engine_id} missing reported_token_usage")
+    if engine_id in required_ids and engine.get("reported_token_usage") is None:
+        raise SystemExit(f"{engine_id} missing parsed token usage")
+    if engine_id in required_ids and engine.get("reported_total_tokens") is None:
+        raise SystemExit(f"{engine_id} missing parsed total tokens")
+PY
+}
+
+wait_for_stats_contract() {
+  local stats_file="${LOG_DIR}/routing_stats.json"
+  local start
+  start="$(date +%s)"
+  until fetch_stats "$stats_file" && assert_stats_contract "$stats_file" 1 1; do
+    if (( "$(date +%s)" - start > 60 )); then
+      die "router stats did not satisfy smoke contract"
+    fi
+    sleep 2
+  done
+}
+
+run_bench_serving() {
+  [[ "$RUN_BENCH_SERVING" == "1" ]] || return 0
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model "$MODEL_NAME" \
+    --dataset-name random \
+    --host 127.0.0.1 \
+    --port "$ROUTER_PORT" \
+    --num-prompts "$BENCH_NUM_PROMPTS" \
+    --request-rate "$BENCH_REQUEST_RATE" \
+    --random-input 128 \
+    --random-output 64 \
+    --output-file "${LOG_DIR}/bench_short.jsonl" >"${LOG_DIR}/bench_short.out" 2>&1
+
+  python3 -m sglang.bench_serving \
+    --backend sglang \
+    --model "$MODEL_NAME" \
+    --dataset-name random \
+    --host 127.0.0.1 \
+    --port "$ROUTER_PORT" \
+    --num-prompts "$BENCH_NUM_PROMPTS" \
+    --request-rate "$BENCH_REQUEST_RATE" \
+    --random-input 700 \
+    --random-output 128 \
+    --output-file "${LOG_DIR}/bench_long.jsonl" >"${LOG_DIR}/bench_long.out" 2>&1
+
+  fetch_stats "${LOG_DIR}/routing_stats_after_bench.json"
+  assert_stats_contract "${LOG_DIR}/routing_stats_after_bench.json" 2 2
 }
 
 run_accuracy_evals() {
@@ -190,17 +333,19 @@ main() {
 
   start_prefill "short-prefill" "$SHORT_PREFILL_CUDA_VISIBLE_DEVICES" "$SHORT_PREFILL_PORT" "$SHORT_BOOTSTRAP_PORT" "127.0.0.1:26000"
   wait_http "short prefill" "http://127.0.0.1:${SHORT_PREFILL_PORT}/health"
-  start_decode "short-decode" "$SHORT_DECODE_CUDA_VISIBLE_DEVICES" "$SHORT_DECODE_PORT" "127.0.0.1:26100" "http://127.0.0.1:${SHORT_PREFILL_PORT}"
+  start_decode "short-decode" "$SHORT_DECODE_CUDA_VISIBLE_DEVICES" "$SHORT_DECODE_PORT" "127.0.0.1:26100"
   wait_http "short decode" "http://127.0.0.1:${SHORT_DECODE_PORT}/health"
 
   start_prefill "long-prefill" "$LONG_PREFILL_CUDA_VISIBLE_DEVICES" "$LONG_PREFILL_PORT" "$LONG_BOOTSTRAP_PORT" "127.0.0.1:26200"
   wait_http "long prefill" "http://127.0.0.1:${LONG_PREFILL_PORT}/health"
-  start_decode "long-decode" "$LONG_DECODE_CUDA_VISIBLE_DEVICES" "$LONG_DECODE_PORT" "127.0.0.1:26300" "http://127.0.0.1:${LONG_PREFILL_PORT}"
+  start_decode "long-decode" "$LONG_DECODE_CUDA_VISIBLE_DEVICES" "$LONG_DECODE_PORT" "127.0.0.1:26300"
   wait_http "long decode" "http://127.0.0.1:${LONG_DECODE_PORT}/health"
 
   start_router
   wait_http "router" "http://127.0.0.1:${ROUTER_PORT}/health"
   run_smoke_tests
+  wait_for_stats_contract
+  run_bench_serving
   run_accuracy_evals
 }
 
