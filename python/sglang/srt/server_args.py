@@ -3585,8 +3585,9 @@ class ServerArgs:
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
-        Looks for ``params.json`` plus ``consolidated*.safetensors`` with no competing
-        ``model-*.safetensors``; when both weight formats ship in the
+        Looks for ``params.json`` plus ``consolidated*.safetensors`` or
+        ``consolidated*.pt`` with no competing ``model-*.safetensors``; when
+        both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
         HF-named architecture.
@@ -3619,6 +3620,7 @@ class ServerArgs:
                     glob.glob(
                         os.path.join(self.model_path, "consolidated*.safetensors")
                     )
+                    or glob.glob(os.path.join(self.model_path, "consolidated*.pt"))
                 ),
                 has_hf_weights=bool(
                     glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
@@ -3632,7 +3634,8 @@ class ServerArgs:
             return _check_format(
                 has_params="params.json" in files,
                 has_consolidated=any(
-                    f.startswith("consolidated") and f.endswith(".safetensors")
+                    f.startswith("consolidated")
+                    and (f.endswith(".safetensors") or f.endswith(".pt"))
                     for f in files
                 ),
                 has_hf_weights=any(
