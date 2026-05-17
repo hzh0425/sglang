@@ -18,7 +18,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu import MXFP8Config
 
 QuantizationMethods = Literal[
-    "fp8", "modelopt", "modelopt_fp8", "modelopt_fp4", "modelslim", "mxfp4"
+    "fp8", "modelopt", "modelopt_fp8", "modelopt_fp4", "modelslim", "mxfp4", "mxfp8"
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))

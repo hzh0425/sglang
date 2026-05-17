@@ -460,6 +460,12 @@ class MultiDetokenizerRouter:
     def _pick(self, key: str) -> str:
         return self.ipc_name_list[zlib.crc32(key.encode()) % self.num_workers]
 
+    @staticmethod
+    def _route_key(http_worker_ipc: Optional[str], rid: Any) -> str:
+        if http_worker_ipc is not None:
+            return http_worker_ipc
+        return str(rid)
+
     def _send(self, ipc_name: str, obj: Any) -> None:
         self.socket_mapping.send_output(ipc_name, obj, is_tokenizer=False)
 
@@ -473,12 +479,13 @@ class MultiDetokenizerRouter:
                     self._send(ipc, recv_obj)
                 continue
 
-            # Single request: route by its own http_worker_ipc.
+            # Single request: route by its own http_worker_ipc when multi-tokenizer
+            # mode sets it, otherwise by rid for the default single-tokenizer mode.
             if isinstance(recv_obj, BaseReq):
-                assert (
-                    recv_obj.http_worker_ipc is not None
-                ), f"Single req {recv_obj.rid=} missing http_worker_ipc"
-                self._send(self._pick(recv_obj.http_worker_ipc), recv_obj)
+                self._send(
+                    self._pick(self._route_key(recv_obj.http_worker_ipc, recv_obj.rid)),
+                    recv_obj,
+                )
                 continue
 
             # Batch request.
@@ -490,10 +497,10 @@ class MultiDetokenizerRouter:
                     continue
 
                 ipcs = recv_obj.http_worker_ipcs
-                assert (
-                    ipcs is not None
-                    and len(ipcs) == len(recv_obj.rids)
-                    and all(x is not None for x in ipcs)
+                if ipcs is None:
+                    ipcs = [None] * len(recv_obj.rids)
+                assert len(ipcs) == len(
+                    recv_obj.rids
                 ), f"Batch req {recv_obj.rids=} has invalid http_worker_ipcs"
 
                 # Split per-item and route each by its own ipc.
@@ -502,7 +509,9 @@ class MultiDetokenizerRouter:
                     if one is recv_obj:
                         raise TypeError(f"Cannot split {type(recv_obj)}")
                     one.http_worker_ipcs = [ipc_key]
-                    self._send(self._pick(ipc_key), one)
+                    self._send(
+                        self._pick(self._route_key(ipc_key, recv_obj.rids[i])), one
+                    )
                 continue
 
             raise ValueError(
