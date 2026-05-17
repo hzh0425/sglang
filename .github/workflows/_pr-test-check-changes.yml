@@ -78,6 +78,10 @@ jobs:
         with:
           filters: |
             main_package:
+              - ".github/workflows/_pr-test-check-changes.yml"
+              - ".github/workflows/_pr-test-sgl-kernel-build.yml"
+              - ".github/workflows/_pr-test-stage.yml"
+              - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"

@@ -595,6 +595,51 @@ class NixlKVManager(CommonKVManager):
                 # touching room status -- the next pop will retry.
                 staging_deferred = False
 
+                if (
+                    staging_strategy is not None
+                    and len(kv_chunk.prefill_kv_indices) > 0
+                ):
+                    for req in reqs_to_be_processed:
+                        if req.is_dummy():
+                            continue
+
+                        assert req.agent_name in self.decode_kv_args_table
+                        dst_info = self.decode_kv_args_table[req.agent_name]
+                        decode_tp_size = dst_info.decode_tp_size
+                        use_staging = (
+                            self.enable_staging
+                            and not self.is_mla_backend
+                            and decode_tp_size != self.attn_tp_size
+                            and dst_info.staging is not None
+                        )
+                        if not use_staging:
+                            continue
+
+                        ready, _, c_offset, _, _ = staging_strategy.check_ready(
+                            req,
+                            kv_chunk.index_slice.start,
+                            len(kv_chunk.prefill_kv_indices),
+                            session_id=req.agent_name,
+                        )
+                        if not ready:
+                            from sglang.srt.disaggregation.common.staging_buffer import (
+                                StagingAllocator,
+                            )
+
+                            if c_offset == StagingAllocator.ALLOC_OVERSIZED:
+                                raise RuntimeError(
+                                    f"[Staging] Chunk staging allocation permanently failed: "
+                                    f"chunk exceeds ring buffer total size "
+                                    f"(room={kv_chunk.room}). Increase "
+                                    f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
+                                )
+                            queue.put(kv_chunk)
+                            staging_deferred = True
+                            break
+
+                    if staging_deferred:
+                        continue
+
                 for req in reqs_to_be_processed:
                     assert room == req.room
                     if req.is_dummy():
@@ -724,10 +769,6 @@ class NixlKVManager(CommonKVManager):
                         )
                         handles.append(aux_xfer_handle)
 
-                if staging_deferred:
-                    # Chunk has been re-enqueued; do not advance status.
-                    continue
-
                 while handles:
                     states = [self.agent.check_xfer_state(h) for h in handles]
                     if any(s == "ERR" for s in states):
@@ -735,6 +776,10 @@ class NixlKVManager(CommonKVManager):
                     if all(s == "DONE" for s in states):
                         break
                     time.sleep(0)
+
+                if staging_deferred:
+                    # Chunk has been re-enqueued; do not advance status.
+                    continue
 
                 if kv_chunk.is_last:
                     self.update_status(room, KVPoll.Success)
