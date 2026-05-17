@@ -33,7 +33,12 @@ fn valid_config() -> RouterConfig {
     RouterConfig::try_from(cli).expect("valid router config")
 }
 
-fn mock_config(short_decode_url: &str, long_decode_url: &str) -> RouterConfig {
+fn mock_config_for_workers(
+    short_prefill_url: &str,
+    short_decode_url: &str,
+    long_prefill_url: &str,
+    long_decode_url: &str,
+) -> RouterConfig {
     let args = vec![
         "sglang-light-router".to_owned(),
         "--pd-disaggregation".to_owned(),
@@ -44,16 +49,25 @@ fn mock_config(short_decode_url: &str, long_decode_url: &str) -> RouterConfig {
         "--decode-long-threshold".to_owned(),
         "16".to_owned(),
         "--prefill".to_owned(),
-        "short=http://127.0.0.1:30000,bootstrap=8998".to_owned(),
+        format!("short={short_prefill_url},bootstrap=8998"),
         "--decode".to_owned(),
         format!("short={short_decode_url}"),
         "--prefill".to_owned(),
-        "long=http://127.0.0.1:30001,bootstrap=8999".to_owned(),
+        format!("long={long_prefill_url},bootstrap=8999"),
         "--decode".to_owned(),
         format!("long={long_decode_url}"),
     ];
     let cli = Cli::try_parse_from(args).expect("valid mock CLI args");
     RouterConfig::try_from(cli).expect("valid mock router config")
+}
+
+fn mock_config(short_decode_url: &str, long_decode_url: &str) -> RouterConfig {
+    mock_config_for_workers(
+        "http://127.0.0.1:30000",
+        short_decode_url,
+        "http://127.0.0.1:30001",
+        long_decode_url,
+    )
 }
 
 #[derive(Clone)]
@@ -213,6 +227,23 @@ fn generate_http_request(text: &str, max_new_tokens: usize) -> Request<Body> {
         .expect("request should build")
 }
 
+fn generate_input_ids_request(token_count: usize, max_new_tokens: usize) -> Request<Body> {
+    let input_ids: Vec<usize> = (0..token_count).collect();
+    Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header("content-type", "application/json")
+        .header("x-sglang-routing-key", "mock-session")
+        .body(Body::from(
+            json!({
+                "input_ids": input_ids,
+                "sampling_params": {"max_new_tokens": max_new_tokens}
+            })
+            .to_string(),
+        ))
+        .expect("request should build")
+}
+
 async fn response_json(response: axum::response::Response) -> Value {
     let body = to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -343,9 +374,12 @@ async fn get_model_info_proxies_to_short_decode() {
 
 #[tokio::test]
 async fn chat_proxy_injects_bootstrap_and_debug_headers() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
         &decode_url,
+        "http://127.0.0.1:30001",
         "http://127.0.0.1:39999",
     )));
 
@@ -379,9 +413,24 @@ async fn chat_proxy_injects_bootstrap_and_debug_headers() {
     let forwarded_body = forwarded_body
         .await
         .expect("mock decode should receive forwarded body");
+    let prefill_body = prefill_body
+        .await
+        .expect("mock prefill should receive forwarded body");
     assert_eq!(forwarded_body["bootstrap_host"], "127.0.0.1");
     assert_eq!(forwarded_body["bootstrap_port"], 8998);
     assert!(forwarded_body["bootstrap_room"].as_u64().is_some());
+    assert_eq!(
+        prefill_body["bootstrap_host"],
+        forwarded_body["bootstrap_host"]
+    );
+    assert_eq!(
+        prefill_body["bootstrap_port"],
+        forwarded_body["bootstrap_port"]
+    );
+    assert_eq!(
+        prefill_body["bootstrap_room"],
+        forwarded_body["bootstrap_room"]
+    );
 
     let stats_response = router
         .oneshot(
@@ -409,13 +458,17 @@ async fn chat_proxy_injects_bootstrap_and_debug_headers() {
     assert_eq!(short_decode["in_flight_requests"], 0);
 
     handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]
 async fn generate_proxy_injects_bootstrap_and_debug_headers() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
         &decode_url,
+        "http://127.0.0.1:30001",
         "http://127.0.0.1:39999",
     )));
 
@@ -441,10 +494,18 @@ async fn generate_proxy_injects_bootstrap_and_debug_headers() {
     let forwarded_body = forwarded_body
         .await
         .expect("mock decode should receive forwarded generate body");
+    let prefill_body = prefill_body
+        .await
+        .expect("mock prefill should receive forwarded generate body");
     assert_eq!(forwarded_body["bootstrap_host"], "127.0.0.1");
     assert_eq!(forwarded_body["bootstrap_port"], 8998);
     assert!(forwarded_body["bootstrap_room"].as_u64().is_some());
     assert_eq!(forwarded_body["sampling_params"]["max_new_tokens"], 4);
+    assert_eq!(
+        prefill_body["bootstrap_room"],
+        forwarded_body["bootstrap_room"]
+    );
+    assert_eq!(prefill_body["sampling_params"]["max_new_tokens"], 4);
 
     let stats_response = router
         .oneshot(
@@ -459,13 +520,17 @@ async fn generate_proxy_injects_bootstrap_and_debug_headers() {
     assert_eq!(stats_json["route_counts"]["prefill=short,decode=short"], 1);
 
     handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]
 async fn generate_long_dispatch_uses_text_and_sampling_params() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        "http://127.0.0.1:30000",
         "http://127.0.0.1:39998",
+        &prefill_url,
         &decode_url,
     )));
 
@@ -497,17 +562,74 @@ async fn generate_long_dispatch_uses_text_and_sampling_params() {
     let forwarded_body = forwarded_body
         .await
         .expect("mock long decode should receive forwarded generate body");
+    let prefill_body = prefill_body
+        .await
+        .expect("mock long prefill should receive forwarded generate body");
     assert_eq!(forwarded_body["bootstrap_port"], 8999);
+    assert_eq!(prefill_body["bootstrap_port"], 8999);
+    assert_eq!(
+        prefill_body["bootstrap_room"],
+        forwarded_body["bootstrap_room"]
+    );
 
     handle.abort();
+    prefill_handle.abort();
+}
+
+#[tokio::test]
+async fn generate_long_dispatch_uses_input_ids_length() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
+    let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
+    let router = app(AppState::new(mock_config_for_workers(
+        "http://127.0.0.1:30000",
+        "http://127.0.0.1:39998",
+        &prefill_url,
+        &decode_url,
+    )));
+
+    let response = router
+        .clone()
+        .oneshot(generate_input_ids_request(8, 8))
+        .await
+        .expect("tokenized generate request should reach router");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-sglang-prefill-group"),
+        Some(&axum::http::HeaderValue::from_static("long")),
+    );
+    assert_eq!(
+        response.headers().get("x-sglang-decode-group"),
+        Some(&axum::http::HeaderValue::from_static("long")),
+    );
+
+    let forwarded_body = forwarded_body
+        .await
+        .expect("mock long decode should receive forwarded generate body");
+    let prefill_body = prefill_body
+        .await
+        .expect("mock long prefill should receive forwarded generate body");
+    assert_eq!(
+        forwarded_body["input_ids"].as_array().map(Vec::len),
+        Some(8)
+    );
+    assert_eq!(prefill_body["input_ids"].as_array().map(Vec::len), Some(8));
+    assert_eq!(forwarded_body["bootstrap_port"], 8999);
+    assert_eq!(prefill_body["bootstrap_port"], 8999);
+
+    handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]
 async fn upstream_error_response_does_not_leak_local_load() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) =
         spawn_decode_mock(StatusCode::INTERNAL_SERVER_ERROR).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
         &decode_url,
+        "http://127.0.0.1:30001",
         "http://127.0.0.1:39999",
     )));
 
@@ -522,6 +644,9 @@ async fn upstream_error_response_does_not_leak_local_load() {
     let _ = forwarded_body
         .await
         .expect("mock decode should receive forwarded body");
+    let _ = prefill_body
+        .await
+        .expect("mock prefill should receive forwarded body");
 
     let stats_response = router
         .oneshot(
@@ -541,14 +666,18 @@ async fn upstream_error_response_does_not_leak_local_load() {
     }
 
     handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]
 async fn generate_upstream_error_response_does_not_leak_local_load() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) =
         spawn_decode_mock(StatusCode::INTERNAL_SERVER_ERROR).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
         &decode_url,
+        "http://127.0.0.1:30001",
         "http://127.0.0.1:39999",
     )));
 
@@ -563,6 +692,9 @@ async fn generate_upstream_error_response_does_not_leak_local_load() {
     let _ = forwarded_body
         .await
         .expect("mock decode should receive forwarded generate body");
+    let _ = prefill_body
+        .await
+        .expect("mock prefill should receive forwarded generate body");
 
     let stats_response = router
         .oneshot(
@@ -582,13 +714,17 @@ async fn generate_upstream_error_response_does_not_leak_local_load() {
     }
 
     handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]
 async fn dropped_proxy_response_body_does_not_leak_local_load() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
         &decode_url,
+        "http://127.0.0.1:30001",
         "http://127.0.0.1:39999",
     )));
 
@@ -603,6 +739,9 @@ async fn dropped_proxy_response_body_does_not_leak_local_load() {
     let _ = forwarded_body
         .await
         .expect("mock decode should receive forwarded body");
+    let _ = prefill_body
+        .await
+        .expect("mock prefill should receive forwarded body");
 
     let stats_response = router
         .oneshot(
@@ -622,13 +761,17 @@ async fn dropped_proxy_response_body_does_not_leak_local_load() {
     }
 
     handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]
 async fn dropped_generate_response_body_does_not_leak_local_load() {
+    let (prefill_url, prefill_body, prefill_handle) = spawn_decode_mock(StatusCode::OK).await;
     let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
-    let router = app(AppState::new(mock_config(
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
         &decode_url,
+        "http://127.0.0.1:30001",
         "http://127.0.0.1:39999",
     )));
 
@@ -643,6 +786,9 @@ async fn dropped_generate_response_body_does_not_leak_local_load() {
     let _ = forwarded_body
         .await
         .expect("mock decode should receive forwarded generate body");
+    let _ = prefill_body
+        .await
+        .expect("mock prefill should receive forwarded generate body");
 
     let stats_response = router
         .oneshot(
@@ -662,6 +808,7 @@ async fn dropped_generate_response_body_does_not_leak_local_load() {
     }
 
     handle.abort();
+    prefill_handle.abort();
 }
 
 #[tokio::test]

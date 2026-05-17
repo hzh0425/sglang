@@ -27,8 +27,14 @@ PREFILL_LONG_THRESHOLD="${PREFILL_LONG_THRESHOLD:-512}"
 DECODE_LONG_THRESHOLD="${DECODE_LONG_THRESHOLD:-512}"
 GSM8K_MIN_ACCURACY="${GSM8K_MIN_ACCURACY:-0.50}"
 MMLU_MIN_SCORE="${MMLU_MIN_SCORE:-0.50}"
+MMLU_NUM_EXAMPLES="${MMLU_NUM_EXAMPLES:-200}"
+MMLU_NUM_THREADS="${MMLU_NUM_THREADS:-32}"
+MMLU_MAX_TOKENS="${MMLU_MAX_TOKENS:-512}"
+MMLU_REPEAT="${MMLU_REPEAT:-1}"
+MMLU_CHAT_TEMPLATE_KWARGS="${MMLU_CHAT_TEMPLATE_KWARGS:-{\"enable_thinking\":false}}"
 BENCH_NUM_PROMPTS="${BENCH_NUM_PROMPTS:-32}"
 BENCH_REQUEST_RATE="${BENCH_REQUEST_RATE:-4}"
+SMOKE_REQUEST_TIMEOUT_SECS="${SMOKE_REQUEST_TIMEOUT_SECS:-300}"
 RUN_BENCH_SERVING="${RUN_BENCH_SERVING:-1}"
 RUN_ACCURACY_EVALS="${RUN_ACCURACY_EVALS:-1}"
 
@@ -73,7 +79,9 @@ check_bench_serving_flags() {
   help_text="$(python3 -m sglang.bench_serving --help 2>&1)"
   grep -q -- "--random-input-len" <<<"$help_text" || die "bench_serving missing --random-input-len"
   grep -q -- "--random-output-len" <<<"$help_text" || die "bench_serving missing --random-output-len"
+  grep -q -- "--random-range-ratio" <<<"$help_text" || die "bench_serving missing --random-range-ratio"
   grep -q -- "--ready-check-timeout-sec" <<<"$help_text" || die "bench_serving missing --ready-check-timeout-sec"
+  grep -q -- "--tokenize-prompt" <<<"$help_text" || die "bench_serving missing --tokenize-prompt"
 }
 
 check_mmlu_model_arg() {
@@ -144,11 +152,12 @@ start_decode() {
   local name="$1"
   local gpu="$2"
   local port="$3"
-  local dist_init_addr="$4"
+  local bootstrap_port="$4"
+  local dist_init_addr="$5"
   local log_file="${LOG_DIR}/${name}.log"
   local common
   common="$(common_sglang_args)"
-  CUDA_VISIBLE_DEVICES="$gpu" bash -lc "${common} --port ${port} --disaggregation-mode decode --dist-init-addr ${dist_init_addr}" >"$log_file" 2>&1 &
+  CUDA_VISIBLE_DEVICES="$gpu" bash -lc "${common} --port ${port} --disaggregation-mode decode --disaggregation-bootstrap-port ${bootstrap_port} --dist-init-addr ${dist_init_addr}" >"$log_file" 2>&1 &
   pids+=("$!")
 }
 
@@ -173,6 +182,7 @@ chat_request() {
   local headers_file="$3"
   local body_file="$4"
   curl -fsS "http://127.0.0.1:${ROUTER_PORT}/v1/chat/completions" \
+    --max-time "$SMOKE_REQUEST_TIMEOUT_SECS" \
     -D "$headers_file" \
     -o "$body_file" \
     -H 'Content-Type: application/json' \
@@ -305,6 +315,8 @@ run_bench_serving() {
     --ready-check-timeout-sec 0 \
     --random-input-len 128 \
     --random-output-len 64 \
+    --random-range-ratio 1.0 \
+    --tokenize-prompt \
     --output-file "${LOG_DIR}/bench_short.jsonl" >"${LOG_DIR}/bench_short.out" 2>&1
 
   python3 -m sglang.bench_serving \
@@ -318,6 +330,8 @@ run_bench_serving() {
     --ready-check-timeout-sec 0 \
     --random-input-len 700 \
     --random-output-len 128 \
+    --random-range-ratio 1.0 \
+    --tokenize-prompt \
     --output-file "${LOG_DIR}/bench_long.jsonl" >"${LOG_DIR}/bench_long.out" 2>&1
 
   fetch_stats "${LOG_DIR}/routing_stats_after_bench.json"
@@ -335,9 +349,11 @@ run_accuracy_evals() {
     --eval-name mmlu \
     --model "$MODEL_NAME" \
     --port "$ROUTER_PORT" \
-    --num-examples 200 \
-    --max-tokens 4096 \
-    --repeat 4 >"${LOG_DIR}/mmlu.out" 2>&1
+    --num-examples "$MMLU_NUM_EXAMPLES" \
+    --num-threads "$MMLU_NUM_THREADS" \
+    --max-tokens "$MMLU_MAX_TOKENS" \
+    --repeat "$MMLU_REPEAT" \
+    --chat-template-kwargs "$MMLU_CHAT_TEMPLATE_KWARGS" >"${LOG_DIR}/mmlu.out" 2>&1
   python3 - "$GSM8K_MIN_ACCURACY" "$MMLU_MIN_SCORE" "${LOG_DIR}/gsm8k.out" "${LOG_DIR}/mmlu.out" <<'PY'
 import re
 import sys
@@ -365,12 +381,12 @@ main() {
 
   start_prefill "short-prefill" "$SHORT_PREFILL_CUDA_VISIBLE_DEVICES" "$SHORT_PREFILL_PORT" "$SHORT_BOOTSTRAP_PORT" "127.0.0.1:26000"
   wait_http "short prefill" "http://127.0.0.1:${SHORT_PREFILL_PORT}/health"
-  start_decode "short-decode" "$SHORT_DECODE_CUDA_VISIBLE_DEVICES" "$SHORT_DECODE_PORT" "127.0.0.1:26100"
+  start_decode "short-decode" "$SHORT_DECODE_CUDA_VISIBLE_DEVICES" "$SHORT_DECODE_PORT" "$SHORT_BOOTSTRAP_PORT" "127.0.0.1:26100"
   wait_http "short decode" "http://127.0.0.1:${SHORT_DECODE_PORT}/health"
 
   start_prefill "long-prefill" "$LONG_PREFILL_CUDA_VISIBLE_DEVICES" "$LONG_PREFILL_PORT" "$LONG_BOOTSTRAP_PORT" "127.0.0.1:26200"
   wait_http "long prefill" "http://127.0.0.1:${LONG_PREFILL_PORT}/health"
-  start_decode "long-decode" "$LONG_DECODE_CUDA_VISIBLE_DEVICES" "$LONG_DECODE_PORT" "127.0.0.1:26300"
+  start_decode "long-decode" "$LONG_DECODE_CUDA_VISIBLE_DEVICES" "$LONG_DECODE_PORT" "$LONG_BOOTSTRAP_PORT" "127.0.0.1:26300"
   wait_http "long decode" "http://127.0.0.1:${LONG_DECODE_PORT}/health"
 
   start_router

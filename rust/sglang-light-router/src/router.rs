@@ -408,6 +408,11 @@ pub enum RouterError {
         engine_id: String,
         source: reqwest::Error,
     },
+    #[error("upstream {engine_id} returned status {status}")]
+    UpstreamStatus {
+        engine_id: String,
+        status: StatusCode,
+    },
     #[error("unknown engine id {0:?}")]
     UnknownEngine(String),
 }
@@ -419,7 +424,7 @@ impl RouterError {
             Self::NoHealthyEngine { .. } | Self::UnknownEngine(_) => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
-            Self::UpstreamRequest { .. } => StatusCode::BAD_GATEWAY,
+            Self::UpstreamRequest { .. } | Self::UpstreamStatus { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -1052,7 +1057,7 @@ async fn route_and_forward(
         Arc::clone(&plan.decode.engine),
         plan.features.uncached_prefill_tokens,
     );
-    let response = forward_to_decode(&state, &plan, &body, endpoint).await?;
+    let response = forward_to_prefill_and_decode(&state, &plan, &body, endpoint).await?;
     let response = attach_guard(response, guard);
 
     Ok(add_debug_headers(response, state.config(), &plan))
@@ -1112,9 +1117,52 @@ fn estimate_prompt_tokens(body: &Value) -> usize {
             .sum();
     }
 
+    if let Some(tokens) = token_id_field_count(body) {
+        return tokens;
+    }
+
     body.get("prompt")
         .or_else(|| body.get("text"))
-        .map_or(0, count_content_tokens)
+        .map_or(0, count_prompt_tokens)
+}
+
+fn token_id_field_count(value: &Value) -> Option<usize> {
+    TOKEN_ID_FIELDS
+        .iter()
+        .find_map(|key| value.get(*key).and_then(count_token_ids))
+}
+
+const TOKEN_ID_FIELDS: [&str; 3] = ["input_ids", "input_token_ids", "token_ids"];
+
+fn count_prompt_tokens(value: &Value) -> usize {
+    if let Some(tokens) = count_token_ids(value) {
+        return tokens;
+    }
+
+    match value {
+        Value::Object(object) => token_id_field_count(value)
+            .or_else(|| object.get("text").map(count_prompt_tokens))
+            .unwrap_or(0),
+        _ => count_content_tokens(value),
+    }
+}
+
+fn count_token_ids(value: &Value) -> Option<usize> {
+    let values = value.as_array()?;
+    if values.iter().all(Value::is_number) {
+        return Some(values.len());
+    }
+
+    let mut total = 0;
+    let mut found_token_array = false;
+    for nested in values {
+        if let Some(count) = count_token_ids(nested) {
+            total += count;
+            found_token_array = true;
+        }
+    }
+
+    found_token_array.then_some(total)
 }
 
 fn count_content_tokens(value: &Value) -> usize {
@@ -1176,40 +1224,72 @@ fn inject_bootstrap(
     Ok(())
 }
 
-async fn forward_to_decode(
+async fn forward_to_prefill_and_decode(
     state: &AppState,
     plan: &RoutePlan,
     body: &Value,
     endpoint: ProxyEndpoint,
 ) -> Result<Response, RouterError> {
-    let decode = &plan.decode.engine;
-    let upstream_url =
-        decode
-            .spec
-            .url
-            .join(endpoint.path())
-            .map_err(|source| RouterError::UpstreamUrl {
-                engine_id: decode.spec.id.clone(),
-                source,
-            })?;
+    let prefill_engine = &plan.prefill.engine;
+    let decode_engine = &plan.decode.engine;
+    let prefill_url = upstream_url(prefill_engine, endpoint.path())?;
+    let decode_url = upstream_url(decode_engine, endpoint.path())?;
 
-    let upstream = state
-        .inner
-        .client
-        .post(upstream_url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|source| RouterError::UpstreamRequest {
-            engine_id: decode.spec.id.clone(),
-            source,
-        })?;
-    let status = upstream.status();
-    let upstream_headers = upstream.headers().clone();
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let prefill_request = state.inner.client.post(prefill_url).json(body).send();
+    let decode_request = state.inner.client.post(decode_url).json(body).send();
+    let (prefill_result, decode_result) = tokio::join!(prefill_request, decode_request);
+
+    let prefill_response = prefill_result.map_err(|source| RouterError::UpstreamRequest {
+        engine_id: prefill_engine.spec.id.clone(),
+        source,
+    })?;
+    let decode_response = decode_result.map_err(|source| RouterError::UpstreamRequest {
+        engine_id: decode_engine.spec.id.clone(),
+        source,
+    })?;
+
+    let status = decode_response.status();
+    let upstream_headers = decode_response.headers().clone();
+
+    consume_prefill_response(&prefill_engine.spec.id, prefill_response).await?;
+
+    let mut response = Response::new(Body::from_stream(decode_response.bytes_stream()));
     *response.status_mut() = status;
     copy_safe_response_headers(&upstream_headers, response.headers_mut());
     Ok(response)
+}
+
+fn upstream_url(engine: &EngineState, path: &'static str) -> Result<Url, RouterError> {
+    engine
+        .spec
+        .url
+        .join(path)
+        .map_err(|source| RouterError::UpstreamUrl {
+            engine_id: engine.spec.id.clone(),
+            source,
+        })
+}
+
+async fn consume_prefill_response(
+    engine_id: &str,
+    response: reqwest::Response,
+) -> Result<(), RouterError> {
+    let status = response.status();
+    if !status.is_success() {
+        return Err(RouterError::UpstreamStatus {
+            engine_id: engine_id.to_owned(),
+            status,
+        });
+    }
+
+    response
+        .bytes()
+        .await
+        .map(|_| ())
+        .map_err(|source| RouterError::UpstreamRequest {
+            engine_id: engine_id.to_owned(),
+            source,
+        })
 }
 
 async fn forward_metadata_to_decode(
@@ -1929,6 +2009,29 @@ mod tests {
         assert_eq!(features.prompt_tokens, 4);
         assert_eq!(features.max_new_tokens, 5);
         assert_eq!(features.estimated_sequence_length, 9);
+    }
+
+    #[test]
+    fn native_generate_body_counts_input_ids() {
+        let body = json!({
+            "input_ids": [10, 20, 30, 40],
+            "sampling_params": {"max_new_tokens": 5}
+        });
+        let features = RoutingFeatures::from_request(&HeaderMap::new(), &body);
+
+        assert_eq!(features.prompt_tokens, 4);
+        assert_eq!(features.max_new_tokens, 5);
+        assert_eq!(features.estimated_sequence_length, 9);
+    }
+
+    #[test]
+    fn native_generate_body_counts_nested_tokenized_prompt() {
+        let body = json!({
+            "prompt": [[10, 20, 30], [40, 50]],
+            "max_new_tokens": 1
+        });
+
+        assert_eq!(estimate_prompt_tokens(&body), 5);
     }
 
     #[test]
