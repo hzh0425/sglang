@@ -47,9 +47,11 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
     if get_bool_env_var("AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS"):
         return True
     try:
+        import triton as triton_module
         from packaging.version import Version
 
-        return Version(Version(triton.__version__).base_version) >= Version("3.5.0")
+        triton_version = Version(Version(triton_module.__version__).base_version)
+        return triton_version >= Version("3.5.0")
     except Exception:
         return False
 
