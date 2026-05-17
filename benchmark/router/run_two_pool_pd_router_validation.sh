@@ -68,6 +68,14 @@ check_gpu_ids_unique() {
   [[ -z "$duplicate" ]] || die "GPU id ${duplicate} is assigned to multiple roles"
 }
 
+check_bench_serving_flags() {
+  local help_text
+  help_text="$(python3 -m sglang.bench_serving --help 2>&1)"
+  grep -q -- "--random-input-len" <<<"$help_text" || die "bench_serving missing --random-input-len"
+  grep -q -- "--random-output-len" <<<"$help_text" || die "bench_serving missing --random-output-len"
+  grep -q -- "--ready-check-timeout-sec" <<<"$help_text" || die "bench_serving missing --ready-check-timeout-sec"
+}
+
 wait_http() {
   local name="$1"
   local url="$2"
@@ -275,8 +283,9 @@ run_bench_serving() {
     --port "$ROUTER_PORT" \
     --num-prompts "$BENCH_NUM_PROMPTS" \
     --request-rate "$BENCH_REQUEST_RATE" \
-    --random-input 128 \
-    --random-output 64 \
+    --ready-check-timeout-sec 0 \
+    --random-input-len 128 \
+    --random-output-len 64 \
     --output-file "${LOG_DIR}/bench_short.jsonl" >"${LOG_DIR}/bench_short.out" 2>&1
 
   python3 -m sglang.bench_serving \
@@ -287,8 +296,9 @@ run_bench_serving() {
     --port "$ROUTER_PORT" \
     --num-prompts "$BENCH_NUM_PROMPTS" \
     --request-rate "$BENCH_REQUEST_RATE" \
-    --random-input 700 \
-    --random-output 128 \
+    --ready-check-timeout-sec 0 \
+    --random-input-len 700 \
+    --random-output-len 128 \
     --output-file "${LOG_DIR}/bench_long.jsonl" >"${LOG_DIR}/bench_long.out" 2>&1
 
   fetch_stats "${LOG_DIR}/routing_stats_after_bench.json"
@@ -330,6 +340,7 @@ PY
 main() {
   [[ -f "$ROUTER_MANIFEST" ]] || die "router manifest not found: ${ROUTER_MANIFEST}"
   check_gpu_ids_unique
+  check_bench_serving_flags
 
   start_prefill "short-prefill" "$SHORT_PREFILL_CUDA_VISIBLE_DEVICES" "$SHORT_PREFILL_PORT" "$SHORT_BOOTSTRAP_PORT" "127.0.0.1:26000"
   wait_http "short prefill" "http://127.0.0.1:${SHORT_PREFILL_PORT}/health"

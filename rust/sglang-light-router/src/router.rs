@@ -933,6 +933,7 @@ pub fn app(state: AppState) -> Router {
     let router = Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/generate", post(generate))
         .route("/debug/routing_stats", get(routing_stats));
 
     if enable_test_load_override {
@@ -994,7 +995,24 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
+) -> Result<Response, RouterError> {
+    route_and_forward(state, headers, body, ProxyEndpoint::ChatCompletions).await
+}
+
+async fn generate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Response, RouterError> {
+    route_and_forward(state, headers, body, ProxyEndpoint::Generate).await
+}
+
+async fn route_and_forward(
+    state: AppState,
+    headers: HeaderMap,
+    mut body: Value,
+    endpoint: ProxyEndpoint,
 ) -> Result<Response, RouterError> {
     let plan = state.route_plan(&headers, &body)?;
     inject_bootstrap(
@@ -1008,10 +1026,25 @@ async fn chat_completions(
         Arc::clone(&plan.decode.engine),
         plan.features.uncached_prefill_tokens,
     );
-    let response = forward_to_decode(&state, &plan, &body).await?;
+    let response = forward_to_decode(&state, &plan, &body, endpoint).await?;
     let response = attach_guard(response, guard);
 
     Ok(add_debug_headers(response, state.config(), &plan))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyEndpoint {
+    ChatCompletions,
+    Generate,
+}
+
+impl ProxyEndpoint {
+    const fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "v1/chat/completions",
+            Self::Generate => "generate",
+        }
+    }
 }
 
 fn select_prefill_group(config: &RouterConfig, features: &RoutingFeatures) -> ContextGroup {
@@ -1053,7 +1086,9 @@ fn estimate_prompt_tokens(body: &Value) -> usize {
             .sum();
     }
 
-    body.get("prompt").map_or(0, count_content_tokens)
+    body.get("prompt")
+        .or_else(|| body.get("text"))
+        .map_or(0, count_content_tokens)
 }
 
 fn count_content_tokens(value: &Value) -> usize {
@@ -1069,6 +1104,13 @@ fn max_new_tokens(body: &Value) -> usize {
     ["max_tokens", "max_completion_tokens", "max_new_tokens"]
         .iter()
         .find_map(|key| body.get(*key).and_then(value_to_usize))
+        .or_else(|| {
+            body.get("sampling_params").and_then(|sampling_params| {
+                ["max_new_tokens", "max_tokens"]
+                    .iter()
+                    .find_map(|key| sampling_params.get(*key).and_then(value_to_usize))
+            })
+        })
         .unwrap_or(DEFAULT_MAX_NEW_TOKENS)
 }
 
@@ -1112,16 +1154,18 @@ async fn forward_to_decode(
     state: &AppState,
     plan: &RoutePlan,
     body: &Value,
+    endpoint: ProxyEndpoint,
 ) -> Result<Response, RouterError> {
     let decode = &plan.decode.engine;
-    let upstream_url = decode
-        .spec
-        .url
-        .join("v1/chat/completions")
-        .map_err(|source| RouterError::UpstreamUrl {
-            engine_id: decode.spec.id.clone(),
-            source,
-        })?;
+    let upstream_url =
+        decode
+            .spec
+            .url
+            .join(endpoint.path())
+            .map_err(|source| RouterError::UpstreamUrl {
+                engine_id: decode.spec.id.clone(),
+                source,
+            })?;
 
     let upstream = state
         .inner
@@ -1814,6 +1858,19 @@ mod tests {
         });
 
         assert_eq!(estimate_prompt_tokens(&body), 2);
+    }
+
+    #[test]
+    fn native_generate_body_contributes_text_and_sampling_max_new_tokens() {
+        let body = json!({
+            "text": "one two three four",
+            "sampling_params": {"max_new_tokens": 5}
+        });
+        let features = RoutingFeatures::from_request(&HeaderMap::new(), &body);
+
+        assert_eq!(features.prompt_tokens, 4);
+        assert_eq!(features.max_new_tokens, 5);
+        assert_eq!(features.estimated_sequence_length, 9);
     }
 
     #[test]

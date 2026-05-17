@@ -72,6 +72,7 @@ async fn spawn_decode_mock(
     };
     let mock_app = axum::Router::new()
         .route("/v1/chat/completions", post(mock_chat))
+        .route("/generate", post(mock_generate))
         .route("/v1/loads", get(mock_loads))
         .with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -91,6 +92,21 @@ async fn mock_chat(
     State(state): State<MockDecodeState>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    capture_mock_body(&state, body);
+
+    (state.status, Json(json!({ "mock": "chat" })))
+}
+
+async fn mock_generate(
+    State(state): State<MockDecodeState>,
+    Json(body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    capture_mock_body(&state, body);
+
+    (state.status, Json(json!({ "mock": "generate" })))
+}
+
+fn capture_mock_body(state: &MockDecodeState, body: Value) {
     if let Some(sender) = state
         .sender
         .lock()
@@ -99,8 +115,6 @@ async fn mock_chat(
     {
         let _ = sender.send(body);
     }
-
-    (state.status, Json(json!({ "mock": true })))
 }
 
 async fn mock_loads() -> Json<Value> {
@@ -125,6 +139,22 @@ fn chat_http_request(prompt: &str, max_tokens: usize) -> Request<Body> {
                 "model": "mock",
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens
+            })
+            .to_string(),
+        ))
+        .expect("request should build")
+}
+
+fn generate_http_request(text: &str, max_new_tokens: usize) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header("content-type", "application/json")
+        .header("x-sglang-routing-key", "mock-session")
+        .body(Body::from(
+            json!({
+                "text": text,
+                "sampling_params": {"max_new_tokens": max_new_tokens}
             })
             .to_string(),
         ))
@@ -264,7 +294,7 @@ async fn chat_proxy_injects_bootstrap_and_debug_headers() {
     );
 
     let json = response_json(response).await;
-    assert_eq!(json["mock"], true);
+    assert_eq!(json["mock"], "chat");
 
     let forwarded_body = forwarded_body
         .await
@@ -297,6 +327,97 @@ async fn chat_proxy_injects_bootstrap_and_debug_headers() {
         .expect("short decode stats should exist");
     assert_eq!(short_decode["local_dispatch_total"], 1);
     assert_eq!(short_decode["in_flight_requests"], 0);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn generate_proxy_injects_bootstrap_and_debug_headers() {
+    let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
+    let router = app(AppState::new(mock_config(
+        &decode_url,
+        "http://127.0.0.1:39999",
+    )));
+
+    let response = router
+        .clone()
+        .oneshot(generate_http_request("short native request", 4))
+        .await
+        .expect("generate request should reach router");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-sglang-prefill-group"),
+        Some(&axum::http::HeaderValue::from_static("short")),
+    );
+    assert_eq!(
+        response.headers().get("x-sglang-decode-worker"),
+        Some(&axum::http::HeaderValue::from_static("short-decode-0")),
+    );
+
+    let response_body = response_json(response).await;
+    assert_eq!(response_body["mock"], "generate");
+
+    let forwarded_body = forwarded_body
+        .await
+        .expect("mock decode should receive forwarded generate body");
+    assert_eq!(forwarded_body["bootstrap_host"], "127.0.0.1");
+    assert_eq!(forwarded_body["bootstrap_port"], 8998);
+    assert!(forwarded_body["bootstrap_room"].as_u64().is_some());
+    assert_eq!(forwarded_body["sampling_params"]["max_new_tokens"], 4);
+
+    let stats_response = router
+        .oneshot(
+            Request::builder()
+                .uri("/debug/routing_stats")
+                .body(Body::empty())
+                .expect("stats request should build"),
+        )
+        .await
+        .expect("stats request should succeed");
+    let stats_json = response_json(stats_response).await;
+    assert_eq!(stats_json["route_counts"]["prefill=short,decode=short"], 1);
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn generate_long_dispatch_uses_text_and_sampling_params() {
+    let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
+    let router = app(AppState::new(mock_config(
+        "http://127.0.0.1:39998",
+        &decode_url,
+    )));
+
+    let response = router
+        .clone()
+        .oneshot(generate_http_request(
+            "one two three four five six seven eight",
+            8,
+        ))
+        .await
+        .expect("generate request should reach router");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-sglang-prefill-group"),
+        Some(&axum::http::HeaderValue::from_static("long")),
+    );
+    assert_eq!(
+        response.headers().get("x-sglang-decode-group"),
+        Some(&axum::http::HeaderValue::from_static("long")),
+    );
+    assert_eq!(
+        response.headers().get("x-sglang-decode-worker"),
+        Some(&axum::http::HeaderValue::from_static("long-decode-1")),
+    );
+
+    let response_body = response_json(response).await;
+    assert_eq!(response_body["mock"], "generate");
+    let forwarded_body = forwarded_body
+        .await
+        .expect("mock long decode should receive forwarded generate body");
+    assert_eq!(forwarded_body["bootstrap_port"], 8999);
 
     handle.abort();
 }
@@ -343,6 +464,47 @@ async fn upstream_error_response_does_not_leak_local_load() {
 }
 
 #[tokio::test]
+async fn generate_upstream_error_response_does_not_leak_local_load() {
+    let (decode_url, forwarded_body, handle) =
+        spawn_decode_mock(StatusCode::INTERNAL_SERVER_ERROR).await;
+    let router = app(AppState::new(mock_config(
+        &decode_url,
+        "http://127.0.0.1:39999",
+    )));
+
+    let response = router
+        .clone()
+        .oneshot(generate_http_request("short native request", 4))
+        .await
+        .expect("generate request should reach router");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let _ = response_json(response).await;
+    let _ = forwarded_body
+        .await
+        .expect("mock decode should receive forwarded generate body");
+
+    let stats_response = router
+        .oneshot(
+            Request::builder()
+                .uri("/debug/routing_stats")
+                .body(Body::empty())
+                .expect("stats request should build"),
+        )
+        .await
+        .expect("stats request should succeed");
+    let stats_json = response_json(stats_response).await;
+    for engine in stats_json["engines"]
+        .as_array()
+        .expect("engines should be an array")
+    {
+        assert_eq!(engine["in_flight_requests"], 0);
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn dropped_proxy_response_body_does_not_leak_local_load() {
     let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
     let router = app(AppState::new(mock_config(
@@ -361,6 +523,46 @@ async fn dropped_proxy_response_body_does_not_leak_local_load() {
     let _ = forwarded_body
         .await
         .expect("mock decode should receive forwarded body");
+
+    let stats_response = router
+        .oneshot(
+            Request::builder()
+                .uri("/debug/routing_stats")
+                .body(Body::empty())
+                .expect("stats request should build"),
+        )
+        .await
+        .expect("stats request should succeed");
+    let stats_json = response_json(stats_response).await;
+    for engine in stats_json["engines"]
+        .as_array()
+        .expect("engines should be an array")
+    {
+        assert_eq!(engine["in_flight_requests"], 0);
+    }
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn dropped_generate_response_body_does_not_leak_local_load() {
+    let (decode_url, forwarded_body, handle) = spawn_decode_mock(StatusCode::OK).await;
+    let router = app(AppState::new(mock_config(
+        &decode_url,
+        "http://127.0.0.1:39999",
+    )));
+
+    let response = router
+        .clone()
+        .oneshot(generate_http_request("short native request", 4))
+        .await
+        .expect("generate request should reach router");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    let _ = forwarded_body
+        .await
+        .expect("mock decode should receive forwarded generate body");
 
     let stats_response = router
         .oneshot(
