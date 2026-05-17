@@ -4,7 +4,7 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     routing::{get, post},
 };
 use clap::{CommandFactory, Parser};
@@ -82,6 +82,18 @@ struct MockMetadataState {
     status: StatusCode,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct CapturedRequestHeaders {
+    authorization: Option<String>,
+    cookie: Option<String>,
+}
+
+#[derive(Clone)]
+struct MockHeaderState {
+    sender: Arc<Mutex<Option<oneshot::Sender<CapturedRequestHeaders>>>>,
+    status: StatusCode,
+}
+
 async fn spawn_decode_mock(
     status: StatusCode,
 ) -> (String, oneshot::Receiver<Value>, JoinHandle<()>) {
@@ -134,6 +146,38 @@ async fn spawn_metadata_mock(
     (format!("http://{addr}"), receiver, handle)
 }
 
+async fn spawn_header_mock(
+    status: StatusCode,
+) -> (
+    String,
+    oneshot::Receiver<CapturedRequestHeaders>,
+    JoinHandle<()>,
+) {
+    let (sender, receiver) = oneshot::channel();
+    let state = MockHeaderState {
+        sender: Arc::new(Mutex::new(Some(sender))),
+        status,
+    };
+    let mock_app = axum::Router::new()
+        .route("/v1/chat/completions", post(mock_header_chat))
+        .route("/generate", post(mock_header_generate))
+        .route("/v1/loads", get(mock_loads))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock header server should bind");
+    let addr = listener
+        .local_addr()
+        .expect("mock header address should exist");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, mock_app)
+            .await
+            .expect("mock header server should run");
+    });
+
+    (format!("http://{addr}"), receiver, handle)
+}
+
 async fn mock_chat(
     State(state): State<MockDecodeState>,
     Json(body): Json<Value>,
@@ -181,6 +225,47 @@ async fn mock_model_info(State(state): State<MockMetadataState>) -> (StatusCode,
             "is_generation": true
         })),
     )
+}
+
+async fn mock_header_chat(
+    State(state): State<MockHeaderState>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    capture_mock_headers(&state, &headers);
+
+    (state.status, Json(json!({ "mock": "chat" })))
+}
+
+async fn mock_header_generate(
+    State(state): State<MockHeaderState>,
+    headers: HeaderMap,
+    Json(_body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    capture_mock_headers(&state, &headers);
+
+    (state.status, Json(json!({ "mock": "generate" })))
+}
+
+fn capture_mock_headers(state: &MockHeaderState, headers: &HeaderMap) {
+    if let Some(sender) = state
+        .sender
+        .lock()
+        .expect("mock header sender lock should not be poisoned")
+        .take()
+    {
+        let _ = sender.send(CapturedRequestHeaders {
+            authorization: header_to_string(headers, "authorization"),
+            cookie: header_to_string(headers, "cookie"),
+        });
+    }
+}
+
+fn header_to_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 async fn mock_loads() -> Json<Value> {
@@ -459,6 +544,61 @@ async fn chat_proxy_injects_bootstrap_and_debug_headers() {
 
     handle.abort();
     prefill_handle.abort();
+}
+
+#[tokio::test]
+async fn chat_proxy_forwards_authorization_to_prefill_and_decode() {
+    let (prefill_url, prefill_headers, prefill_handle) = spawn_header_mock(StatusCode::OK).await;
+    let (decode_url, decode_headers, decode_handle) = spawn_header_mock(StatusCode::OK).await;
+    let router = app(AppState::new(mock_config_for_workers(
+        &prefill_url,
+        &decode_url,
+        "http://127.0.0.1:30001",
+        "http://127.0.0.1:39999",
+    )));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer test-token")
+        .header("cookie", "session=do-not-forward")
+        .body(Body::from(
+            json!({
+                "model": "mock",
+                "messages": [{"role": "user", "content": "short auth request"}],
+                "max_tokens": 4
+            })
+            .to_string(),
+        ))
+        .expect("request should build");
+
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("chat request should reach router");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        prefill_headers
+            .await
+            .expect("prefill should receive request headers"),
+        CapturedRequestHeaders {
+            authorization: Some("Bearer test-token".to_owned()),
+            cookie: None,
+        }
+    );
+    assert_eq!(
+        decode_headers
+            .await
+            .expect("decode should receive request headers"),
+        CapturedRequestHeaders {
+            authorization: Some("Bearer test-token".to_owned()),
+            cookie: None,
+        }
+    );
+
+    prefill_handle.abort();
+    decode_handle.abort();
 }
 
 #[tokio::test]

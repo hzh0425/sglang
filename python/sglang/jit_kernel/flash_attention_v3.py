@@ -33,6 +33,27 @@ def _normalize_fa2_fallback_result(result, return_softmax_lse):
     return result
 
 
+def _reject_unsupported_fa2_fallback_options(**options):
+    unsupported = [
+        name
+        for name, (value, default) in options.items()
+        if not _is_default_fa2_fallback_option(value, default)
+    ]
+    if unsupported:
+        raise NotImplementedError(
+            "flash_attn v2 fallback does not support FA3-only option(s): "
+            + ", ".join(sorted(unsupported))
+        )
+
+
+def _is_default_fa2_fallback_option(value, default):
+    if value is None:
+        return True
+    if default is None:
+        return False
+    return isinstance(value, (int, float)) and value == default
+
+
 @cache_once
 def _load_fa3_kernels():
     # By default, we use the implementation from sgl-kernel,
@@ -216,6 +237,21 @@ def flash_attn_varlen_func(
     if not _is_fa3_supported():
         # Fall back to flash_attn package (FA2) on platforms without sgl-kernel FA3
         # (e.g. ROCm, or CUDA < sm90)
+        _reject_unsupported_fa2_fallback_options(
+            seqused_q=(seqused_q, None),
+            seqused_k=(seqused_k, None),
+            page_table=(page_table, None),
+            qv=(qv, None),
+            q_descale=(q_descale, None),
+            k_descale=(k_descale, None),
+            v_descale=(v_descale, None),
+            attention_chunk=(attention_chunk, 0),
+            num_splits=(num_splits, 1),
+            pack_gqa=(pack_gqa, None),
+            sm_margin=(sm_margin, 0),
+            sinks=(sinks, None),
+            out=(out, None),
+        )
         if cu_seqlens_q is not None:
             from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
 

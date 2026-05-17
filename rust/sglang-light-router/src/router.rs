@@ -1018,9 +1018,12 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-async fn get_model_info(State(state): State<AppState>) -> Result<Response, RouterError> {
+async fn get_model_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, RouterError> {
     let decode = state.inner.metadata_decode_engine()?;
-    forward_metadata_to_decode(&state, &decode, "get_model_info").await
+    forward_metadata_to_decode(&state, &decode, &headers, "get_model_info").await
 }
 
 async fn chat_completions(
@@ -1057,7 +1060,7 @@ async fn route_and_forward(
         Arc::clone(&plan.decode.engine),
         plan.features.uncached_prefill_tokens,
     );
-    let response = forward_to_prefill_and_decode(&state, &plan, &body, endpoint).await?;
+    let response = forward_to_prefill_and_decode(&state, &plan, &headers, &body, endpoint).await?;
     let response = attach_guard(response, guard);
 
     Ok(add_debug_headers(response, state.config(), &plan))
@@ -1227,6 +1230,7 @@ fn inject_bootstrap(
 async fn forward_to_prefill_and_decode(
     state: &AppState,
     plan: &RoutePlan,
+    headers: &HeaderMap,
     body: &Value,
     endpoint: ProxyEndpoint,
 ) -> Result<Response, RouterError> {
@@ -1235,8 +1239,12 @@ async fn forward_to_prefill_and_decode(
     let prefill_url = upstream_url(prefill_engine, endpoint.path())?;
     let decode_url = upstream_url(decode_engine, endpoint.path())?;
 
-    let prefill_request = state.inner.client.post(prefill_url).json(body).send();
-    let decode_request = state.inner.client.post(decode_url).json(body).send();
+    let prefill_request = with_safe_request_headers(state.inner.client.post(prefill_url), headers)
+        .json(body)
+        .send();
+    let decode_request = with_safe_request_headers(state.inner.client.post(decode_url), headers)
+        .json(body)
+        .send();
     let (prefill_result, decode_result) = tokio::join!(prefill_request, decode_request);
 
     let prefill_response = prefill_result.map_err(|source| RouterError::UpstreamRequest {
@@ -1295,6 +1303,7 @@ async fn consume_prefill_response(
 async fn forward_metadata_to_decode(
     state: &AppState,
     decode: &EngineState,
+    headers: &HeaderMap,
     path: &'static str,
 ) -> Result<Response, RouterError> {
     let upstream_url = decode
@@ -1310,6 +1319,7 @@ async fn forward_metadata_to_decode(
         .inner
         .client
         .get(upstream_url)
+        .headers(safe_request_headers(headers))
         .send()
         .await
         .map_err(|source| RouterError::UpstreamRequest {
@@ -1322,6 +1332,21 @@ async fn forward_metadata_to_decode(
     *response.status_mut() = status;
     copy_safe_response_headers(&upstream_headers, response.headers_mut());
     Ok(response)
+}
+
+fn with_safe_request_headers(
+    request: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    request.headers(safe_request_headers(headers))
+}
+
+fn safe_request_headers(source: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(value) = source.get(header::AUTHORIZATION) {
+        headers.insert(header::AUTHORIZATION, value.clone());
+    }
+    headers
 }
 
 fn copy_safe_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
