@@ -150,6 +150,7 @@ jobs:
           jobs: |
             [
               {"prefix": "base-b-test-1-gpu-small", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-small'].size }}},
+              {"prefix": "base-b-test-cpu", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-cpu'].size }}},
               {"prefix": "base-b-test-1-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-1-gpu-large'].size }}},
               {"prefix": "base-b-test-2-gpu-large", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-2-gpu-large'].size }}},
               {"prefix": "base-b-test-4-gpu-b200", "expected_count": ${{ fromJson(needs.check-changes.outputs.partitions)['base-b-test-4-gpu-b200'].size }}}
@@ -343,6 +344,71 @@ jobs:
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '30'
     secrets: inherit
+
+  base-b-test-cpu:
+    needs: [check-changes, call-gate, wait-for-base-a]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      needs.check-changes.outputs.main_package == 'true'
+    runs-on: xeon-gnr
+    env:
+      HF_HOME: /home/sdp/.cache/huggingface
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Build and Push
+        run: |
+          version=$(cat python/sglang/version.py | cut -d'"' -f2)
+          tag=v${version}-xeon
+          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
+          PR_HEAD_REF=${{ github.head_ref }}
+
+          docker build \
+            ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
+            ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
+            . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
+
+      - name: Run container
+        run: |
+          docker run -dt \
+            -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
+            -v ${HF_HOME}:/root/.cache/huggingface \
+            --name ci_sglang_xeon \
+            sglang_xeon
+
+      - name: Check AMX support
+        id: check_amx
+        timeout-minutes: 5
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_xeon \
+            bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch._C._cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
+
+      - name: Run unit tests
+        timeout-minutes: 36
+        run: |
+          docker exec -w /sglang-checkout/ ci_sglang_xeon \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite base-b-test-cpu"
+
+      - name: Change permission
+        timeout-minutes: 2
+        run: |
+          docker exec -u root ci_sglang_xeon bash -c "
+            rm -rf /tmp/ci-home  &&
+            chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
+          "
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker rm -f ci_sglang_xeon || true
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
@@ -549,6 +615,7 @@ jobs:
         base-a-test-1-gpu-small,
         base-a-test-cpu,
         base-b-test-1-gpu-small,
+        base-b-test-cpu,
         base-b-test-1-gpu-large,
         base-b-test-2-gpu-large,
         base-b-test-4-gpu-b200,
