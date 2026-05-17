@@ -27,6 +27,12 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
         return kernel(*args, **kwargs)
 
 
+def _normalize_fa2_fallback_result(result, return_softmax_lse):
+    if return_softmax_lse and isinstance(result, tuple):
+        return result[:2]
+    return result
+
+
 @cache_once
 def _load_fa3_kernels():
     # By default, we use the implementation from sgl-kernel,
@@ -213,7 +219,7 @@ def flash_attn_varlen_func(
         if cu_seqlens_q is not None:
             from flash_attn import flash_attn_varlen_func as fa2_flash_attn_varlen_func
 
-            return fa2_flash_attn_varlen_func(
+            result = fa2_flash_attn_varlen_func(
                 q,
                 k,
                 v,
@@ -227,11 +233,12 @@ def flash_attn_varlen_func(
                 softcap=softcap,
                 return_attn_probs=return_softmax_lse,
             )
+            return _normalize_fa2_fallback_result(result, return_softmax_lse)
         else:
             # 4D inputs (batch, seqlen, nheads, headdim) without cu_seqlens
             from flash_attn import flash_attn_func as fa2_flash_attn_func
 
-            return fa2_flash_attn_func(
+            result = fa2_flash_attn_func(
                 q,
                 k,
                 v,
@@ -241,6 +248,7 @@ def flash_attn_varlen_func(
                 softcap=softcap,
                 return_attn_probs=return_softmax_lse,
             )
+            return _normalize_fa2_fallback_result(result, return_softmax_lse)
 
     return _call_fa3_kernel(
         _load_fa3_kernels()["flash_attn_varlen_func"],
