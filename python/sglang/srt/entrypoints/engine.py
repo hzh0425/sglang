@@ -674,6 +674,13 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs,
         )
 
+    @staticmethod
+    def _reserve_zmq_ipc_name() -> str:
+        tmp_fd, tmp_path = tempfile.mkstemp()
+        os.close(tmp_fd)
+        os.unlink(tmp_path)
+        return f"ipc://{tmp_path}"
+
     @classmethod
     def _launch_detokenizer_subprocesses(
         cls,
@@ -708,7 +715,7 @@ class Engine(EngineScoreMixin, EngineBase):
         worker_ipc_names: List[str] = []
         try:
             for i in range(server_args.detokenizer_worker_num):
-                worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                worker_ipc = cls._reserve_zmq_ipc_name()
                 port_args.detokenizer_ipc_name = worker_ipc
                 proc = mp.Process(
                     target=run_detokenizer_process_func,

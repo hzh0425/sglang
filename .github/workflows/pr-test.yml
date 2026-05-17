@@ -250,7 +250,9 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   base-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-a-test-1-gpu-small
@@ -329,7 +331,9 @@ jobs:
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-1-gpu-small
@@ -343,7 +347,9 @@ jobs:
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-1-gpu-large
@@ -357,7 +363,9 @@ jobs:
 
   base-b-test-2-gpu-large:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-2-gpu-large
@@ -370,7 +378,9 @@ jobs:
 
   base-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-b-test-4-gpu-b200
@@ -404,7 +414,9 @@ jobs:
 
   base-c-test-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-h100
@@ -417,7 +429,9 @@ jobs:
 
   base-c-test-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-h200
@@ -437,7 +451,9 @@ jobs:
 
   base-c-test-8-gpu-h20:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-8-gpu-h20
@@ -450,7 +466,9 @@ jobs:
 
   base-c-test-deepep-4-gpu-h100:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-deepep-4-gpu-h100
@@ -465,7 +483,9 @@ jobs:
 
   base-c-test-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-4-gpu-b200
@@ -479,7 +499,9 @@ jobs:
 
   base-c-test-dsv4-4-gpu-b200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-dsv4-4-gpu-b200
@@ -493,7 +515,9 @@ jobs:
 
   base-c-test-dsv4-8-gpu-h200:
     needs: [check-changes, call-gate, wait-for-base-b, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() }}
+    if: |
+      always() &&
+      !failure() && !cancelled()
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: base-c-test-dsv4-8-gpu-h200
