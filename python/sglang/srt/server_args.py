@@ -3165,6 +3165,7 @@ class ServerArgs:
 
         if (
             envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+            and not self.enable_deepep_waterfill
             and self.moe_a2a_backend != "megamoe"
         ):
             self.moe_a2a_backend = "megamoe"
