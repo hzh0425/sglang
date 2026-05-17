@@ -119,9 +119,34 @@ def _repo_relative_path(p: str) -> str:
     """
     if not os.path.isabs(p):
         p = os.path.join(os.getcwd(), p)
-    marker = "/sglang/"
-    idx = p.rfind(marker)
-    return p[idx + len(marker) :] if idx >= 0 else p
+
+    path = os.path.abspath(p)
+    for root in _repo_root_candidates():
+        root = os.path.abspath(root)
+        try:
+            if os.path.commonpath([path, root]) != root:
+                continue
+        except ValueError:
+            continue
+        return os.path.relpath(path, root)
+
+    return path
+
+
+def _repo_root_candidates() -> List[str]:
+    candidates = [
+        os.environ.get("GITHUB_WORKSPACE"),
+        os.path.join(os.path.dirname(__file__), "../../../.."),
+        os.getcwd(),
+    ]
+    roots: List[str] = []
+    for root in candidates:
+        if not root:
+            continue
+        root = os.path.abspath(root)
+        if root not in roots:
+            roots.append(root)
+    return roots
 
 
 def run_unittest_files(

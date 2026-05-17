@@ -225,8 +225,20 @@ def _handle_output_by_index(output, i):
             embeddings=_extract_field_by_index(output, "embeddings", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
+            cached_tokens_details=_extract_field_by_index(
+                output, "cached_tokens_details", i
+            ),
+            time_stats=_extract_field_by_index(output, "time_stats", i),
+            placeholder_tokens_idx=_extract_field_by_index(
+                output, "placeholder_tokens_idx", i
+            ),
+            placeholder_tokens_val=_extract_field_by_index(
+                output, "placeholder_tokens_val", i
+            ),
+            retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            pooled_hidden_states=_extract_field_by_index(
+                output, "pooled_hidden_states", i
+            ),
         )
     elif isinstance(output, BatchStrOutput):
         new_output = BatchStrOutput(
