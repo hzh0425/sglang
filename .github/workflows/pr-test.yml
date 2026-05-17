@@ -81,6 +81,7 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
       run_all_tests: ${{ inputs.run_all_tests == true }}
       force_continue_on_error: ${{ inputs.force_continue_on_error == true }}
+      enable_sgl_kernel_run_all_tests: ${{ inputs.run_all_tests == true && inputs.test_parallel_dispatch != true && github.event_name != 'schedule' }}
     secrets: inherit
 
   call-pr-test-extra:

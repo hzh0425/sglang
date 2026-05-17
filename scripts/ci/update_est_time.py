@@ -7,11 +7,12 @@ Usage:
 """
 
 import argparse
+import ast
 import json
-import re
 import subprocess
 import sys
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -21,6 +22,9 @@ DEFAULT_MODEL_URL = (
 
 # AMD / NPU live in separate workflows and are not scraped by sglang-ci-stats.
 BACKENDS = ("cuda", "cpu")
+REGISTER_FUNCTIONS = {f"register_{backend}_ci" for backend in BACKENDS}
+REGISTRATION_PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
+_UNSET = object()
 
 # A change is "significant" if |delta| >= this many seconds AND the relative
 # change is at least SIGNIFICANT_REL_DELTA. Dual threshold filters out both
@@ -28,6 +32,14 @@ BACKENDS = ("cuda", "cpu")
 # short tests.
 SIGNIFICANT_ABS_DELTA = 30
 SIGNIFICANT_REL_DELTA = 0.3
+
+
+@dataclass(frozen=True)
+class RegistrationMatch:
+    suite: str
+    old_value: int | float
+    value_start: int
+    value_end: int
 
 
 def fetch_model(url):
@@ -43,28 +55,95 @@ def fetch_model(url):
     return json.loads(out.stdout)
 
 
-def make_patterns(suite):
-    """Yield regex objects that match `register_{backend}_ci(est_time=N, ...)`
-    for the given suite, covering both registration styles:
+def _constant_value(node):
+    if isinstance(node, ast.Constant):
+        return node.value
+    return _UNSET
 
-      legacy: register_X_ci(est_time=N, suite="<full-suite>")
-      new:    register_X_ci(est_time=N, stage="<stage>", runner_config="<rc>")
-    """
-    stage_rc = None
-    if "-test-" in suite:
-        stage, _, rc = suite.partition("-test-")
-        stage_rc = (stage, rc)
-    for backend in BACKENDS:
-        yield re.compile(
-            rf"(register_{backend}_ci\(est_time=)(\d+)"
-            rf'(,\s*suite="{re.escape(suite)}")'
-        )
-        if stage_rc is not None:
-            stage, rc = stage_rc
-            yield re.compile(
-                rf"(register_{backend}_ci\(est_time=)(\d+)"
-                rf'(,\s*stage="{re.escape(stage)}",\s*runner_config="{re.escape(rc)}")'
-            )
+
+def _call_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
+
+
+def _line_offsets(content):
+    offsets = [0]
+    total = 0
+    for line in content.splitlines(keepends=True):
+        total += len(line)
+        offsets.append(total)
+    return offsets
+
+
+def _absolute_offset(line_offsets, node):
+    return line_offsets[node.lineno - 1] + node.col_offset
+
+
+def _absolute_end_offset(line_offsets, node):
+    return line_offsets[node.end_lineno - 1] + node.end_col_offset
+
+
+def _registration_from_call(node, line_offsets):
+    func_name = _call_name(node.func)
+    if func_name not in REGISTER_FUNCTIONS:
+        return None
+    if any(isinstance(arg, ast.Starred) for arg in node.args):
+        return None
+    if len(node.args) > len(REGISTRATION_PARAM_ORDER):
+        return None
+
+    values = {}
+    value_nodes = {}
+    seen = set()
+    for name, arg in zip(REGISTRATION_PARAM_ORDER, node.args):
+        values[name] = _constant_value(arg)
+        value_nodes[name] = arg
+        seen.add(name)
+
+    for keyword in node.keywords:
+        if keyword.arg is None or keyword.arg in seen:
+            return None
+        values[keyword.arg] = _constant_value(keyword.value)
+        value_nodes[keyword.arg] = keyword.value
+        seen.add(keyword.arg)
+
+    est_time = values.get("est_time", _UNSET)
+    est_time_node = value_nodes.get("est_time")
+    if not isinstance(est_time, (int, float)) or est_time_node is None:
+        return None
+
+    legacy_suite = values.get("suite", _UNSET)
+    stage = values.get("stage", _UNSET)
+    runner_config = values.get("runner_config", _UNSET)
+    if isinstance(stage, str) and isinstance(runner_config, str):
+        suite = f"{stage}-test-{runner_config}"
+    elif isinstance(legacy_suite, str):
+        suite = legacy_suite
+    else:
+        return None
+
+    old_value = int(est_time) if float(est_time).is_integer() else est_time
+    return RegistrationMatch(
+        suite=suite,
+        old_value=old_value,
+        value_start=_absolute_offset(line_offsets, est_time_node),
+        value_end=_absolute_end_offset(line_offsets, est_time_node),
+    )
+
+
+def find_registration_matches(content, filename="<string>"):
+    """Return CI registration calls with source spans for their est_time value."""
+    tree = ast.parse(content, filename=filename)
+    line_offsets = _line_offsets(content)
+    matches = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        match = _registration_from_call(node, line_offsets)
+        if match is not None:
+            matches.append(match)
+    return matches
 
 
 def update_files(model, dry_run=False):
@@ -84,21 +163,30 @@ def update_files(model, dry_run=False):
             continue
         content = filepath.read_text()
         new_content = content
+        matches_by_suite = defaultdict(list)
+        for match in find_registration_matches(content, filename=str(filepath)):
+            matches_by_suite[match.suite].append(match)
 
+        replacements = []
+        used_spans = set()
         for suite, p90 in entries:
-            for pattern in make_patterns(suite):
-                match = pattern.search(new_content)
-                if match is None:
+            for match in matches_by_suite.get(suite, []):
+                span = (match.value_start, match.value_end)
+                if span in used_spans:
                     continue
-                old_val = int(match.group(2))
+                used_spans.add(span)
+                old_val = match.old_value
                 if old_val != p90:
-                    new_content = pattern.sub(rf"\g<1>{p90}\3", new_content)
+                    replacements.append((match.value_start, match.value_end, str(p90)))
                     changes.append((relpath, suite, old_val, p90))
                     print(
                         f"  {relpath}: suite={suite!r} " f"est_time {old_val} -> {p90}",
                         file=sys.stderr,
                     )
                 break  # one (file, suite) -> at most one register call
+
+        for start, end, replacement in sorted(replacements, reverse=True):
+            new_content = new_content[:start] + replacement + new_content[end:]
 
         if new_content != content and not dry_run:
             filepath.write_text(new_content)
