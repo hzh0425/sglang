@@ -558,7 +558,8 @@ class ApertusForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def get_module_name_from_weight_name(self, name):
-        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
+        num_shard = 3
+        for param_name, weight_name, _ in self.stacked_params_mapping:
             if weight_name in name:
                 return (
                     name.replace(weight_name, param_name)[: -len(".weight")],
