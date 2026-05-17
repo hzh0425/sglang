@@ -225,7 +225,7 @@ class Mxfp4LinearMethod(LinearMethodBase):
         # Handle 3D input tensors [batch, seq, hidden]
         original_shape = x.shape
         if x.dim() == 3:
-            x = x.view(-1, x.shape[-1])
+            x = x.reshape(-1, x.shape[-1])
 
         x_fp4, x_scale = dynamic_mxfp4_quant(x, shuffle=True)
 
@@ -234,4 +234,4 @@ class Mxfp4LinearMethod(LinearMethodBase):
         if bias is not None:
             y = y + bias
 
-        return y.view(*original_shape[:-1], layer.weight.shape[0])
+        return y.reshape(*original_shape[:-1], layer.weight.shape[0])

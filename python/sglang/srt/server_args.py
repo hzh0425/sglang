@@ -3585,7 +3585,7 @@ class ServerArgs:
     def _is_mistral_native_format(self) -> bool:
         """True iff the checkpoint requires load_format=mistral.
 
-        Looks for ``consolidated*.safetensors`` with no competing
+        Looks for ``params.json`` plus ``consolidated*.safetensors`` with no competing
         ``model-*.safetensors``; when both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
@@ -3606,7 +3606,9 @@ class ServerArgs:
         )
 
         def _check_format(has_params, has_consolidated, has_hf_weights) -> bool:
-            if has_params and name_matches:
+            if not has_params:
+                return False
+            if name_matches:
                 return True
             return has_consolidated and not has_hf_weights
 
