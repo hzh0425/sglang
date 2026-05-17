@@ -43,6 +43,34 @@ class ServerArgsTest(unittest.TestCase):
 
             self.assertTrue(args._is_mistral_native_format())
 
+    def test_mistral_native_detection_prefers_hf_weights(self):
+        hf_weight_names = (
+            "model.safetensors",
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "pytorch_model.bin",
+            "pytorch_model.bin.index.json",
+            "pytorch_model-00001-of-00002.bin",
+        )
+
+        for hf_weight_name in hf_weight_names:
+            with self.subTest(hf_weight_name=hf_weight_name):
+                with tempfile.TemporaryDirectory() as model_dir:
+                    for filename in (
+                        "params.json",
+                        "consolidated.00.safetensors",
+                        hf_weight_name,
+                    ):
+                        with open(
+                            os.path.join(model_dir, filename), "w", encoding="utf-8"
+                        ):
+                            pass
+
+                    args = ServerArgs.__new__(ServerArgs)
+                    args.model_path = model_dir
+
+                    self.assertFalse(args._is_mistral_native_format())
+
     def test_deepep_waterfill_takes_precedence_over_megamoe_env(self):
         args = ServerArgs.__new__(ServerArgs)
         args.enable_deepep_waterfill = True

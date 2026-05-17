@@ -3587,7 +3587,7 @@ class ServerArgs:
         """True iff the checkpoint requires load_format=mistral.
 
         Looks for ``params.json`` plus ``consolidated*.safetensors`` or
-        ``consolidated*.pt`` with no competing ``model-*.safetensors``; when
+        ``consolidated*.pt`` with no competing HF weight files; when
         both weight formats ship in the
         same checkpoint (e.g. Mistral-7B-Instruct-v0.3) the HF path is
         preferred to avoid loading Mistral-named weights into an
@@ -3614,6 +3614,20 @@ class ServerArgs:
                 return True
             return has_consolidated and not has_hf_weights
 
+        def _is_hf_weight_file(filename: str) -> bool:
+            filename = os.path.basename(filename)
+            return (
+                filename
+                in {
+                    "model.safetensors",
+                    "model.safetensors.index.json",
+                    "pytorch_model.bin",
+                    "pytorch_model.bin.index.json",
+                }
+                or (filename.startswith("model-") and filename.endswith(".safetensors"))
+                or (filename.startswith("pytorch_model-") and filename.endswith(".bin"))
+            )
+
         if os.path.isdir(self.model_path):
             return _check_format(
                 has_params=os.path.exists(os.path.join(self.model_path, "params.json")),
@@ -3623,8 +3637,9 @@ class ServerArgs:
                     )
                     or glob.glob(os.path.join(self.model_path, "consolidated*.pt"))
                 ),
-                has_hf_weights=bool(
-                    glob.glob(os.path.join(self.model_path, "model-*.safetensors"))
+                has_hf_weights=any(
+                    _is_hf_weight_file(filename)
+                    for filename in os.listdir(self.model_path)
                 ),
             )
 
@@ -3639,9 +3654,7 @@ class ServerArgs:
                     and (f.endswith(".safetensors") or f.endswith(".pt"))
                     for f in files
                 ),
-                has_hf_weights=any(
-                    f.startswith("model-") and f.endswith(".safetensors") for f in files
-                ),
+                has_hf_weights=any(_is_hf_weight_file(f) for f in files),
             )
         except Exception:
             return False
