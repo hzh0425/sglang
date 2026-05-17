@@ -62,6 +62,12 @@ struct MockDecodeState {
     status: StatusCode,
 }
 
+#[derive(Clone)]
+struct MockMetadataState {
+    sender: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    status: StatusCode,
+}
+
 async fn spawn_decode_mock(
     status: StatusCode,
 ) -> (String, oneshot::Receiver<Value>, JoinHandle<()>) {
@@ -83,6 +89,32 @@ async fn spawn_decode_mock(
         axum::serve(listener, mock_app)
             .await
             .expect("mock server should run");
+    });
+
+    (format!("http://{addr}"), receiver, handle)
+}
+
+async fn spawn_metadata_mock(
+    status: StatusCode,
+) -> (String, oneshot::Receiver<()>, JoinHandle<()>) {
+    let (sender, receiver) = oneshot::channel();
+    let state = MockMetadataState {
+        sender: Arc::new(Mutex::new(Some(sender))),
+        status,
+    };
+    let mock_app = axum::Router::new()
+        .route("/get_model_info", get(mock_model_info))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock metadata server should bind");
+    let addr = listener
+        .local_addr()
+        .expect("mock metadata address should exist");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, mock_app)
+            .await
+            .expect("mock metadata server should run");
     });
 
     (format!("http://{addr}"), receiver, handle)
@@ -115,6 +147,26 @@ fn capture_mock_body(state: &MockDecodeState, body: Value) {
     {
         let _ = sender.send(body);
     }
+}
+
+async fn mock_model_info(State(state): State<MockMetadataState>) -> (StatusCode, Json<Value>) {
+    if let Some(sender) = state
+        .sender
+        .lock()
+        .expect("mock metadata sender lock should not be poisoned")
+        .take()
+    {
+        let _ = sender.send(());
+    }
+
+    (
+        state.status,
+        Json(json!({
+            "model_path": "mock-model",
+            "tokenizer_path": "mock-tokenizer",
+            "is_generation": true
+        })),
+    )
 }
 
 async fn mock_loads() -> Json<Value> {
@@ -259,6 +311,34 @@ async fn health_reports_local_config_readiness() {
     assert_eq!(json["status"], "ok");
     assert_eq!(json["readiness"], "local_config");
     assert_eq!(json["engines_total"], 4);
+}
+
+#[tokio::test]
+async fn get_model_info_proxies_to_short_decode() {
+    let (decode_url, metadata_hit, handle) = spawn_metadata_mock(StatusCode::OK).await;
+    let router = app(AppState::new(mock_config(
+        &decode_url,
+        "http://127.0.0.1:39999",
+    )));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/get_model_info")
+                .body(Body::empty())
+                .expect("metadata request should build"),
+        )
+        .await
+        .expect("metadata request should reach router");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata = response_json(response).await;
+    assert_eq!(metadata["model_path"], "mock-model");
+    metadata_hit
+        .await
+        .expect("short decode should receive metadata request");
+
+    handle.abort();
 }
 
 #[tokio::test]

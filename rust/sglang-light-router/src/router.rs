@@ -822,6 +822,26 @@ impl RouterRuntime {
     fn next_bootstrap_room(&self) -> u64 {
         self.bootstrap_room.fetch_add(1, Ordering::Relaxed)
     }
+
+    fn metadata_decode_engine(&self) -> Result<Arc<EngineState>, RouterError> {
+        self.engines
+            .iter()
+            .find(|engine| {
+                engine.spec.role == RouterRole::Decode
+                    && engine.spec.group == ContextGroup::Short
+                    && engine.is_healthy()
+            })
+            .or_else(|| {
+                self.engines
+                    .iter()
+                    .find(|engine| engine.spec.role == RouterRole::Decode && engine.is_healthy())
+            })
+            .cloned()
+            .ok_or(RouterError::NoHealthyEngine {
+                role: RouterRole::Decode,
+                group: ContextGroup::Short,
+            })
+    }
 }
 
 fn increment_map_count(counts: &Mutex<BTreeMap<String, usize>>, key: String) {
@@ -932,6 +952,7 @@ pub fn app(state: AppState) -> Router {
     let enable_test_load_override = state.config().enable_test_load_override;
     let router = Router::new()
         .route("/health", get(health))
+        .route("/get_model_info", get(get_model_info))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/generate", post(generate))
         .route("/debug/routing_stats", get(routing_stats));
@@ -990,6 +1011,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         engines_total: state.config().engines.len(),
         engines_by_role,
     })
+}
+
+async fn get_model_info(State(state): State<AppState>) -> Result<Response, RouterError> {
+    let decode = state.inner.metadata_decode_engine()?;
+    forward_metadata_to_decode(&state, &decode, "get_model_info").await
 }
 
 async fn chat_completions(
@@ -1172,6 +1198,38 @@ async fn forward_to_decode(
         .client
         .post(upstream_url)
         .json(body)
+        .send()
+        .await
+        .map_err(|source| RouterError::UpstreamRequest {
+            engine_id: decode.spec.id.clone(),
+            source,
+        })?;
+    let status = upstream.status();
+    let upstream_headers = upstream.headers().clone();
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    *response.status_mut() = status;
+    copy_safe_response_headers(&upstream_headers, response.headers_mut());
+    Ok(response)
+}
+
+async fn forward_metadata_to_decode(
+    state: &AppState,
+    decode: &EngineState,
+    path: &'static str,
+) -> Result<Response, RouterError> {
+    let upstream_url = decode
+        .spec
+        .url
+        .join(path)
+        .map_err(|source| RouterError::UpstreamUrl {
+            engine_id: decode.spec.id.clone(),
+            source,
+        })?;
+
+    let upstream = state
+        .inner
+        .client
+        .get(upstream_url)
         .send()
         .await
         .map_err(|source| RouterError::UpstreamRequest {

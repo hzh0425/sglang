@@ -76,6 +76,25 @@ check_bench_serving_flags() {
   grep -q -- "--ready-check-timeout-sec" <<<"$help_text" || die "bench_serving missing --ready-check-timeout-sec"
 }
 
+check_mmlu_model_arg() {
+  python3 - "$0" <<'PY'
+import sys
+
+script_path = sys.argv[1]
+lines = open(script_path, encoding="utf-8").read().splitlines()
+target = "python3 -m " + "sglang.test.run_eval"
+eval_flag = "--eval-name " + "mmlu"
+model_flag = "--model " + '"$MODEL_NAME"'
+for index, line in enumerate(lines):
+    if target not in line:
+        continue
+    command_block = "\n".join(lines[index : index + 12])
+    if eval_flag in command_block and model_flag in command_block:
+        raise SystemExit(0)
+raise SystemExit("MMLU validation must pass --model to avoid /v1/models")
+PY
+}
+
 wait_http() {
   local name="$1"
   local url="$2"
@@ -314,6 +333,7 @@ run_accuracy_evals() {
     --parallel 50 >"${LOG_DIR}/gsm8k.out" 2>&1
   python3 -m sglang.test.run_eval \
     --eval-name mmlu \
+    --model "$MODEL_NAME" \
     --port "$ROUTER_PORT" \
     --num-examples 200 \
     --max-tokens 4096 \
@@ -341,6 +361,7 @@ main() {
   [[ -f "$ROUTER_MANIFEST" ]] || die "router manifest not found: ${ROUTER_MANIFEST}"
   check_gpu_ids_unique
   check_bench_serving_flags
+  check_mmlu_model_arg
 
   start_prefill "short-prefill" "$SHORT_PREFILL_CUDA_VISIBLE_DEVICES" "$SHORT_PREFILL_PORT" "$SHORT_BOOTSTRAP_PORT" "127.0.0.1:26000"
   wait_http "short prefill" "http://127.0.0.1:${SHORT_PREFILL_PORT}/health"
