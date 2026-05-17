@@ -1,3 +1,4 @@
+import ast
 import glob
 import json
 import os
@@ -548,11 +549,44 @@ def detect_multimodal_suite(file_path):
 
 def _extract_runner_config(content):
     """Pull `runner_config` and the args string from a `register_cuda_ci(...)` call."""
-    args = re.search(r"^[^#\n]*register_cuda_ci\s*\(([^)]*)\)", content, re.MULTILINE)
-    if not args:
-        return None, None
-    m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
-    return (m.group(1), args.group(1)) if m else (None, None)
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        args = re.search(
+            r"^[^#\n]*register_cuda_ci\s*\((.*?)\)",
+            content,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not args:
+            return None, None
+        m = re.search(r'runner_config\s*=\s*["\']([^"\']+)["\']', args.group(1))
+        return (m.group(1), args.group(1)) if m else (None, None)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            func_name = func.id
+        elif isinstance(func, ast.Attribute):
+            func_name = func.attr
+        else:
+            continue
+        if func_name != "register_cuda_ci":
+            continue
+
+        args_str = ast.get_source_segment(content, node) or ""
+        for keyword in node.keywords:
+            if keyword.arg != "runner_config":
+                continue
+            if isinstance(keyword.value, ast.Constant) and isinstance(
+                keyword.value.value, str
+            ):
+                return keyword.value.value, args_str
+            return None, args_str
+        return None, args_str
+
+    return None, None
 
 
 def detect_suite(file_path_from_test):
