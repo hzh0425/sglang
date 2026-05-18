@@ -43,7 +43,6 @@ fn mock_config_for_workers(
         "sglang-light-router".to_owned(),
         "--pd-disaggregation".to_owned(),
         "--enable-routing-debug-headers".to_owned(),
-        "--enable-test-load-override".to_owned(),
         "--prefill-long-threshold".to_owned(),
         "8".to_owned(),
         "--decode-long-threshold".to_owned(),
@@ -354,14 +353,14 @@ fn valid_short_long_pool_configures_engines() {
     assert_eq!(
         config
             .engines_for(RouterRole::Prefill, ContextGroup::Short)
-            .first()
+            .next()
             .and_then(|engine| engine.bootstrap_port),
         Some(8998),
     );
     assert_eq!(
         config
             .engines_for(RouterRole::Decode, ContextGroup::Long)
-            .first()
+            .next()
             .map(|engine| engine.url.as_str()),
         Some("http://127.0.0.1:31001/"),
     );

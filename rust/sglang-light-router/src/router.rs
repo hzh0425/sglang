@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     pin::Pin,
@@ -12,25 +12,22 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context as AnyhowContext;
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bytes::Bytes;
 use clap::Parser;
 use http_body::{Frame, SizeHint};
-use num_traits::ToPrimitive;
 use rand::seq::SliceRandom;
-use serde::{Deserialize, Serialize};
+use reqwest::Url;
+use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::net::TcpListener;
-use url::Url;
 
 const REQUIRED_GROUPS: [ContextGroup; 2] = [ContextGroup::Short, ContextGroup::Long];
 const DEFAULT_MAX_NEW_TOKENS: usize = 16;
@@ -95,10 +92,6 @@ pub struct Cli {
     /// Include routing decisions in response headers.
     #[arg(long, default_value_t = false)]
     pub enable_routing_debug_headers: bool,
-
-    /// Expose test-only load override endpoints. Disabled by default.
-    #[arg(long, default_value_t = false)]
-    pub enable_test_load_override: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
@@ -159,7 +152,7 @@ impl fmt::Display for RouterRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct EngineSpec {
     pub id: String,
     pub role: RouterRole,
@@ -173,23 +166,22 @@ pub struct RouterConfig {
     pub listen_addr: SocketAddr,
     pub prefill_long_threshold: usize,
     pub decode_long_threshold: usize,
-    pub prefill_routing_policy_chain: String,
-    pub decode_routing_policy_chain: String,
     pub balance_abs_threshold: f64,
     pub balance_relative_upper_bound_limit: f64,
     pub load_score_token_usage_weight: f64,
     pub enable_routing_debug_headers: bool,
-    pub enable_test_load_override: bool,
     pub engines: Vec<EngineSpec>,
 }
 
 impl RouterConfig {
-    #[must_use]
-    pub fn engines_for(&self, role: RouterRole, group: ContextGroup) -> Vec<&EngineSpec> {
+    pub fn engines_for(
+        &self,
+        role: RouterRole,
+        group: ContextGroup,
+    ) -> impl Iterator<Item = &EngineSpec> {
         self.engines
             .iter()
-            .filter(|engine| engine.role == role && engine.group == group)
-            .collect()
+            .filter(move |engine| engine.role == role && engine.group == group)
     }
 
     fn validate_policy_chain(name: &str, value: &str) -> Result<(), RouterError> {
@@ -222,18 +214,10 @@ impl TryFrom<Cli> for RouterConfig {
         )?;
 
         let mut engines = Vec::with_capacity(cli.prefill.len() + cli.decode.len());
-        for raw in &cli.prefill {
-            let index = engines
-                .iter()
-                .filter(|engine: &&EngineSpec| engine.role == RouterRole::Prefill)
-                .count();
+        for (index, raw) in cli.prefill.iter().enumerate() {
             engines.push(parse_endpoint(raw, RouterRole::Prefill, index)?);
         }
-        for raw in &cli.decode {
-            let index = engines
-                .iter()
-                .filter(|engine: &&EngineSpec| engine.role == RouterRole::Decode)
-                .count();
+        for (index, raw) in cli.decode.iter().enumerate() {
             engines.push(parse_endpoint(raw, RouterRole::Decode, index)?);
         }
 
@@ -243,58 +227,34 @@ impl TryFrom<Cli> for RouterConfig {
             listen_addr: SocketAddr::new(cli.host, cli.port),
             prefill_long_threshold: cli.prefill_long_threshold,
             decode_long_threshold: cli.decode_long_threshold,
-            prefill_routing_policy_chain: cli.prefill_routing_policy_chain,
-            decode_routing_policy_chain: cli.decode_routing_policy_chain,
             balance_abs_threshold: cli.balance_abs_threshold,
             balance_relative_upper_bound_limit: cli.balance_relative_upper_bound_limit,
             load_score_token_usage_weight: cli.load_score_token_usage_weight,
             enable_routing_debug_headers: cli.enable_routing_debug_headers,
-            enable_test_load_override: cli.enable_test_load_override,
             engines,
         })
     }
 }
 
-#[derive(Debug)]
-struct RawEndpoint {
-    group: ContextGroup,
-    url: Url,
-    bootstrap_port: Option<u16>,
-}
-
 fn parse_endpoint(raw: &str, role: RouterRole, index: usize) -> Result<EngineSpec, RouterError> {
-    let endpoint = RawEndpoint::parse(raw)?;
-    if role == RouterRole::Prefill && endpoint.bootstrap_port.is_none() {
-        return Err(RouterError::MissingBootstrapPort {
-            group: endpoint.group,
-        });
+    let (group, rest) = raw
+        .split_once('=')
+        .ok_or_else(|| RouterError::InvalidEndpoint(raw.to_owned()))?;
+    let group = ContextGroup::from_str(group)?;
+    let (url, bootstrap_port) = parse_endpoint_parts(rest, raw)?;
+    validate_url(&url, raw)?;
+
+    if role == RouterRole::Prefill && bootstrap_port.is_none() {
+        return Err(RouterError::MissingBootstrapPort { group });
     }
 
     Ok(EngineSpec {
-        id: format!("{}-{}-{index}", endpoint.group, role),
+        id: format!("{group}-{role}-{index}"),
         role,
-        group: endpoint.group,
-        url: endpoint.url,
-        bootstrap_port: endpoint.bootstrap_port,
+        group,
+        url,
+        bootstrap_port,
     })
-}
-
-impl RawEndpoint {
-    fn parse(raw: &str) -> Result<Self, RouterError> {
-        let (group, rest) = raw
-            .split_once('=')
-            .ok_or_else(|| RouterError::InvalidEndpoint(raw.to_owned()))?;
-        let group = ContextGroup::from_str(group)?;
-
-        let (url, bootstrap_port) = parse_endpoint_parts(rest, raw)?;
-        validate_url(&url, raw)?;
-
-        Ok(Self {
-            group,
-            url,
-            bootstrap_port,
-        })
-    }
 }
 
 fn parse_endpoint_parts(
@@ -308,7 +268,7 @@ fn parse_endpoint_parts(
         .ok_or_else(|| RouterError::InvalidEndpoint(original.to_owned()))?;
     let url = Url::parse(url_part).map_err(|source| RouterError::InvalidUrl {
         value: url_part.to_owned(),
-        source,
+        message: source.to_string(),
     })?;
 
     let mut bootstrap_port = None;
@@ -343,14 +303,12 @@ fn validate_url(url: &Url, original: &str) -> Result<(), RouterError> {
 }
 
 fn validate_required_engines(engines: &[EngineSpec]) -> Result<(), RouterError> {
-    let mut present = BTreeSet::new();
-    for engine in engines {
-        present.insert((engine.role, engine.group));
-    }
-
     for group in REQUIRED_GROUPS {
         for role in [RouterRole::Prefill, RouterRole::Decode] {
-            if !present.contains(&(role, group)) {
+            if !engines
+                .iter()
+                .any(|engine| engine.role == role && engine.group == group)
+            {
                 return Err(RouterError::MissingRoleGroup { role, group });
             }
         }
@@ -367,11 +325,8 @@ pub enum RouterError {
     InvalidGroup(String),
     #[error("invalid endpoint {0:?}; expected group=http://host:port[,bootstrap=port]")]
     InvalidEndpoint(String),
-    #[error("invalid URL {value:?}: {source}")]
-    InvalidUrl {
-        value: String,
-        source: url::ParseError,
-    },
+    #[error("invalid URL {value:?}: {message}")]
+    InvalidUrl { value: String, message: String },
     #[error("unsupported URL scheme {0:?}; expected http or https")]
     UnsupportedUrlScheme(String),
     #[error("unknown endpoint option {0:?}")]
@@ -398,11 +353,8 @@ pub enum RouterError {
     MissingSelectedBootstrapPort { engine_id: String },
     #[error("selected prefill engine {engine_id} has no host")]
     MissingSelectedBootstrapHost { engine_id: String },
-    #[error("failed to build upstream URL for {engine_id}: {source}")]
-    UpstreamUrl {
-        engine_id: String,
-        source: url::ParseError,
-    },
+    #[error("failed to build upstream URL for {engine_id}: {message}")]
+    UpstreamUrl { engine_id: String, message: String },
     #[error("upstream request to {engine_id} failed: {source}")]
     UpstreamRequest {
         engine_id: String,
@@ -413,17 +365,13 @@ pub enum RouterError {
         engine_id: String,
         status: StatusCode,
     },
-    #[error("unknown engine id {0:?}")]
-    UnknownEngine(String),
 }
 
 impl RouterError {
     const fn status_code(&self) -> StatusCode {
         match self {
             Self::RequestBodyNotObject => StatusCode::BAD_REQUEST,
-            Self::NoHealthyEngine { .. } | Self::UnknownEngine(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::NoHealthyEngine { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamRequest { .. } | Self::UpstreamStatus { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -442,9 +390,7 @@ impl IntoResponse for RouterError {
 struct RoutingFeatures {
     routing_key: Option<String>,
     prompt_tokens: usize,
-    uncached_prefill_tokens: usize,
     max_new_tokens: usize,
-    estimated_sequence_length: usize,
 }
 
 impl RoutingFeatures {
@@ -455,10 +401,12 @@ impl RoutingFeatures {
         Self {
             routing_key: extract_routing_key(headers),
             prompt_tokens,
-            uncached_prefill_tokens: prompt_tokens,
             max_new_tokens,
-            estimated_sequence_length: prompt_tokens.saturating_add(max_new_tokens),
         }
+    }
+
+    fn sequence_len(&self) -> usize {
+        self.prompt_tokens.saturating_add(self.max_new_tokens)
     }
 }
 
@@ -498,6 +446,7 @@ impl EngineState {
         self.healthy.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     fn set_healthy(&self, healthy: bool) {
         self.healthy.store(healthy, Ordering::Relaxed);
     }
@@ -526,15 +475,6 @@ impl EngineState {
             .expect("reported load lock poisoned")
             .last_ok = false;
     }
-
-    fn set_local_work_for_test(&self, work: usize) {
-        match self.spec.role {
-            RouterRole::Prefill => self.in_flight_prefill_tokens.store(work, Ordering::Relaxed),
-            RouterRole::Decode => self
-                .in_flight_decode_requests
-                .store(work, Ordering::Relaxed),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -562,16 +502,12 @@ impl PolicyBranch {
 #[derive(Debug, Clone)]
 struct EngineSelection {
     engine: Arc<EngineState>,
-    role: RouterRole,
-    group: ContextGroup,
     branch: PolicyBranch,
 }
 
 #[derive(Debug, Clone)]
 struct RoutePlan {
     features: RoutingFeatures,
-    prefill_group: ContextGroup,
-    decode_group: ContextGroup,
     prefill: EngineSelection,
     decode: EngineSelection,
 }
@@ -581,7 +517,6 @@ struct RouterRuntime {
     config: RouterConfig,
     client: reqwest::Client,
     engines: Vec<Arc<EngineState>>,
-    engines_by_id: BTreeMap<String, Arc<EngineState>>,
     engines_by_role_group: BTreeMap<(RouterRole, ContextGroup), Vec<Arc<EngineState>>>,
     sticky: RwLock<BTreeMap<StickyKey, String>>,
     route_counts: Mutex<BTreeMap<String, usize>>,
@@ -592,12 +527,10 @@ struct RouterRuntime {
 impl RouterRuntime {
     fn new(config: RouterConfig) -> Self {
         let mut engines = Vec::with_capacity(config.engines.len());
-        let mut engines_by_id = BTreeMap::new();
         let mut engines_by_role_group: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
         for spec in &config.engines {
             let engine = Arc::new(EngineState::new(spec.clone()));
-            engines_by_id.insert(spec.id.clone(), Arc::clone(&engine));
             engines_by_role_group
                 .entry((spec.role, spec.group))
                 .or_default()
@@ -609,7 +542,6 @@ impl RouterRuntime {
             config,
             client: reqwest::Client::new(),
             engines,
-            engines_by_id,
             engines_by_role_group,
             sticky: RwLock::new(BTreeMap::new()),
             route_counts: Mutex::new(BTreeMap::new()),
@@ -666,12 +598,7 @@ impl RouterRuntime {
             (reference, PolicyBranch::LoadBasedFallback)
         };
 
-        Ok(EngineSelection {
-            engine,
-            role,
-            group,
-            branch,
-        })
+        Ok(EngineSelection { engine, branch })
     }
 
     fn load_based_reference(
@@ -782,7 +709,10 @@ impl RouterRuntime {
     }
 
     fn commit_plan(&self, plan: &RoutePlan) {
-        self.record_route(plan.prefill_group, plan.decode_group);
+        self.record_route(
+            plan.prefill.engine.spec.group,
+            plan.decode.engine.spec.group,
+        );
         let routing_key = plan.features.routing_key.as_ref();
         self.commit_selection(routing_key, &plan.prefill);
         self.commit_selection(routing_key, &plan.decode);
@@ -796,8 +726,8 @@ impl RouterRuntime {
                 .insert(
                     StickyKey {
                         routing_key: key.clone(),
-                        role: selection.role,
-                        group: selection.group,
+                        role: selection.engine.spec.role,
+                        group: selection.engine.spec.group,
                     },
                     selection.engine.spec.id.clone(),
                 );
@@ -807,7 +737,7 @@ impl RouterRuntime {
             .engine
             .local_dispatch_total
             .fetch_add(1, Ordering::Relaxed);
-        self.record_policy(selection.role, selection.branch);
+        self.record_policy(selection.engine.spec.role, selection.branch);
     }
 
     fn record_route(&self, prefill_group: ContextGroup, decode_group: ContextGroup) {
@@ -883,7 +813,7 @@ fn score_for_engine(
 }
 
 fn load_score(work: usize, token_usage: Option<f64>, lambda: f64) -> f64 {
-    let work = work.to_f64().unwrap_or(f64::MAX);
+    let work = usize_to_f64(work);
     let usage = token_usage
         .filter(|value| value.is_finite())
         .unwrap_or(0.0)
@@ -923,8 +853,6 @@ impl AppState {
 
         let plan = RoutePlan {
             features,
-            prefill_group,
-            decode_group,
             prefill,
             decode,
         };
@@ -954,21 +882,13 @@ impl AppState {
 }
 
 pub fn app(state: AppState) -> Router {
-    let enable_test_load_override = state.config().enable_test_load_override;
-    let router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/get_model_info", get(get_model_info))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/generate", post(generate))
-        .route("/debug/routing_stats", get(routing_stats));
-
-    if enable_test_load_override {
-        router
-            .route("/debug/test_load_override", post(test_load_override))
-            .with_state(state)
-    } else {
-        router.with_state(state)
-    }
+        .route("/debug/routing_stats", get(routing_stats))
+        .with_state(state)
 }
 
 /// Serve the router using the supplied local configuration.
@@ -977,17 +897,13 @@ pub fn app(state: AppState) -> Router {
 ///
 /// Returns an error if the TCP listener cannot bind or if the axum server exits
 /// with an error.
-pub async fn serve_config(config: RouterConfig) -> anyhow::Result<()> {
+pub async fn serve_config(config: RouterConfig) -> std::io::Result<()> {
     let listen_addr = config.listen_addr;
     let state = AppState::new(config);
     state.start_load_polling();
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("failed to bind router on {listen_addr}"))?;
+    let listener = TcpListener::bind(listen_addr).await?;
     tracing::info!("sglang-light-router listening on {}", listen_addr);
-    axum::serve(listener, app(state))
-        .await
-        .context("router server failed")
+    axum::serve(listener, app(state)).await
 }
 
 #[derive(Debug, Serialize)]
@@ -1058,7 +974,7 @@ async fn route_and_forward(
     let guard = LoadGuard::new(
         Arc::clone(&plan.prefill.engine),
         Arc::clone(&plan.decode.engine),
-        plan.features.uncached_prefill_tokens,
+        plan.features.prompt_tokens,
     );
     let response = forward_to_prefill_and_decode(&state, &plan, &headers, &body, endpoint).await?;
     let response = attach_guard(response, guard);
@@ -1082,7 +998,7 @@ impl ProxyEndpoint {
 }
 
 fn select_prefill_group(config: &RouterConfig, features: &RoutingFeatures) -> ContextGroup {
-    if features.uncached_prefill_tokens >= config.prefill_long_threshold {
+    if features.prompt_tokens >= config.prefill_long_threshold {
         ContextGroup::Long
     } else {
         ContextGroup::Short
@@ -1090,7 +1006,7 @@ fn select_prefill_group(config: &RouterConfig, features: &RoutingFeatures) -> Co
 }
 
 fn select_decode_group(config: &RouterConfig, features: &RoutingFeatures) -> ContextGroup {
-    if features.estimated_sequence_length >= config.decode_long_threshold {
+    if features.sequence_len() >= config.decode_long_threshold {
         ContextGroup::Long
     } else {
         ContextGroup::Short
@@ -1239,10 +1155,18 @@ async fn forward_to_prefill_and_decode(
     let prefill_url = upstream_url(prefill_engine, endpoint.path())?;
     let decode_url = upstream_url(decode_engine, endpoint.path())?;
 
-    let prefill_request = with_safe_request_headers(state.inner.client.post(prefill_url), headers)
+    let prefill_request = state
+        .inner
+        .client
+        .post(prefill_url)
+        .headers(safe_request_headers(headers))
         .json(body)
         .send();
-    let decode_request = with_safe_request_headers(state.inner.client.post(decode_url), headers)
+    let decode_request = state
+        .inner
+        .client
+        .post(decode_url)
+        .headers(safe_request_headers(headers))
         .json(body)
         .send();
     let (prefill_result, decode_result) = tokio::join!(prefill_request, decode_request);
@@ -1256,14 +1180,9 @@ async fn forward_to_prefill_and_decode(
         source,
     })?;
 
-    let status = decode_response.status();
-    let upstream_headers = decode_response.headers().clone();
-
+    let response = proxy_response(decode_response);
     consume_prefill_response(&prefill_engine.spec.id, prefill_response).await?;
 
-    let mut response = Response::new(Body::from_stream(decode_response.bytes_stream()));
-    *response.status_mut() = status;
-    copy_safe_response_headers(&upstream_headers, response.headers_mut());
     Ok(response)
 }
 
@@ -1274,7 +1193,7 @@ fn upstream_url(engine: &EngineState, path: &'static str) -> Result<Url, RouterE
         .join(path)
         .map_err(|source| RouterError::UpstreamUrl {
             engine_id: engine.spec.id.clone(),
-            source,
+            message: source.to_string(),
         })
 }
 
@@ -1312,7 +1231,7 @@ async fn forward_metadata_to_decode(
         .join(path)
         .map_err(|source| RouterError::UpstreamUrl {
             engine_id: decode.spec.id.clone(),
-            source,
+            message: source.to_string(),
         })?;
 
     let upstream = state
@@ -1326,19 +1245,16 @@ async fn forward_metadata_to_decode(
             engine_id: decode.spec.id.clone(),
             source,
         })?;
+    Ok(proxy_response(upstream))
+}
+
+fn proxy_response(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let upstream_headers = upstream.headers().clone();
     let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
     *response.status_mut() = status;
     copy_safe_response_headers(&upstream_headers, response.headers_mut());
-    Ok(response)
-}
-
-fn with_safe_request_headers(
-    request: reqwest::RequestBuilder,
-    headers: &HeaderMap,
-) -> reqwest::RequestBuilder {
-    request.headers(safe_request_headers(headers))
+    response
 }
 
 fn safe_request_headers(source: &HeaderMap) -> HeaderMap {
@@ -1366,55 +1282,37 @@ fn add_debug_headers(mut response: Response, config: &RouterConfig, plan: &Route
         return response;
     }
 
-    insert_static_header(
-        response.headers_mut(),
-        "x-sglang-prefill-group",
-        plan.prefill_group.as_str(),
-    );
-    insert_static_header(
-        response.headers_mut(),
-        "x-sglang-decode-group",
-        plan.decode_group.as_str(),
-    );
-    insert_header(
-        response.headers_mut(),
-        "x-sglang-prefill-worker",
-        &plan.prefill.engine.spec.id,
-    );
-    insert_header(
-        response.headers_mut(),
-        "x-sglang-decode-worker",
-        &plan.decode.engine.spec.id,
-    );
-    insert_static_header(
-        response.headers_mut(),
-        "x-sglang-prefill-policy-branch",
-        plan.prefill.branch.as_str(),
-    );
-    insert_static_header(
-        response.headers_mut(),
-        "x-sglang-decode-policy-branch",
-        plan.decode.branch.as_str(),
-    );
-    insert_header(
-        response.headers_mut(),
-        "x-sglang-prompt-tokens",
-        &plan.features.prompt_tokens.to_string(),
-    );
-    insert_header(
-        response.headers_mut(),
-        "x-sglang-max-new-tokens",
-        &plan.features.max_new_tokens.to_string(),
-    );
+    let prompt_tokens = plan.features.prompt_tokens.to_string();
+    let max_new_tokens = plan.features.max_new_tokens.to_string();
+    for (name, value) in [
+        (
+            "x-sglang-prefill-group",
+            plan.prefill.engine.spec.group.as_str(),
+        ),
+        (
+            "x-sglang-decode-group",
+            plan.decode.engine.spec.group.as_str(),
+        ),
+        (
+            "x-sglang-prefill-worker",
+            plan.prefill.engine.spec.id.as_str(),
+        ),
+        (
+            "x-sglang-decode-worker",
+            plan.decode.engine.spec.id.as_str(),
+        ),
+        (
+            "x-sglang-prefill-policy-branch",
+            plan.prefill.branch.as_str(),
+        ),
+        ("x-sglang-decode-policy-branch", plan.decode.branch.as_str()),
+        ("x-sglang-prompt-tokens", prompt_tokens.as_str()),
+        ("x-sglang-max-new-tokens", max_new_tokens.as_str()),
+    ] {
+        insert_header(response.headers_mut(), name, value);
+    }
 
     response
-}
-
-fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
-    headers.insert(
-        HeaderName::from_static(name),
-        HeaderValue::from_static(value),
-    );
 }
 
 fn insert_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
@@ -1518,7 +1416,7 @@ struct EngineStats {
     id: String,
     role: RouterRole,
     group: ContextGroup,
-    url: Url,
+    url: String,
     local_dispatch_total: usize,
     in_flight_requests: usize,
     work: usize,
@@ -1544,7 +1442,7 @@ impl AppState {
                     id: engine.spec.id.clone(),
                     role: engine.spec.role,
                     group: engine.spec.group,
-                    url: engine.spec.url.clone(),
+                    url: engine.spec.url.to_string(),
                     local_dispatch_total: engine.local_dispatch_total.load(Ordering::Relaxed),
                     in_flight_requests: engine.in_flight_requests.load(Ordering::Relaxed),
                     work: engine.local_work(engine.spec.role),
@@ -1572,57 +1470,6 @@ impl AppState {
             engines,
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct LoadOverrideRequest {
-    id: String,
-    healthy: Option<bool>,
-    work: Option<usize>,
-    total_tokens: Option<usize>,
-    token_usage: Option<f64>,
-    decode_batch_size: Option<usize>,
-    last_load_poll_ok: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct LoadOverrideResponse {
-    status: &'static str,
-}
-
-async fn test_load_override(
-    State(state): State<AppState>,
-    Json(request): Json<LoadOverrideRequest>,
-) -> Result<Json<LoadOverrideResponse>, RouterError> {
-    let engine = state
-        .inner
-        .engines_by_id
-        .get(&request.id)
-        .ok_or_else(|| RouterError::UnknownEngine(request.id.clone()))?;
-
-    if let Some(healthy) = request.healthy {
-        engine.set_healthy(healthy);
-    }
-    if let Some(work) = request.work {
-        engine.set_local_work_for_test(work);
-    }
-
-    let mut reported = engine.reported();
-    if request.total_tokens.is_some() {
-        reported.total_tokens = request.total_tokens;
-    }
-    if request.token_usage.is_some() {
-        reported.token_usage = request.token_usage;
-    }
-    if request.decode_batch_size.is_some() {
-        reported.decode_batch_size = request.decode_batch_size;
-    }
-    if let Some(last_ok) = request.last_load_poll_ok {
-        reported.last_ok = last_ok;
-    }
-    engine.set_reported(reported);
-
-    Ok(Json(LoadOverrideResponse { status: "ok" }))
 }
 
 async fn poll_engine_load(client: &reqwest::Client, engine: &EngineState) {
@@ -1705,9 +1552,14 @@ fn find_f64(object: &Value, keys: &[&str]) -> Option<f64> {
 }
 
 fn ratio(numerator: Option<usize>, denominator: Option<usize>) -> Option<f64> {
-    let numerator = numerator?.to_f64()?;
-    let denominator = denominator?.to_f64()?;
+    let numerator = usize_to_f64(numerator?);
+    let denominator = usize_to_f64(denominator?);
     (denominator > 0.0).then_some(numerator / denominator)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn usize_to_f64(value: usize) -> f64 {
+    value as f64
 }
 
 #[cfg(test)]
@@ -1719,13 +1571,10 @@ mod tests {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 20_000)),
             prefill_long_threshold: 10,
             decode_long_threshold: 20,
-            prefill_routing_policy_chain: "sticky,power_of_two".to_owned(),
-            decode_routing_policy_chain: "sticky,power_of_two".to_owned(),
             balance_abs_threshold: 2.0,
             balance_relative_upper_bound_limit: 2.0,
             load_score_token_usage_weight: 1.0,
             enable_routing_debug_headers: true,
-            enable_test_load_override: true,
             engines: vec![
                 engine(
                     "short-prefill-0",
@@ -1793,10 +1642,18 @@ mod tests {
         RoutingFeatures {
             routing_key: None,
             prompt_tokens,
-            uncached_prefill_tokens: prompt_tokens,
             max_new_tokens,
-            estimated_sequence_length: prompt_tokens + max_new_tokens,
         }
+    }
+
+    fn engine_by_id(state: &AppState, id: &str) -> Arc<EngineState> {
+        state
+            .inner
+            .engines
+            .iter()
+            .find(|engine| engine.spec.id == id)
+            .cloned()
+            .expect("engine exists")
     }
 
     #[test]
@@ -1813,9 +1670,8 @@ mod tests {
 
         assert_eq!(features.routing_key.as_deref(), Some("primary"));
         assert_eq!(features.prompt_tokens, 3);
-        assert_eq!(features.uncached_prefill_tokens, 3);
         assert_eq!(features.max_new_tokens, 7);
-        assert_eq!(features.estimated_sequence_length, 10);
+        assert_eq!(features.sequence_len(), 10);
     }
 
     #[test]
@@ -1890,8 +1746,8 @@ mod tests {
             .route_plan(&headers, &long_body)
             .expect("long route should select");
 
-        assert_eq!(long.prefill_group, ContextGroup::Long);
-        assert_eq!(long.decode_group, ContextGroup::Long);
+        assert_eq!(long.prefill.engine.spec.group, ContextGroup::Long);
+        assert_eq!(long.decode.engine.spec.group, ContextGroup::Long);
         assert_ne!(second.prefill.engine.spec.id, long.prefill.engine.spec.id);
         assert_ne!(second.decode.engine.spec.id, long.decode.engine.spec.id);
     }
@@ -1950,20 +1806,8 @@ mod tests {
     #[test]
     fn load_guard_lifetime_is_tied_to_attached_response_body() {
         let state = AppState::new(test_config());
-        let prefill = Arc::clone(
-            state
-                .inner
-                .engines_by_id
-                .get("short-prefill-0")
-                .expect("prefill engine exists"),
-        );
-        let decode = Arc::clone(
-            state
-                .inner
-                .engines_by_id
-                .get("short-decode-0")
-                .expect("decode engine exists"),
-        );
+        let prefill = engine_by_id(&state, "short-prefill-0");
+        let decode = engine_by_id(&state, "short-decode-0");
         let guard = LoadGuard::new(Arc::clone(&prefill), Arc::clone(&decode), 5);
         let response = attach_guard(Response::new(Body::empty()), guard);
 
@@ -1996,14 +1840,10 @@ mod tests {
     #[test]
     fn bootstrap_injection_requires_object_body() {
         let state = AppState::new(test_config());
-        let prefill = state
-            .inner
-            .engines_by_id
-            .get("short-prefill-0")
-            .expect("prefill engine exists");
+        let prefill = engine_by_id(&state, "short-prefill-0");
         let mut body = Value::Array(Vec::new());
 
-        let error = inject_bootstrap(&mut body, prefill, 1).expect_err("array is invalid");
+        let error = inject_bootstrap(&mut body, &prefill, 1).expect_err("array is invalid");
 
         assert!(matches!(error, RouterError::RequestBodyNotObject));
     }
@@ -2033,7 +1873,7 @@ mod tests {
 
         assert_eq!(features.prompt_tokens, 4);
         assert_eq!(features.max_new_tokens, 5);
-        assert_eq!(features.estimated_sequence_length, 9);
+        assert_eq!(features.sequence_len(), 9);
     }
 
     #[test]
@@ -2046,7 +1886,7 @@ mod tests {
 
         assert_eq!(features.prompt_tokens, 4);
         assert_eq!(features.max_new_tokens, 5);
-        assert_eq!(features.estimated_sequence_length, 9);
+        assert_eq!(features.sequence_len(), 9);
     }
 
     #[test]

@@ -1,9 +1,8 @@
-use anyhow::Context;
 use clap::Parser;
 use sglang_light_router::{Cli, RouterConfig, serve_config};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -12,6 +11,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = RouterConfig::try_from(cli).context("invalid router configuration")?;
-    serve_config(config).await
+    let config = RouterConfig::try_from(cli)?;
+    serve_config(config).await?;
+    Ok(())
 }
