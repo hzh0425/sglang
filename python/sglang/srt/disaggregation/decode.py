@@ -25,7 +25,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -56,7 +56,11 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    EvictParams,
+    InitLoadBackParams,
+)
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -97,6 +101,88 @@ def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _tree_cache_class_name(tree_cache: BasePrefixCache) -> str:
+    return tree_cache.__class__.__name__
+
+
+def _supports_mamba_cache(tree_cache: BasePrefixCache) -> bool:
+    supports_mamba = getattr(tree_cache, "supports_mamba", None)
+    return bool(supports_mamba and supports_mamba())
+
+
+def pd_decode_hicache_incremental_scope_error(
+    *,
+    server_args: ServerArgs,
+    transfer_backend: TransferBackend,
+    tree_cache: BasePrefixCache,
+    enable_hisparse: bool,
+    enable_staging: bool,
+    uses_swa_tail_prealloc: bool,
+    spec_enabled: bool,
+) -> Optional[str]:
+    if not getattr(server_args, "disaggregation_decode_enable_radix_cache", False):
+        return None
+
+    if not getattr(server_args, "enable_hierarchical_cache", False):
+        return None
+
+    unsupported = []
+    tree_cache_name = _tree_cache_class_name(tree_cache)
+    if tree_cache_name != "HiRadixCache":
+        unsupported.append(f"tree_cache={tree_cache_name}")
+    if transfer_backend != TransferBackend.MOONCAKE:
+        unsupported.append(f"transfer_backend={transfer_backend.value}")
+    if enable_hisparse:
+        unsupported.append("enable_hisparse=True")
+    if enable_staging:
+        unsupported.append("staging_buffer=True")
+    if uses_swa_tail_prealloc:
+        unsupported.append("swa_tail_prealloc=True")
+    if _supports_mamba_cache(tree_cache):
+        unsupported.append("mamba_cache=True")
+    if spec_enabled:
+        unsupported.append("spec_decode=True")
+
+    if not unsupported:
+        return None
+
+    return (
+        "PD decode HiCache incremental transfer supports only "
+        "Mooncake + full KV + HiRadixCache + decode radix cache; got "
+        + ", ".join(unsupported)
+    )
+
+
+@dataclass
+class DecodePrefixMatch:
+    prefix_indices: torch.Tensor
+    l1_prefix_len: int
+    l2_host_hit_length: int
+    l3_storage_hit_length: int
+    decode_prefix_len: int
+    last_device_node: Any
+    last_host_node: Any
+    best_match_node: Any
+    prefetch_registered: bool = False
+
+    @property
+    def needs_local_restore(self) -> bool:
+        return self.decode_prefix_len > self.l1_prefix_len
+
+
+def _pd_decode_hicache_incremental_enabled(
+    server_args: ServerArgs,
+    transfer_backend: TransferBackend,
+    tree_cache: BasePrefixCache,
+) -> bool:
+    return (
+        getattr(server_args, "disaggregation_decode_enable_radix_cache", False)
+        and getattr(server_args, "enable_hierarchical_cache", False)
+        and transfer_backend == TransferBackend.MOONCAKE
+        and _tree_cache_class_name(tree_cache) == "HiRadixCache"
+    )
 
 
 class DecodeReqToTokenPool:
@@ -247,6 +333,15 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    prefix_match: Optional[DecodePrefixMatch] = None
+    delta_kv_indices: Optional[torch.Tensor] = None
+    loadback_indices: Optional[torch.Tensor] = None
+    loadback_node: Any = None
+    local_restore_started: bool = False
+    local_restore_done: bool = False
+    local_restore_failed: bool = False
+    local_restore_error: Optional[str] = None
+    pd_transfer_done: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -330,6 +425,27 @@ class DecodePreallocQueue:
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+            )
+        scope_error = pd_decode_hicache_incremental_scope_error(
+            server_args=self.scheduler.server_args,
+            transfer_backend=self.transfer_backend,
+            tree_cache=self.tree_cache,
+            enable_hisparse=self.scheduler.enable_hisparse,
+            enable_staging=self.enable_staging,
+            uses_swa_tail_prealloc=self._uses_swa_tail_prealloc(),
+            spec_enabled=not self.scheduler.spec_algorithm.is_none(),
+        )
+        if scope_error is not None:
+            raise RuntimeError(scope_error)
+        if (
+            _pd_decode_hicache_incremental_enabled(
+                self.scheduler.server_args, self.transfer_backend, self.tree_cache
+            )
+            and self.kv_manager.kv_args.state_types
+        ):
+            raise RuntimeError(
+                "PD decode HiCache incremental transfer supports only full KV "
+                f"without auxiliary state transfer; got state_types={self.kv_manager.kv_args.state_types}"
             )
 
     def _uses_swa_tail_prealloc(self) -> bool:
@@ -470,7 +586,7 @@ class DecodePreallocQueue:
 
             self.pending_reqs.append(decode_req)
 
-    def _match_prefix_and_lock(self, req: Req) -> Tuple[torch.Tensor, int]:
+    def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
@@ -487,7 +603,68 @@ class DecodePreallocQueue:
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(last_device_node)
 
-        return prefix_indices, len(prefix_indices)
+        l1_prefix_len = len(prefix_indices)
+        page_size = self.token_to_kv_pool_allocator.page_size
+        if page_size > 1 and l1_prefix_len % page_size != 0:
+            l1_prefix_len = page_align_floor(l1_prefix_len, page_size)
+            prefix_indices = prefix_indices[:l1_prefix_len]
+
+        l2_host_hit_length = result.host_hit_length
+        if page_size > 1 and l2_host_hit_length % page_size != 0:
+            l2_host_hit_length = page_align_floor(l2_host_hit_length, page_size)
+
+        l3_storage_hit_length = 0
+        prefetch_registered = False
+        if (
+            l2_host_hit_length >= 0
+            and _pd_decode_hicache_incremental_enabled(
+                self.scheduler.server_args, self.transfer_backend, self.tree_cache
+            )
+            and hasattr(self.tree_cache, "query_storage_hit_length")
+        ):
+            matched_len = l1_prefix_len + l2_host_hit_length
+            suffix_tokens = req.origin_input_ids[matched_len:]
+            last_host_node = result.last_host_node
+            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                last_hash = last_host_node.get_last_hash_value()
+                prefix_keys = (
+                    last_host_node.get_prefix_hash_values(last_host_node.parent)
+                    if self.tree_cache.hicache_storage_pass_prefix_keys
+                    else None
+                )
+                l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
+                    last_host_node,
+                    suffix_tokens,
+                    last_hash,
+                    prefix_keys,
+                )
+                if l3_storage_hit_length > 0:
+                    self.tree_cache.prefetch_from_storage(
+                        req.rid,
+                        last_host_node,
+                        suffix_tokens[:l3_storage_hit_length],
+                        last_hash,
+                        prefix_keys,
+                    )
+                    prefetch_registered = req.rid in self.tree_cache.ongoing_prefetch
+                    if not prefetch_registered:
+                        l3_storage_hit_length = 0
+
+        decode_prefix_len = l1_prefix_len + l2_host_hit_length + l3_storage_hit_length
+        if page_size > 1 and decode_prefix_len % page_size != 0:
+            decode_prefix_len = page_align_floor(decode_prefix_len, page_size)
+
+        return DecodePrefixMatch(
+            prefix_indices=prefix_indices,
+            l1_prefix_len=l1_prefix_len,
+            l2_host_hit_length=l2_host_hit_length,
+            l3_storage_hit_length=l3_storage_hit_length,
+            decode_prefix_len=decode_prefix_len,
+            last_device_node=last_device_node,
+            last_host_node=result.last_host_node,
+            best_match_node=result.best_match_node,
+            prefetch_registered=prefetch_registered,
+        )
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -822,19 +999,30 @@ class DecodePreallocQueue:
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
+            prefix_match: Optional[DecodePrefixMatch] = None
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
-                prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
-                # Align prefix_len down to page boundary so both prefill and
-                # decode agree on the page-aligned split point for KV transfer.
-                page_size = self.token_to_kv_pool_allocator.page_size
-                if page_size > 1 and prefix_len % page_size != 0:
-                    prefix_len = page_align_floor(prefix_len, page_size)
-                    prefix_indices = prefix_indices[:prefix_len]
+                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                prefix_indices = prefix_match.prefix_indices
+                prefix_len = prefix_match.l1_prefix_len
+                decode_prefix_len = prefix_match.decode_prefix_len
 
                 fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
+                if decode_prefix_len > 0:
+                    logger.info(
+                        "PD Delta decode prefix match: rid=%s, "
+                        "decode_prefix_len=%s, l1_prefix_len=%s, "
+                        "l2_host_hit_length=%s, l3_storage_hit_length=%s, "
+                        "delta_tokens=%s",
+                        decode_req.req.rid,
+                        decode_prefix_len,
+                        prefix_match.l1_prefix_len,
+                        prefix_match.l2_host_hit_length,
+                        prefix_match.l3_storage_hit_length,
+                        max(fill_len - decode_prefix_len, 0),
+                    )
                 required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
+                    fill_len=fill_len, prefix_len=decode_prefix_len
                 )
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
@@ -847,6 +1035,7 @@ class DecodePreallocQueue:
             else:
                 prefix_indices = None
                 prefix_len = 0
+                decode_prefix_len = 0
                 required_alloc_tokens = origin_input_len
 
             required_tokens_for_request = (
@@ -857,7 +1046,7 @@ class DecodePreallocQueue:
                 max(
                     required_tokens_for_request,
                     origin_input_len
-                    - prefix_len
+                    - decode_prefix_len
                     + min(
                         decode_req.req.sampling_params.max_new_tokens,
                         CLIP_MAX_NEW_TOKEN,
@@ -866,12 +1055,12 @@ class DecodePreallocQueue:
                 )
                 > full_allocatable_tokens
             ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if prefix_match is not None:
+                    self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if prefix_match is not None:
+                    self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
                 break
 
             if uses_swa_tail_prealloc:
@@ -888,11 +1077,21 @@ class DecodePreallocQueue:
                     )
                     > swa_allocatable_tokens
                 ):
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    if prefix_match is not None:
+                        self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
                     break
 
-            dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
+            dst_kv_indices = self._pre_alloc(
+                decode_req.req,
+                prefix_indices,
+                prefix_len,
+                decode_prefix_len,
+            )
+            decode_req.prefix_match = prefix_match
+            decode_req.delta_kv_indices = dst_kv_indices
+            decode_req.local_restore_done = (
+                prefix_match is None or not prefix_match.needs_local_restore
+            )
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
@@ -905,12 +1104,12 @@ class DecodePreallocQueue:
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
-            decode_req.req.cache_protected_len = prefix_len
+            decode_req.req.cache_protected_len = decode_prefix_len
 
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
-                    dst_kv_indices[: origin_input_len - prefix_len]
+                    dst_kv_indices[: origin_input_len - decode_prefix_len]
                     .cpu()
                     .numpy()
                     .astype(np.int32)
@@ -920,7 +1119,7 @@ class DecodePreallocQueue:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
                     self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
-                        prefix_len:origin_input_len
+                        decode_prefix_len:origin_input_len
                     ]
                     .cpu()
                     .numpy()
@@ -985,7 +1184,7 @@ class DecodePreallocQueue:
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
-                decode_prefix_len=prefix_len,
+                decode_prefix_len=decode_prefix_len,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1197,10 +1396,13 @@ class DecodePreallocQueue:
         req: Req,
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
+        decode_prefix_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
         if prefix_len is None:
             prefix_len = 0
+        if decode_prefix_len is None:
+            decode_prefix_len = prefix_len
 
         req_pool_indices = self.req_to_token_pool.alloc([req])
 
@@ -1210,7 +1412,7 @@ class DecodePreallocQueue:
 
         fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
         req.kv_allocated_len = fill_len
-        req.kv_committed_len = fill_len
+        req.kv_committed_len = prefix_len
 
         if prefix_len > 0:
             self.req_to_token_pool.write(
@@ -1220,9 +1422,9 @@ class DecodePreallocQueue:
         # TODO(retraction): when retraction is implemented with radix cache
         # awareness, a retracted request should re-match the tree here
         # instead of re-allocating from scratch. See resume_retracted_reqs.
-        delta_len = fill_len - prefix_len
+        delta_len = fill_len - decode_prefix_len
         required_alloc_tokens = self._required_alloc_tokens(
-            fill_len=fill_len, prefix_len=prefix_len
+            fill_len=fill_len, prefix_len=decode_prefix_len
         )
 
         # Evict cached entries if the pool doesn't have enough free pages.
@@ -1241,7 +1443,7 @@ class DecodePreallocQueue:
                     f"after evicting {result.num_tokens_evicted}/{num_to_evict} tokens. "
                     f"evictable_size={self.tree_cache.evictable_size()}, "
                     f"protected_size={self.tree_cache.protected_size()}, "
-                    f"fill_len={fill_len}, prefix_len={prefix_len}, delta_len={delta_len}, "
+                    f"fill_len={fill_len}, prefix_len={prefix_len}, decode_prefix_len={decode_prefix_len}, delta_len={delta_len}, "
                     f"page_size={self.token_to_kv_pool_allocator.page_size}, "
                     f"req={req.rid}"
                 )
@@ -1250,6 +1452,7 @@ class DecodePreallocQueue:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
             assert prefix_len == 0
+            assert decode_prefix_len == 0
 
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
@@ -1298,9 +1501,11 @@ class DecodePreallocQueue:
             else:
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
                     prefix_lens=torch.tensor(
-                        [prefix_len], dtype=torch.int64, device=device
+                        [decode_prefix_len], dtype=torch.int64, device=device
                     ),
-                    prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
+                    prefix_lens_cpu=torch.tensor(
+                        [decode_prefix_len], dtype=torch.int64
+                    ),
                     seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
@@ -1313,13 +1518,17 @@ class DecodePreallocQueue:
             f"evictable={self.tree_cache.evictable_size()}, "
             f"protected={self.tree_cache.protected_size()}, "
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
-            f"fill={fill_len}, prefix={prefix_len}, "
+            f"fill={fill_len}, prefix={prefix_len}, decode_prefix={decode_prefix_len}, "
             f"page_size={self.token_to_kv_pool_allocator.page_size}, "
             f"req={req.rid}"
         )
 
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(prefix_len, prefix_len + len(kv_loc))), kv_loc
+            (
+                req.req_pool_idx,
+                slice(decode_prefix_len, decode_prefix_len + len(kv_loc)),
+            ),
+            kv_loc,
         )
 
         # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
@@ -1379,6 +1588,141 @@ class DecodeTransferQueue:
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _abort_decode_req_with_hicache_cleanup(
+        self, decode_req: DecodeRequest, error_message: str
+    ) -> None:
+        logger.error(error_message)
+        prepare_abort(
+            decode_req.req,
+            error_message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        if (
+            decode_req.prefix_match is not None
+            and decode_req.prefix_match.prefetch_registered
+            and hasattr(self.tree_cache, "release_aborted_request")
+        ):
+            self.tree_cache.release_aborted_request(decode_req.req.rid)
+        if decode_req.prefix_match is not None:
+            self.tree_cache.dec_lock_ref(decode_req.prefix_match.last_device_node)
+        if decode_req.kv_receiver is not None:
+            decode_req.kv_receiver.clear()
+            decode_req.kv_receiver = None
+        if decode_req.req.req_pool_idx is not None:
+            if decode_req.delta_kv_indices is not None:
+                self.tree_cache.token_to_kv_pool_allocator.free(
+                    decode_req.delta_kv_indices
+                )
+            self.tree_cache.req_to_token_pool.free(decode_req.req)
+
+    def _process_hicache_local_restore(self, decode_req: DecodeRequest) -> bool:
+        prefix_match = decode_req.prefix_match
+        if prefix_match is None or not prefix_match.needs_local_restore:
+            decode_req.local_restore_done = True
+            return True
+
+        if decode_req.local_restore_failed:
+            return True
+
+        if hasattr(self.tree_cache, "check_hicache_events"):
+            self.tree_cache.check_hicache_events()
+
+        if (
+            prefix_match.l3_storage_hit_length > 0
+            and not decode_req.local_restore_started
+        ):
+            if not self.tree_cache.check_prefetch_progress(decode_req.req.rid):
+                return False
+            loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(
+                decode_req.req.rid
+            )
+            if loaded_tokens < prefix_match.l3_storage_hit_length:
+                decode_req.local_restore_failed = True
+                decode_req.local_restore_error = (
+                    f"HiCache prefetch restored fewer tokens than committed for "
+                    f"rid={decode_req.req.rid}: decode_prefix_len={prefix_match.decode_prefix_len}, "
+                    f"expected_l3={prefix_match.l3_storage_hit_length}, actual_l3={loaded_tokens}"
+                )
+                return True
+
+        if not decode_req.local_restore_started:
+            if self.tree_cache.ongoing_load_back:
+                return False
+
+            rematch = match_prefix_for_req(
+                self.tree_cache,
+                decode_req.req,
+                decode_req.req.origin_input_ids,
+                cow_mamba=False,
+                include_req=True,
+            )
+            expected_host_tokens = (
+                prefix_match.l2_host_hit_length + prefix_match.l3_storage_hit_length
+            )
+            host_hit_length = min(rematch.host_hit_length, expected_host_tokens)
+            new_indices, loadback_node = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=rematch.best_match_node,
+                    host_hit_length=host_hit_length,
+                    req=decode_req.req,
+                    force=True,
+                )
+            )
+            if len(new_indices) < expected_host_tokens:
+                decode_req.local_restore_failed = True
+                decode_req.local_restore_error = (
+                    f"HiCache load_back restored fewer tokens than committed for "
+                    f"rid={decode_req.req.rid}: decode_prefix_len={prefix_match.decode_prefix_len}, "
+                    f"expected_loadback={expected_host_tokens}, actual_loadback={len(new_indices)}"
+                )
+                return True
+            decode_req.loadback_indices = new_indices[:expected_host_tokens]
+            decode_req.loadback_node = loadback_node
+            decode_req.local_restore_started = True
+            self.tree_cache.ready_to_load_host_cache()
+
+        if (
+            decode_req.loadback_node is not None
+            and decode_req.loadback_node.id in self.tree_cache.ongoing_load_back
+        ):
+            return False
+
+        decode_req.local_restore_done = True
+        return True
+
+    def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
+        prefix_match = decode_req.prefix_match
+        if prefix_match is None:
+            return
+
+        if prefix_match.needs_local_restore:
+            self.tree_cache.req_to_token_pool.write(
+                (
+                    decode_req.req.req_pool_idx,
+                    slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
+                ),
+                decode_req.loadback_indices,
+            )
+            decode_req.req.prefix_indices = torch.cat(
+                [prefix_match.prefix_indices, decode_req.loadback_indices]
+            )
+            decode_req.req.last_node = decode_req.loadback_node
+        else:
+            decode_req.req.prefix_indices = prefix_match.prefix_indices
+            decode_req.req.last_node = prefix_match.last_device_node
+
+        fill_len = len(decode_req.req.origin_input_ids) + max(
+            len(decode_req.req.output_ids) - 1, 0
+        )
+        decode_req.req.cache_protected_len = prefix_match.decode_prefix_len
+        decode_req.req.kv_committed_len = fill_len
+        decode_req.req.fill_ids = (
+            decode_req.req.origin_input_ids + decode_req.req.output_ids
+        )[:fill_len]
+        decode_req.req.set_extend_input_len(
+            len(decode_req.req.fill_ids) - len(decode_req.req.prefix_indices)
+        )
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
         Returns:
@@ -1432,6 +1776,8 @@ class DecodeTransferQueue:
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
             return True
+
+        self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
         decode_req.req.output_ids.append(output_id[0].item())
@@ -1496,30 +1842,53 @@ class DecodeTransferQueue:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
 
+            local_restore_ready = self._process_hicache_local_restore(decode_req)
+            if decode_req.local_restore_failed:
+                self._abort_decode_req_with_hicache_cleanup(
+                    decode_req,
+                    decode_req.local_restore_error
+                    or f"HiCache local restore failed for request {decode_req.req.rid}",
+                )
+                self.scheduler.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                indices_to_remove.add(i)
+                if self.scheduler.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
+                continue
+
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
                     decode_req.kv_receiver.failure_exception()
                 except Exception as e:
                     error_message += f" with exception {e}"
-                logger.error(error_message)
-                prepare_abort(
-                    decode_req.req,
-                    error_message,
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                if decode_req.prefix_match is not None:
+                    self._abort_decode_req_with_hicache_cleanup(
+                        decode_req, error_message
+                    )
+                else:
+                    logger.error(error_message)
+                    prepare_abort(
+                        decode_req.req,
+                        error_message,
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
+                    # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                    release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 self.scheduler.stream_output(
                     [decode_req.req], decode_req.req.return_logprob
                 )
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-                # release pre-allocated kv cache, but don't insert into the tree since it's failed
-                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue
             elif poll == KVPoll.Success:
+                decode_req.pd_transfer_done = True
+                if not local_restore_ready:
+                    continue
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
                     indices_to_remove.add(i)
@@ -1532,9 +1901,15 @@ class DecodeTransferQueue:
                             self.scheduler.hisparse_coordinator.request_finished(
                                 decode_req.req
                             )
-                        release_kv_cache(
-                            decode_req.req, self.tree_cache, is_insert=False
-                        )
+                        if decode_req.prefix_match is not None:
+                            self._abort_decode_req_with_hicache_cleanup(
+                                decode_req,
+                                f"Decode metadata commit aborted for request {decode_req.req.rid}",
+                            )
+                        else:
+                            release_kv_cache(
+                                decode_req.req, self.tree_cache, is_insert=False
+                            )
                         if self.scheduler.enable_metrics:
                             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                     else:

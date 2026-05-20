@@ -65,6 +65,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _short_hash(hash_value: Optional[str]) -> Optional[str]:
+    return hash_value[:12] if hash_value else None
+
+
 class HiRadixCache(RadixCache):
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
@@ -972,7 +976,10 @@ class HiRadixCache(RadixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
-        self, node: TreeNode, mem_quota: Optional[int] = None
+        self,
+        node: TreeNode,
+        mem_quota: Optional[int] = None,
+        force: bool = False,
     ) -> Optional[torch.Tensor]:
 
         start_time = time.perf_counter()
@@ -993,7 +1000,7 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
-        if len(host_indices) < self.load_back_threshold or (
+        if (not force and len(host_indices) < self.load_back_threshold) or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
@@ -1050,7 +1057,7 @@ class HiRadixCache(RadixCache):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
-            loading_values = self.load_back(last_node, mem_quota)
+            loading_values = self.load_back(last_node, mem_quota, force=params.force)
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
@@ -1064,6 +1071,56 @@ class HiRadixCache(RadixCache):
             self._empty_match_result.device_indices,
             last_node,
         )
+
+    def query_storage_hit_length(
+        self,
+        last_host_node: TreeNode,
+        new_input_tokens: List[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[List[str]] = None,
+    ) -> int:
+        if not self.enable_storage or self.cache_controller.prefetch_rate_limited():
+            return 0
+
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=last_host_node.key.extra_key,
+            is_bigram=self.is_eagle,
+        ).page_aligned(self.page_size)
+        if len(prefetch_key) < self.prefetch_threshold:
+            return 0
+
+        operation = PrefetchOperation(
+            "__storage_hit_query__",
+            self.cache_controller.mem_pool_host.get_dummy_flat_data_page()[:0],
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+        )
+        hash_values, storage_hit_count = self.cache_controller._storage_hit_query(
+            operation
+        )
+        storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+        )
+        storage_hit_count = storage_hit_count_tensor.item()
+        storage_hit_count = storage_hit_count - (storage_hit_count % self.page_size)
+        logger.info(
+            "HiCache storage hit query: node_id=%s, query_tokens=%s, "
+            "aligned_tokens=%s, hit_tokens=%s, hit_pages=%s, last_hash=%s, "
+            "first_hit_hash=%s, last_hit_hash=%s, prefix_keys=%s",
+            last_host_node.id,
+            len(new_input_tokens),
+            len(prefetch_key),
+            storage_hit_count,
+            storage_hit_count // self.page_size,
+            _short_hash(last_hash),
+            _short_hash(hash_values[0] if hash_values else None),
+            _short_hash(hash_values[-1] if hash_values else None),
+            len(prefix_keys) if prefix_keys else 0,
+        )
+        return storage_hit_count
 
     def ready_to_load_host_cache(self) -> int:
         """
@@ -1172,7 +1229,15 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        logger.info(
+            "HiCache storage prefetch terminate: req=%s, completed_tokens=%s, "
+            "hash_pages=%s, first_hash=%s, last_hash=%s",
+            req_id,
+            completed_tokens,
+            len(hash_value),
+            _short_hash(hash_value[0] if hash_value else None),
+            _short_hash(hash_value[-1] if hash_value else None),
+        )
 
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
@@ -1201,6 +1266,17 @@ class HiRadixCache(RadixCache):
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        logger.info(
+            "HiCache storage prefetch inserted: req=%s, requested_tokens=%s, "
+            "completed_tokens=%s, matched_existing_tokens=%s, loaded_tokens=%s, "
+            "node_id=%s",
+            req_id,
+            len(prefetch_key),
+            min_completed_tokens,
+            matched_length,
+            loaded_from_storage,
+            last_host_node.id,
+        )
 
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -1297,6 +1373,16 @@ class HiRadixCache(RadixCache):
                 last_host_node.release_host()
                 # no sufficient host memory for prefetch
                 return
+        logger.info(
+            "HiCache storage prefetch issued: req=%s, node_id=%s, tokens=%s, "
+            "pages=%s, last_hash=%s, prefix_keys=%s",
+            req_id,
+            last_host_node.id,
+            prefetch_length,
+            prefetch_length // self.page_size,
+            _short_hash(last_hash),
+            len(prefix_keys) if prefix_keys else 0,
+        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
