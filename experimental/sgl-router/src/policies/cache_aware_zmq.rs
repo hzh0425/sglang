@@ -37,6 +37,7 @@ use crate::config::CacheAwareConfig;
 
 use crate::discovery::ModelId;
 use crate::policies::kv_events::{compute_block_hashes, BlockSizeOracle, HashTree};
+use crate::policies::load_based::LoadBasedPolicy;
 use crate::policies::{Policy, SelectionContext};
 use crate::tokenizer::{adapter, TokenizerRegistry};
 use crate::workers::Worker;
@@ -89,10 +90,7 @@ impl CacheAwareZmqPolicy {
     /// is the order the registry returned, i.e. dashmap-undefined). For
     /// production traffic the ties are rare; tests pin the load skew.
     fn pick_min_load(workers: &[Arc<Worker>]) -> Option<Arc<Worker>> {
-        workers
-            .iter()
-            .min_by_key(|w| w.active_load())
-            .map(Arc::clone)
+        LoadBasedPolicy::pick_min_load(workers)
     }
 
     /// Detect load imbalance. Returns `true` when the spread between max
@@ -186,43 +184,29 @@ impl CacheAwareZmqPolicy {
             }
         }
     }
-}
 
-impl Policy for CacheAwareZmqPolicy {
-    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
-        if workers.is_empty() {
+    /// Return a worker only when cache state gives a strong enough signal.
+    /// Fallback decisions are intentionally left to the caller so this can
+    /// be used as the middle step in a policy chain.
+    pub(crate) fn select_cache_hit(
+        &self,
+        workers: &[Arc<Worker>],
+        ctx: &SelectionContext<'_>,
+    ) -> Option<Arc<Worker>> {
+        if workers.is_empty() || self.is_imbalanced(workers) {
             return None;
         }
 
-        // 1. Load-imbalance fast-path: even the best cache hit gets
-        //    dropped in favour of evening out load.
-        if self.is_imbalanced(workers) {
-            return Self::pick_min_load(workers);
-        }
-
-        // 2. Extract the prompt text.
         let body = match ctx.request_body() {
             Some(b) if !b.is_empty() => b,
-            _ => return Self::pick_min_load(workers),
+            _ => return None,
         };
-        let Some(text) = Self::extract_prompt_text(body) else {
-            return Self::pick_min_load(workers);
-        };
-
-        // 3. Tokenize + hash + match.
-        let Some(tokens) = self.tokenize(ctx.model(), &text) else {
-            return Self::pick_min_load(workers);
-        };
-        // Source block_size from the worker — the router can only hash
-        // prompts at the block size the workers publish at. If no worker
-        // has registered yet (oracle empty), cache-aware routing has no
-        // ground truth to score against; fall back to min-load.
-        let Some(block_size) = self.block_size_oracle.get() else {
-            return Self::pick_min_load(workers);
-        };
+        let text = Self::extract_prompt_text(body)?;
+        let tokens = self.tokenize(ctx.model(), &text)?;
+        let block_size = self.block_size_oracle.get()?;
         let block_hashes = compute_block_hashes(&tokens, block_size as usize);
         if block_hashes.is_empty() {
-            return Self::pick_min_load(workers);
+            return None;
         }
         let matched = self.tree.match_prefix(None, &block_hashes);
         let match_rate = matched.matched_blocks as f32 / block_hashes.len() as f32;
@@ -235,17 +219,26 @@ impl Policy for CacheAwareZmqPolicy {
             "cache-aware-zmq match_prefix",
         );
         if match_rate <= self.config.cache_threshold || matched.workers.is_empty() {
-            return Self::pick_min_load(workers);
+            return None;
         }
-        // Among workers in the matched set, pick the lowest-load one.
         let matched_urls: std::collections::HashSet<&str> =
             matched.workers.iter().map(|kw| kw.url.as_str()).collect();
-        let best_matched: Option<Arc<Worker>> = workers
+        workers
             .iter()
             .filter(|w| matched_urls.contains(w.url.as_str()))
             .min_by_key(|w| w.active_load())
-            .map(Arc::clone);
-        best_matched.or_else(|| Self::pick_min_load(workers))
+            .map(Arc::clone)
+    }
+}
+
+impl Policy for CacheAwareZmqPolicy {
+    fn select(&self, workers: &[Arc<Worker>], ctx: &SelectionContext<'_>) -> Option<Arc<Worker>> {
+        if workers.is_empty() {
+            return None;
+        }
+
+        self.select_cache_hit(workers, ctx)
+            .or_else(|| Self::pick_min_load(workers))
     }
 }
 
@@ -298,11 +291,13 @@ mod tests {
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                pd_bucket: None,
             }],
             discovery: crate::config::DiscoveryConfig {
                 backend: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
                         urls: vec!["http://placeholder:0".into()],
+                        worker_groups: Vec::new(),
                     },
                 ),
             },

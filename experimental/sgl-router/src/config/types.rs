@@ -67,8 +67,9 @@ impl Default for ActiveLoadConfig {
 /// values at deserialization time and removes the runtime string match in
 /// the policy factory.
 ///
-/// Serialised as `"round_robin"` / `"random"` / `"power_of_two"` /
-/// `"cache_aware_zmq"`.
+/// Serialized as `"round_robin"` / `"random"` / `"power_of_two"` /
+/// `"cache_aware_zmq"` / `"load_based"` /
+/// `"sticky_session_cache_aware_load_based"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
@@ -76,10 +77,19 @@ pub enum PolicyKind {
     RoundRobin,
     Random,
     PowerOfTwo,
+    /// Selects the currently least-loaded worker. Used as the baseline
+    /// for sticky-session and cache-aware policy-chain comparisons.
+    LoadBased,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
     CacheAwareZmq,
+    /// Ordered chain: sticky session -> cache-aware ZMQ -> load-based fallback.
+    ///
+    /// Sticky routing uses `x-sgl-route-key`, `x-sglang-routing-key`, or
+    /// the request body's `session_id` field. Cache-aware tuning still
+    /// lives on `ModelConfig::cache_aware`.
+    StickySessionCacheAwareLoadBased,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +147,94 @@ pub struct ModelConfig {
     /// policy construction time.
     #[serde(default)]
     pub cache_aware: Option<CacheAwareConfig>,
+    /// Optional short/long PD bucket routing for this public model. When set,
+    /// the chat route selects a prefill and decode group before running the
+    /// in-group policy.
+    #[serde(default)]
+    pub pd_bucket: Option<PdBucketConfig>,
+}
+
+/// PD bucket routing thresholds for a model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdBucketConfig {
+    /// Optional ordered token buckets. When present, the first bucket whose
+    /// `max_tokens` is greater than the estimated token count wins; requests
+    /// beyond the last max use the last bucket.
+    #[serde(default)]
+    pub groups: Vec<PdBucketGroupConfig>,
+    #[serde(default = "default_short_group")]
+    pub short_group: String,
+    #[serde(default = "default_long_group")]
+    pub long_group: String,
+    /// Requests with estimated prefill tokens >= this threshold use
+    /// `long_group` for prefill, otherwise `short_group`.
+    #[serde(default = "default_pd_bucket_long_threshold")]
+    pub prefill_long_threshold: usize,
+    /// Requests with estimated sequence tokens >= this threshold use
+    /// `long_group` for decode, otherwise `short_group`.
+    #[serde(default = "default_pd_bucket_long_threshold")]
+    pub decode_long_threshold: usize,
+}
+
+impl Default for PdBucketConfig {
+    fn default() -> Self {
+        Self {
+            short_group: default_short_group(),
+            long_group: default_long_group(),
+            prefill_long_threshold: default_pd_bucket_long_threshold(),
+            decode_long_threshold: default_pd_bucket_long_threshold(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PdBucketGroupConfig {
+    pub group: String,
+    pub max_tokens: usize,
+}
+
+impl PdBucketConfig {
+    pub fn group_for_prefill(&self, tokens: usize) -> String {
+        self.group_for_tokens(tokens)
+            .unwrap_or_else(|| legacy_bucket_group(tokens, self.prefill_long_threshold, self))
+    }
+
+    pub fn group_for_decode(&self, tokens: usize) -> String {
+        self.group_for_tokens(tokens)
+            .unwrap_or_else(|| legacy_bucket_group(tokens, self.decode_long_threshold, self))
+    }
+
+    fn group_for_tokens(&self, tokens: usize) -> Option<String> {
+        if self.groups.is_empty() {
+            return None;
+        }
+        self.groups
+            .iter()
+            .find(|bucket| tokens < bucket.max_tokens)
+            .or_else(|| self.groups.last())
+            .map(|bucket| bucket.group.clone())
+    }
+}
+
+fn legacy_bucket_group(tokens: usize, long_threshold: usize, bucket: &PdBucketConfig) -> String {
+    if tokens >= long_threshold {
+        bucket.long_group.clone()
+    } else {
+        bucket.short_group.clone()
+    }
+}
+
+fn default_short_group() -> String {
+    "short".to_string()
+}
+
+fn default_long_group() -> String {
+    "long".to_string()
+}
+
+fn default_pd_bucket_long_threshold() -> usize {
+    512
 }
 
 /// Per-model cache-aware-ZMQ tuning.
@@ -314,6 +412,17 @@ pub enum DiscoveryBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticUrlsDiscoveryConfig {
     pub urls: Vec<String>,
+    /// Optional URL -> group tags used by PD bucket routing. The router still
+    /// learns each worker's model id and PD role from `/server_info`; this
+    /// field only adds an operator-defined group such as `short` or `long`.
+    #[serde(default)]
+    pub worker_groups: Vec<StaticUrlGroupConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StaticUrlGroupConfig {
+    pub url: String,
+    pub group: String,
 }
 
 /// Configuration for the Kubernetes `EndpointSlice` discovery backend.

@@ -89,6 +89,7 @@ mod tests {
     async fn exits_when_receiver_dropped() {
         let cfg = StaticUrlsDiscoveryConfig {
             urls: (0..10).map(|i| format!("http://w{i}:30000")).collect(),
+            worker_groups: Vec::new(),
         };
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
@@ -112,6 +113,7 @@ mod tests {
 
         let cfg = StaticUrlsDiscoveryConfig {
             urls: vec!["http://w0:30000".into(), "http://w1:30000".into()],
+            worker_groups: Vec::new(),
         };
         let (tx, mut rx) = mpsc::channel(8);
         let h = spawn(cfg, tx).await.unwrap();

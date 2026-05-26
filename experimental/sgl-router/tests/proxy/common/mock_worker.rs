@@ -24,6 +24,7 @@ pub struct CapturedHeaders {
     pub seen: HashSet<String>,            // names (kept for backwards compat)
     pub headers: HashMap<String, String>, // name -> value (last write wins)
     pub last_body: Option<Bytes>,
+    pub request_count: usize,
 }
 
 #[derive(Clone)]
@@ -398,6 +399,7 @@ async fn serve_tiny_server_info() -> Json<Value> {
 async fn chat(State(s): State<MockWorkerState>, headers: HeaderMap, body: Bytes) -> Response<Body> {
     {
         let mut g = s.captured.lock().unwrap();
+        g.request_count += 1;
         g.last_body = Some(body.clone());
         for (k, v) in headers.iter() {
             g.seen.insert(k.as_str().to_string());

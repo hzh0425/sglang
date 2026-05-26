@@ -56,6 +56,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                pd_bucket: None,
             },
             crate::config::ModelConfig {
                 id: "deepseek".into(),
@@ -63,6 +64,7 @@ mod tests {
                 policy: PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                pd_bucket: None,
             },
         ];
         let app = crate::server::app::build_router(std::sync::Arc::new(ctx));

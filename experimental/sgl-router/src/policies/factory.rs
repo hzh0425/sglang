@@ -6,6 +6,8 @@ use crate::discovery::ModelId;
 use crate::policies::{
     cache_aware_zmq::CacheAwareZmqPolicy,
     kv_events::{BlockSizeOracle, HashTree},
+    load_based::LoadBasedPolicy,
+    policy_chain::PolicyChain,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
@@ -32,9 +34,19 @@ pub fn build_policy(
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
+                cache_cfg,
+                tree,
+                tokenizers,
+                block_size_oracle,
+            ))
+        }
+        PolicyKind::StickySessionCacheAwareLoadBased => {
+            let cache_cfg = model.cache_aware.unwrap_or_default();
+            Arc::new(PolicyChain::sticky_session_cache_aware_load_based(
                 cache_cfg,
                 tree,
                 tokenizers,
@@ -54,12 +66,21 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::RoundRobin => Arc::new(RoundRobinPolicy::new()),
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
+        PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
             // oracle so the test policy is constructible. Production
             // callers go through `build_policy` with the real
             // process-shared instances.
             Arc::new(CacheAwareZmqPolicy::new(
+                crate::config::CacheAwareConfig::default(),
+                Arc::new(HashTree::new()),
+                Arc::new(TokenizerRegistry::default()),
+                BlockSizeOracle::new(),
+            ))
+        }
+        PolicyKind::StickySessionCacheAwareLoadBased => {
+            Arc::new(PolicyChain::sticky_session_cache_aware_load_based(
                 crate::config::CacheAwareConfig::default(),
                 Arc::new(HashTree::new()),
                 Arc::new(TokenizerRegistry::default()),
@@ -132,11 +153,13 @@ mod tests {
                     policy: *p,
                     circuit_breaker: None,
                     cache_aware: None,
+                    pd_bucket: None,
                 })
                 .collect(),
             discovery: DiscoveryConfig {
                 backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: vec!["http://placeholder:0".into()],
+                    worker_groups: Vec::new(),
                 }),
             },
             proxy: ProxyConfig::default(),
@@ -150,7 +173,9 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::RoundRobin);
         let _ = build_policy_kind_only(PolicyKind::Random);
         let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
+        let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
+        let _ = build_policy_kind_only(PolicyKind::StickySessionCacheAwareLoadBased);
     }
 
     #[test]
@@ -181,6 +206,20 @@ mod tests {
         assert!(
             dbg.contains("CacheAwareZmqPolicy"),
             "expected CacheAwareZmqPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn sticky_session_cache_aware_load_based_builds_via_factory() {
+        let cfg = cfg_with_models(&[("modelA", PolicyKind::StickySessionCacheAwareLoadBased)]);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("PolicyChain"),
+            "expected PolicyChain debug repr, got: {dbg}",
         );
     }
 }

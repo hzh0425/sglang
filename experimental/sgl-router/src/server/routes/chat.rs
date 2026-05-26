@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::config::Config;
 use crate::discovery::{ModelId, WorkerMode};
-use crate::policies::registry::{PdPoolResolver, PdResolveError};
+use crate::policies::registry::{select_decode_with_affinity, PdPoolResolver, PdResolveError};
 use crate::policies::SelectionContext;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{RequestOutcome, StaleRequestOutcome, WorkerModeLabel};
+use crate::tokenizer::adapter;
 use crate::workers::{LoadGuard, Worker};
 use axum::body::Body;
 use axum::extract::State;
@@ -26,6 +28,10 @@ use std::sync::Arc;
 /// prefix matches `x-sgl-router-error-code` so router-emitted metadata
 /// stays grouped.
 const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url");
+const X_SGLANG_PREFILL_GROUP: HeaderName = HeaderName::from_static("x-sglang-prefill-group");
+const X_SGLANG_DECODE_GROUP: HeaderName = HeaderName::from_static("x-sglang-decode-group");
+const X_SGLANG_PREFILL_WORKER: HeaderName = HeaderName::from_static("x-sglang-prefill-worker");
+const X_SGLANG_DECODE_WORKER: HeaderName = HeaderName::from_static("x-sglang-decode-worker");
 
 /// Coarse char-count → token-count divisor used to estimate prefill load
 /// from the request body when no real tokenizer count is available. Four
@@ -37,18 +43,19 @@ const X_SGL_DECODE_URL: HeaderName = HeaderName::from_static("x-sgl-decode-url")
 /// purpose.
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
-/// Per-route body-size cap on `/v1/chat/completions`. 1 MiB is comfortable
-/// for normal chat traffic (a 200 k-token context tokenized as JSON is well
-/// under this) while preventing a hostile client from forcing the router to
-/// heap-allocate hundreds of MiB before forwarding. The cap is wired in
+/// Per-route body-size cap on `/v1/chat/completions`. 8 MiB leaves room for
+/// long-context multi-turn chat payloads while preventing a hostile client
+/// from forcing the router to heap-allocate hundreds of MiB before forwarding.
+/// The cap is wired in
 /// `crate::server::app::build_router` as a route-level `DefaultBodyLimit`
 /// layer; axum's `Bytes` extractor enforces it and returns 413
 /// PAYLOAD_TOO_LARGE before this handler runs.
-pub const MAX_CHAT_BODY_BYTES: usize = 1 << 20;
+pub const MAX_CHAT_BODY_BYTES: usize = 8 << 20;
 
-/// Minimal probe over the request body — we only need the `stream` field
-/// and the `model` field to decide between buffered vs SSE forwarding and
-/// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
+/// Minimal probe over the request body. We only need `stream`, `model`,
+/// optional routing key, and max output length to select a worker and choose
+/// buffered vs SSE forwarding. Deserializing into this struct (vs
+/// `serde_json::Value`)
 /// does two things:
 ///
 /// 1. Avoids the per-field heap allocation of `Value` for a 1 MiB body.
@@ -64,6 +71,93 @@ struct RequestProbe {
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    session_id: Option<serde_json::Value>,
+    #[serde(default)]
+    nvext: Option<NvExtProbe>,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
+    #[serde(default)]
+    messages: Option<Vec<MessageProbe>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageProbe {
+    #[serde(default)]
+    content: Option<MessageContentProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MessageContentProbe {
+    Text(String),
+    Parts(Vec<MessageContentPartProbe>),
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageContentPartProbe {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NvExtProbe {
+    #[serde(default)]
+    session_control: Option<SessionControlProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionControlProbe {
+    #[serde(default)]
+    session_id: Option<serde_json::Value>,
+}
+
+impl RequestProbe {
+    fn routing_key(&self) -> Option<String> {
+        if let Some(key) = self
+            .session_id
+            .as_ref()
+            .and_then(json_scalar_to_routing_key)
+        {
+            return Some(key);
+        }
+        self.nvext
+            .as_ref()?
+            .session_control
+            .as_ref()?
+            .session_id
+            .as_ref()
+            .and_then(json_scalar_to_routing_key)
+    }
+
+    fn output_tokens(&self) -> usize {
+        self.max_completion_tokens.or(self.max_tokens).unwrap_or(0)
+    }
+
+    fn prompt_text(&self) -> Option<String> {
+        let messages = self.messages.as_ref()?;
+        let mut text = String::new();
+        for message in messages {
+            match message.content.as_ref() {
+                Some(MessageContentProbe::Text(content)) => {
+                    text.push_str(content);
+                    text.push('\n');
+                }
+                Some(MessageContentProbe::Parts(parts)) => {
+                    for part in parts {
+                        if let Some(content) = &part.text {
+                            text.push_str(content);
+                            text.push('\n');
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        (!text.is_empty()).then_some(text)
+    }
 }
 
 /// POST /v1/chat/completions — parse model from body, select a healthy
@@ -77,10 +171,16 @@ pub async fn chat_completions(
 ) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
+    let routing_key = routing_key_from_headers(&headers).or_else(|| probe.routing_key());
+    let max_tokens = probe.output_tokens();
     let model_str = probe
         .model
+        .clone()
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
+    let prefill_load = estimate_prefill_tokens(&ctx, &model_str, &probe, &body);
+    let route_groups =
+        route_groups_for_request(&ctx.config, &model_id, &headers, prefill_load, max_tokens);
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
@@ -101,12 +201,21 @@ pub async fn chat_completions(
                 model: model_str.clone(),
             },
         })?;
+    let workers = filter_workers_by_group(workers, &ctx.config, route_groups.prefill.as_deref());
+    if workers.is_empty() {
+        return Err(ApiError::NoPrefillWorkersAvailable {
+            model: model_str.clone(),
+        });
+    }
 
     let policy = ctx
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
+    let scoped_routing_key =
+        scoped_routing_key(routing_key.as_deref(), route_groups.prefill.as_deref());
+    let selection_ctx =
+        SelectionContext::with_routing_key(&model_id, Some(&body), scoped_routing_key.as_deref());
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -127,29 +236,47 @@ pub async fn chat_completions(
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
+        let decode_candidates = resolver.decode_candidates(&model_id).map_err(|e| match e {
+            PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            },
+            PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                model: model_str.clone(),
+            },
+        })?;
+        let decode_candidates = filter_workers_by_group(
+            decode_candidates,
+            &ctx.config,
+            route_groups.decode.as_deref(),
+        );
+        if decode_candidates.is_empty() {
+            return Err(ApiError::NoDecodeWorkersAvailable {
+                model: model_str.clone(),
+            });
+        }
         Some(
-            resolver
-                .decode_with_affinity(&model_id, &worker.url)
-                .map_err(|e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                })?,
+            select_decode_with_affinity(&worker.url, &decode_candidates).ok_or_else(|| {
+                ApiError::NoDecodeWorkersAvailable {
+                    model: model_str.clone(),
+                }
+            })?,
         )
     } else {
         None
     };
     let decode_hint_url: Option<String> = decode_peer.as_ref().map(|d| d.url.clone());
+    let response_hints = RoutingResponseHints {
+        prefill_group: route_groups.prefill.clone(),
+        decode_group: decode_peer
+            .as_ref()
+            .and_then(|_| route_groups.decode.clone()),
+        prefill_worker: Some(worker.id.to_string()),
+        decode_worker: decode_peer.as_ref().map(|d| d.id.to_string()),
+        decode_url: decode_hint_url.clone(),
+    };
     let mut request_headers = headers;
     if let Some(url) = &decode_hint_url {
         match HeaderValue::from_str(url) {
@@ -186,7 +313,6 @@ pub async fn chat_completions(
     // future decode-side scheduler — current decode selection is
     // host-affinity only.
     let guard = worker.load_guard();
-    let prefill_load = estimate_prefill_tokens(&body);
     let active_guard =
         ctx.active_load
             .register(worker.id.clone(), worker.url.clone(), prefill_load, 0);
@@ -397,48 +523,161 @@ pub async fn chat_completions(
     ctx.metrics
         .record_request(&metrics_worker_url, &metrics_model, metrics_mode, outcome);
 
-    // Mirror the upstream `x-sgl-decode-url` hint onto the response so
-    // external tests / sidecars can observe PD decode affinity without
-    // sniffing the proxy hop. The request-side header was set above for
-    // the prefill worker; copying it here makes the affinity observable
-    // end-to-end. Plain-mode requests skip this (no decode peer was
-    // resolved). A malformed URL was already rejected at the
-    // request-side parse — we only reach this branch when the URL was
-    // header-valid, so the second parse is safe.
-    match (result, decode_hint_url) {
-        (Ok(mut response), Some(url)) => {
-            match HeaderValue::from_str(&url) {
-                Ok(v) => {
-                    response.headers_mut().insert(X_SGL_DECODE_URL, v);
-                }
-                Err(e) => {
-                    // Already-validated upstream; defensive log only.
-                    tracing::warn!(
-                        decode_url = %url,
-                        error = %e,
-                        "decode worker URL rejected by header parser on response; omitting response-side hint",
-                    );
-                }
-            }
+    // Mirror routing hints onto the response so external tests / sidecars
+    // can observe PD bucket and decode-affinity choices without sniffing
+    // the proxy hop. Plain-mode requests omit decode-only hints.
+    match result {
+        Ok(mut response) => {
+            attach_routing_response_headers(&mut response, &response_hints);
             Ok(response)
         }
-        (other, _) => other,
+        Err(e) => Err(e),
     }
 }
 
-/// Estimate prefill-token count from the raw request body for use as
-/// the active-load `prefill_load` counter. Returns 1 at minimum so
-/// a registered request always shows up as "load > 0" — under-counting
-/// to zero would hide the request from the cache-aware policy's
-/// load-imbalance fast-path.
-///
-/// This is a coarse approximation: we count the body length in bytes
-/// and divide by [`CHARS_PER_TOKEN_ESTIMATE`]. A future improvement is
-/// to thread the tokenizer's actual token count through (the
-/// cache-aware-zmq policy already tokenizes the prompt for tree
-/// matching — that count could be reused here).
-fn estimate_prefill_tokens(body: &Bytes) -> usize {
+/// Estimate prefill-token count for active-load and PD bucket routing.
+/// Prefer tokenizer counts over body-size heuristics so long-context
+/// buckets are keyed by tokens, not UTF-8 byte width. Non-text message
+/// shapes or tokenizer failures fall back to the old byte estimate.
+fn estimate_prefill_tokens(
+    ctx: &AppContext,
+    model_id: &str,
+    probe: &RequestProbe,
+    body: &Bytes,
+) -> usize {
+    if let (Some(tokenizer), Some(prompt_text)) =
+        (ctx.tokenizers.get(model_id), probe.prompt_text())
+    {
+        match adapter::encode(&tokenizer, &prompt_text) {
+            Ok(tokens) if !tokens.is_empty() => return tokens.len(),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, model = model_id, "tokenizer prefill estimate failed");
+            }
+        }
+    }
+    estimate_prefill_tokens_from_body(body)
+}
+
+fn estimate_prefill_tokens_from_body(body: &Bytes) -> usize {
     (body.len() / CHARS_PER_TOKEN_ESTIMATE).max(1)
+}
+
+#[derive(Debug, Default)]
+struct RouteGroups {
+    prefill: Option<String>,
+    decode: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RoutingResponseHints {
+    prefill_group: Option<String>,
+    decode_group: Option<String>,
+    prefill_worker: Option<String>,
+    decode_worker: Option<String>,
+    decode_url: Option<String>,
+}
+
+fn route_groups_for_request(
+    config: &Config,
+    model: &ModelId,
+    headers: &HeaderMap,
+    prefill_tokens: usize,
+    max_tokens: usize,
+) -> RouteGroups {
+    let prefill_override = group_from_header(headers, "x-sglang-prefill-group");
+    let decode_override = group_from_header(headers, "x-sglang-decode-group");
+    let Some(model_cfg) = config.models.iter().find(|m| m.id == model.0) else {
+        return RouteGroups {
+            prefill: prefill_override,
+            decode: decode_override,
+        };
+    };
+    let Some(bucket) = model_cfg.pd_bucket.as_ref() else {
+        return RouteGroups {
+            prefill: prefill_override,
+            decode: decode_override,
+        };
+    };
+    let sequence_tokens = prefill_tokens.saturating_add(max_tokens);
+    RouteGroups {
+        prefill: prefill_override.or_else(|| Some(bucket.group_for_prefill(prefill_tokens))),
+        decode: decode_override.or_else(|| Some(bucket.group_for_decode(sequence_tokens))),
+    }
+}
+
+fn group_from_header(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn filter_workers_by_group(
+    workers: Vec<Arc<Worker>>,
+    config: &Config,
+    group: Option<&str>,
+) -> Vec<Arc<Worker>> {
+    let Some(group) = group else {
+        return workers;
+    };
+    workers
+        .into_iter()
+        .filter(|worker| config.static_worker_group(&worker.url) == Some(group))
+        .collect()
+}
+
+fn scoped_routing_key(routing_key: Option<&str>, group: Option<&str>) -> Option<String> {
+    let routing_key = routing_key?;
+    Some(match group {
+        Some(group) => format!("{group}:{routing_key}"),
+        None => routing_key.to_string(),
+    })
+}
+
+fn attach_routing_response_headers(response: &mut Response<Body>, hints: &RoutingResponseHints) {
+    insert_response_header(response, X_SGL_DECODE_URL, hints.decode_url.as_deref());
+    insert_response_header(
+        response,
+        X_SGLANG_PREFILL_GROUP,
+        hints.prefill_group.as_deref(),
+    );
+    insert_response_header(
+        response,
+        X_SGLANG_DECODE_GROUP,
+        hints.decode_group.as_deref(),
+    );
+    insert_response_header(
+        response,
+        X_SGLANG_PREFILL_WORKER,
+        hints.prefill_worker.as_deref(),
+    );
+    insert_response_header(
+        response,
+        X_SGLANG_DECODE_WORKER,
+        hints.decode_worker.as_deref(),
+    );
+}
+
+fn insert_response_header(response: &mut Response<Body>, name: HeaderName, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    match HeaderValue::from_str(value) {
+        Ok(v) => {
+            response.headers_mut().insert(name, v);
+        }
+        Err(e) => {
+            tracing::warn!(
+                header = %name,
+                value = %value,
+                error = %e,
+                "routing response hint rejected by header parser",
+            );
+        }
+    }
 }
 
 /// Mint a fresh `bootstrap_room` for a PD-disagg request.
@@ -516,8 +755,8 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     //      This rejects `null` / `[]` / `"hi"` (all valid JSON but not
     //      request shape) without walking the full value into a
     //      `serde_json::Value` per field.
-    //   2. `RequestProbe` (struct of `Option<bool>` + `Option<String>`)
-    //      lifts out only the fields we care about — `stream` and `model`.
+    //   2. `RequestProbe` lifts out only the fields we care about for
+    //      routing and forwarding mode.
     //      Other fields are ignored; the worker is authoritative for the
     //      rest of the schema.
     let _: HashMap<String, IgnoredAny> = serde_json::from_slice(body).map_err(|e| {
@@ -529,6 +768,35 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
     })?;
     Ok(probe)
+}
+
+fn routing_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    ["x-sgl-route-key", "x-sglang-routing-key"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn json_scalar_to_routing_key(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -592,6 +860,49 @@ mod tests {
     }
 
     #[test]
+    fn parse_probe_reads_session_id_routing_key() {
+        let b = Bytes::from_static(br#"{"model":"tiny","session_id":" session-a "}"#);
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.routing_key().as_deref(), Some("session-a"));
+    }
+
+    #[test]
+    fn parse_probe_reads_nvext_session_control_routing_key() {
+        let b = Bytes::from_static(
+            br#"{"model":"tiny","nvext":{"session_control":{"session_id":" session-a ","action":"open","timeout":300}}}"#,
+        );
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.routing_key().as_deref(), Some("session-a"));
+    }
+
+    #[test]
+    fn parse_probe_prefers_top_level_session_id() {
+        let b = Bytes::from_static(
+            br#"{"model":"tiny","session_id":"top","nvext":{"session_control":{"session_id":"nested"}}}"#,
+        );
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.routing_key().as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn parse_probe_prefers_max_completion_tokens() {
+        let b =
+            Bytes::from_static(br#"{"model":"tiny","max_tokens":8,"max_completion_tokens":16}"#);
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.output_tokens(), 16);
+    }
+
+    #[test]
+    fn routing_key_prefers_supported_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sglang-routing-key", "manual-a".parse().unwrap());
+        assert_eq!(
+            routing_key_from_headers(&headers).as_deref(),
+            Some("manual-a")
+        );
+    }
+
+    #[test]
     fn parse_probe_rejects_non_object_shapes() {
         // Pin the contract: degenerate JSON (valid JSON but wrong shape)
         // must be rejected, not silently forwarded with `stream=false`.
@@ -626,6 +937,23 @@ mod tests {
             }"#,
         );
         assert_eq!(parse_probe(&b).unwrap().stream, Some(true));
+    }
+
+    #[test]
+    fn parse_probe_collects_text_message_content_for_token_estimate() {
+        let b = Bytes::from_static(
+            br#"{
+              "model": "x",
+              "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": [{"type": "text", "text": "world"}]}
+              ]
+            }"#,
+        );
+        assert_eq!(
+            parse_probe(&b).unwrap().prompt_text().as_deref(),
+            Some("hello\nworld\n")
+        );
     }
 
     #[test]

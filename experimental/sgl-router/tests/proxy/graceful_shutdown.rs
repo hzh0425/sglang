@@ -46,10 +46,12 @@ fn build_ctx_with_worker(worker_url: &str) -> Arc<AppContext> {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            pd_bucket: None,
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
+                worker_groups: Vec::new(),
             }),
         },
         proxy: ProxyConfig::default(),

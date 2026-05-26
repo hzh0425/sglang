@@ -71,11 +71,13 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             policy: sgl_router::config::PolicyKind::CacheAwareZmq,
             circuit_breaker: None,
             cache_aware: None,
+            pd_bucket: None,
         }],
         discovery: sgl_router::config::DiscoveryConfig {
             backend: sgl_router::config::DiscoveryBackend::StaticUrls(
                 sgl_router::config::StaticUrlsDiscoveryConfig {
                     urls: vec!["http://placeholder:0".into()],
+                    worker_groups: Vec::new(),
                 },
             ),
         },
