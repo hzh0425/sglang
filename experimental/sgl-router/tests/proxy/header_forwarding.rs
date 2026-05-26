@@ -33,10 +33,12 @@ async fn forwards_whitelisted_headers_strips_others() {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            pd_bucket: None,
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
+                worker_groups: Vec::new(),
             }),
         },
         proxy: ProxyConfig::default(),

@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 async fn emits_one_added_per_url_with_plain_seed() {
     let cfg = StaticUrlsDiscoveryConfig {
         urls: vec!["http://x:30000".into(), "http://y:30000".into()],
+        worker_groups: Vec::new(),
     };
     let (tx, mut rx) = mpsc::channel(16);
     let _h = sgl_router::discovery::static_urls::spawn(cfg, tx)
@@ -56,6 +57,7 @@ async fn emits_one_added_per_url_with_plain_seed() {
 async fn emits_one_event_and_parks_until_receiver_dropped() {
     let cfg = StaticUrlsDiscoveryConfig {
         urls: vec!["http://x:30000".into()],
+        worker_groups: Vec::new(),
     };
     let (tx, mut rx) = mpsc::channel(16);
     let h = sgl_router::discovery::static_urls::spawn(cfg, tx)
@@ -131,6 +133,7 @@ async fn static_urls_pd_role_resolved_end_to_end() {
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec![url.clone()],
+                worker_groups: Vec::new(),
             }),
         },
         proxy: ProxyConfig::default(),

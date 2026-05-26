@@ -250,10 +250,9 @@ pub fn select_decode_with_affinity(
         .filter(|w| w.breaker.would_allow())
         .collect();
 
-    // Compute the median load over the closed-breaker subset.  Empty
-    // subset → median is 0 (means: every peer's breaker is open; the
-    // affinity gate is moot, we'll fall through to the last-resort
-    // branch).
+    // Compute the median load over the closed-breaker subset. Empty subset
+    // means every peer's breaker is open, so we'll fall through to the
+    // last-resort branch. A zero median admits only idle affinity peers.
     let load_tolerance = if healthy.is_empty() {
         0
     } else {
@@ -265,10 +264,12 @@ pub fn select_decode_with_affinity(
 
     // Rule 1: same-host AND healthy AND not overloaded.
     if let Some(host) = prefill_host.as_deref() {
-        let affinity_peer = healthy.iter().find(|w| {
-            host_of(&w.url).as_deref() == Some(host)
-                && (load_tolerance == 0 || w.active_load() <= load_tolerance)
-        });
+        let affinity_peer = healthy
+            .iter()
+            .filter(|w| {
+                host_of(&w.url).as_deref() == Some(host) && w.active_load() <= load_tolerance
+            })
+            .min_by_key(|w| w.active_load());
         if let Some(w) = affinity_peer {
             return Some(Arc::clone(w));
         }
@@ -523,6 +524,33 @@ mod tests {
             chosen.url, "http://host_a:30001",
             "same-host decode peer must win over remote peer",
         );
+    }
+
+    #[test]
+    fn decoder_picks_lowest_load_same_host_peer() {
+        let r = registry(&[
+            spec_with_url("p1", "http://host_a:30000", WorkerMode::Prefill, "m"),
+            spec_with_url("d1", "http://host_a:30001", WorkerMode::Decode, "m"),
+            spec_with_url("d2", "http://host_a:30002", WorkerMode::Decode, "m"),
+            spec_with_url("d3", "http://host_b:30001", WorkerMode::Decode, "m"),
+        ]);
+        let resolver = PdPoolResolver::new(r);
+        let pool = resolver
+            .workers
+            .healthy_workers_for(&ModelId("m".into()))
+            .into_iter()
+            .filter(|w| w.mode() == WorkerMode::Decode)
+            .collect::<Vec<_>>();
+        let d1 = pool
+            .iter()
+            .find(|w| w.url == "http://host_a:30001")
+            .unwrap();
+        let _busy = d1.load_guard();
+
+        let chosen = resolver
+            .decode_with_affinity(&ModelId("m".into()), "http://host_a:30000")
+            .unwrap();
+        assert_eq!(chosen.url, "http://host_a:30002");
     }
 
     /// Affinity peer's breaker is open → fall back to the remote

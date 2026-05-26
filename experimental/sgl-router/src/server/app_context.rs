@@ -105,6 +105,7 @@ impl AppContext {
                     backend: crate::config::DiscoveryBackend::StaticUrls(
                         crate::config::StaticUrlsDiscoveryConfig {
                             urls: vec!["http://placeholder:0".into()],
+                            worker_groups: Vec::new(),
                         },
                     ),
                 },

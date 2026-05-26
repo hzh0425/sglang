@@ -35,6 +35,46 @@ impl Config {
             if m.id.is_empty() {
                 return Err(anyhow!("model.id must be non-empty"));
             }
+            if let Some(bucket) = &m.pd_bucket {
+                if bucket.groups.is_empty()
+                    && (bucket.short_group.trim().is_empty() || bucket.long_group.trim().is_empty())
+                {
+                    return Err(anyhow!(
+                        "model {:?} pd_bucket group names must be non-empty",
+                        m.id
+                    ));
+                }
+                if bucket.groups.is_empty() && bucket.short_group == bucket.long_group {
+                    return Err(anyhow!(
+                        "model {:?} pd_bucket short_group and long_group must differ",
+                        m.id
+                    ));
+                }
+                if bucket.groups.is_empty()
+                    && (bucket.prefill_long_threshold == 0 || bucket.decode_long_threshold == 0)
+                {
+                    return Err(anyhow!(
+                        "model {:?} pd_bucket thresholds must be greater than zero",
+                        m.id
+                    ));
+                }
+                let mut previous_max_tokens = 0;
+                for group in &bucket.groups {
+                    if group.group.trim().is_empty() {
+                        return Err(anyhow!(
+                            "model {:?} pd_bucket group names must be non-empty",
+                            m.id
+                        ));
+                    }
+                    if group.max_tokens <= previous_max_tokens {
+                        return Err(anyhow!(
+                            "model {:?} pd_bucket group max_tokens must be strictly increasing",
+                            m.id
+                        ));
+                    }
+                    previous_max_tokens = group.max_tokens;
+                }
+            }
         }
         match &self.discovery.backend {
             DiscoveryBackend::StaticUrls(s) => {
@@ -76,6 +116,36 @@ impl Config {
                         ));
                     }
                 }
+                let mut grouped = std::collections::HashSet::new();
+                for entry in &s.worker_groups {
+                    let trimmed = entry.url.trim();
+                    let group = entry.group.trim();
+                    if group.is_empty() {
+                        return Err(anyhow!(
+                            "discovery.static_urls.worker_groups entry for {:?} has an empty group",
+                            entry.url
+                        ));
+                    }
+                    let parsed = url::Url::parse(trimmed).map_err(|e| {
+                        anyhow!(
+                            "discovery.static_urls.worker_groups url {:?} is not a valid URL: {e}",
+                            entry.url
+                        )
+                    })?;
+                    let normalized = parsed.as_str().trim_end_matches('/').to_string();
+                    if !seen.contains(&normalized) {
+                        return Err(anyhow!(
+                            "discovery.static_urls.worker_groups url {:?} is not present in discovery.static_urls.urls",
+                            entry.url
+                        ));
+                    }
+                    if !grouped.insert(normalized.clone()) {
+                        return Err(anyhow!(
+                            "discovery.static_urls.worker_groups contains duplicate url {:?}",
+                            entry.url
+                        ));
+                    }
+                }
             }
             DiscoveryBackend::K8s(k) => {
                 // Empty namespace is intentional: triggers `Api::all(client)`
@@ -88,6 +158,26 @@ impl Config {
         }
         Ok(())
     }
+
+    pub fn static_worker_group(&self, worker_url: &str) -> Option<&str> {
+        let DiscoveryBackend::StaticUrls(static_urls) = &self.discovery.backend else {
+            return None;
+        };
+        let normalized = normalize_url_for_config_match(worker_url)?;
+        static_urls
+            .worker_groups
+            .iter()
+            .find(|entry| {
+                normalize_url_for_config_match(&entry.url).as_deref() == Some(&normalized)
+            })
+            .map(|entry| entry.group.as_str())
+    }
+}
+
+fn normalize_url_for_config_match(raw: &str) -> Option<String> {
+    url::Url::parse(raw.trim())
+        .ok()
+        .map(|parsed| parsed.as_str().trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -256,6 +346,84 @@ urls = ["http://10.0.0.1:30000"]
         )
         .unwrap();
         assert_eq!(c.models[0].policy, PolicyKind::StickySessionLoadBased);
+    }
+
+    #[test]
+    fn loads_pd_bucket_worker_groups() {
+        let c = load(
+            "toml",
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+policy = "sticky_session_load_based"
+[models.pd_bucket]
+short_group = "short"
+long_group = "long"
+prefill_long_threshold = 512
+decode_long_threshold = 768
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
+[[discovery.static_urls.worker_groups]]
+url = "http://10.0.0.1:30000"
+group = "short"
+[[discovery.static_urls.worker_groups]]
+url = "http://10.0.0.2:30000"
+group = "long"
+"#,
+        )
+        .unwrap();
+        let bucket = c.models[0].pd_bucket.as_ref().unwrap();
+        assert_eq!(bucket.short_group, "short");
+        assert_eq!(bucket.long_group, "long");
+        assert_eq!(bucket.prefill_long_threshold, 512);
+        assert_eq!(bucket.decode_long_threshold, 768);
+        assert_eq!(
+            c.static_worker_group("http://10.0.0.1:30000"),
+            Some("short")
+        );
+        assert_eq!(c.static_worker_group("http://10.0.0.2:30000"), Some("long"));
+    }
+
+    #[test]
+    fn loads_multi_pd_bucket_groups() {
+        let c = load(
+            "toml",
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+policy = "sticky_session_load_based"
+[models.pd_bucket]
+[[models.pd_bucket.groups]]
+group = "ctx0_16k"
+max_tokens = 16384
+[[models.pd_bucket.groups]]
+group = "ctx16_32k"
+max_tokens = 32768
+[[models.pd_bucket.groups]]
+group = "ctx32_64k"
+max_tokens = 65536
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://10.0.0.1:30000"]
+"#,
+        )
+        .unwrap();
+        let bucket = c.models[0].pd_bucket.as_ref().unwrap();
+        assert_eq!(bucket.group_for_prefill(8192), "ctx0_16k");
+        assert_eq!(bucket.group_for_prefill(16384), "ctx16_32k");
+        assert_eq!(bucket.group_for_decode(32768), "ctx32_64k");
+        assert_eq!(bucket.group_for_decode(131072), "ctx32_64k");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use sgl_router::policies::factory::build_registry_with_defaults as build_policy_
 use sgl_router::proxy::Proxy;
 use sgl_router::server::app::build_router;
 use sgl_router::server::app_context::AppContext;
+use sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES;
 use sgl_router::tokenizer::TokenizerRegistry;
 use sgl_router::workers::{Worker, WorkerRegistry};
 
@@ -35,10 +36,12 @@ fn config_for(_worker_url: &str) -> Config {
             policy: PolicyKind::RoundRobin,
             circuit_breaker: None,
             cache_aware: None,
+            pd_bucket: None,
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
+                worker_groups: Vec::new(),
             }),
         },
         proxy: ProxyConfig::default(),
@@ -420,8 +423,7 @@ async fn oversized_request_body_returns_413() {
     let ctx = build_ctx_with_worker(&worker.url);
     let app = build_router(ctx);
 
-    // 2 MiB body — the configured limit is 1 MiB.
-    let big = vec![b'x'; 2 * 1024 * 1024];
+    let big = vec![b'x'; MAX_CHAT_BODY_BYTES + 1];
     let req = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")

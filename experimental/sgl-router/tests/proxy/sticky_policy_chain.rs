@@ -32,10 +32,12 @@ fn config() -> Config {
             policy: PolicyKind::StickySessionLoadBased,
             circuit_breaker: None,
             cache_aware: None,
+            pd_bucket: None,
         }],
         discovery: DiscoveryConfig {
             backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                 urls: vec!["http://placeholder:0".into()],
+                worker_groups: Vec::new(),
             }),
         },
         proxy: ProxyConfig::default(),

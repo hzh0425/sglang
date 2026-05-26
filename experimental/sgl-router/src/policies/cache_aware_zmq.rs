@@ -298,11 +298,13 @@ mod tests {
                 policy: crate::config::PolicyKind::RoundRobin,
                 circuit_breaker: None,
                 cache_aware: None,
+                pd_bucket: None,
             }],
             discovery: crate::config::DiscoveryConfig {
                 backend: crate::config::DiscoveryBackend::StaticUrls(
                     crate::config::StaticUrlsDiscoveryConfig {
                         urls: vec!["http://placeholder:0".into()],
+                        worker_groups: Vec::new(),
                     },
                 ),
             },

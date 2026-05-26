@@ -172,6 +172,8 @@ class Gateway:
         tokenizer_path: str,
         worker_urls: list[str],
         policy: str = "round_robin",
+        worker_groups: list[tuple[str, str]] | None = None,
+        pd_bucket: dict | None = None,
         extra_models: list[dict] | None = None,
         timeout: float = 60.0,
     ) -> None:
@@ -195,6 +197,8 @@ class Gateway:
                 tokenizer_path=tokenizer_path,
                 urls=list(worker_urls),
                 policy=policy,
+                worker_groups=worker_groups or [],
+                pd_bucket=pd_bucket,
                 extra_models=extra_models or [],
             ),
             timeout=timeout,
@@ -208,6 +212,8 @@ class Gateway:
         prefill_urls: list[str],
         decode_urls: list[str],
         policy: str = "round_robin",
+        worker_groups: list[tuple[str, str]] | None = None,
+        pd_bucket: dict | None = None,
         timeout: float = 60.0,
     ) -> None:
         """Start the router in PD-disaggregated mode.
@@ -227,6 +233,8 @@ class Gateway:
                 tokenizer_path=tokenizer_path,
                 urls=list(prefill_urls) + list(decode_urls),
                 policy=policy,
+                worker_groups=worker_groups or [],
+                pd_bucket=pd_bucket,
                 extra_models=[],
             ),
             timeout=timeout,
@@ -299,6 +307,8 @@ class Gateway:
         tokenizer_path: str,
         urls: list[str],
         policy: str,
+        worker_groups: list[tuple[str, str]],
+        pd_bucket: dict | None,
         extra_models: list[dict],
     ) -> str:
         resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
@@ -327,6 +337,30 @@ class Gateway:
             )
 
         urls_toml = ", ".join(f'"{u}"' for u in urls)
+        pd_bucket_toml = ""
+        if pd_bucket is not None:
+            pd_bucket_toml = "\n[models.pd_bucket]\n"
+            if "groups" in pd_bucket:
+                for group in pd_bucket["groups"]:
+                    pd_bucket_toml += (
+                        "\n[[models.pd_bucket.groups]]\n"
+                        f'group = "{group["group"]}"\n'
+                        f'max_tokens = {group["max_tokens"]}\n'
+                    )
+            else:
+                pd_bucket_toml += (
+                    f'short_group = "{pd_bucket["short_group"]}"\n'
+                    f'long_group = "{pd_bucket["long_group"]}"\n'
+                    f'prefill_long_threshold = {pd_bucket["prefill_long_threshold"]}\n'
+                    f'decode_long_threshold = {pd_bucket["decode_long_threshold"]}\n'
+                )
+        worker_groups_toml = ""
+        for url, group in worker_groups:
+            worker_groups_toml += (
+                "\n[[discovery.static_urls.worker_groups]]\n"
+                f'url = "{url}"\n'
+                f'group = "{group}"\n'
+            )
 
         return f"""\
 [server]
@@ -337,6 +371,7 @@ port = {self.port}
 id = "{model_id}"
 tokenizer_path = "{resolved_tokenizer}"
 policy = "{policy}"
+{pd_bucket_toml}
 {extra_model_toml}
 
 [discovery]
@@ -344,6 +379,7 @@ backend = "static_urls"
 
 [discovery.static_urls]
 urls = [{urls_toml}]
+{worker_groups_toml}
 {proxy_section}{active_load_section}"""
 
     def _launch(self, config_text: str, *, timeout: float) -> None:

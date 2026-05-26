@@ -15,6 +15,7 @@ mod failover;
 mod graceful_shutdown;
 mod header_forwarding;
 mod pd_bootstrap_injection;
+mod pd_bucket_groups;
 mod pd_pool_isolation;
 mod sticky_policy_chain;
 mod timeout;

@@ -305,10 +305,12 @@ mod tests {
                     cool_down_secs,
                 }),
                 cache_aware: None,
+                pd_bucket: None,
             }],
             discovery: DiscoveryConfig {
                 backend: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
                     urls: vec!["http://test:30000".into()],
+                    worker_groups: Vec::new(),
                 }),
             },
             proxy: ProxyConfig::default(),

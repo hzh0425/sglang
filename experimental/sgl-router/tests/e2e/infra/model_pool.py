@@ -176,6 +176,7 @@ def spawn_worker(
     env.pop("SGLANG_ROUTER_E2E_GPU_IDS", None)
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    env.setdefault("MC_TCP_ENABLE_CONNECTION_POOL", "true")
     logger.info(
         "spawning sglang worker: model=%s port=%d gpus=%s disagg=%s",
         model_id,
