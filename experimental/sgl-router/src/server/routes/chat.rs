@@ -46,10 +46,10 @@ const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 /// PAYLOAD_TOO_LARGE before this handler runs.
 pub const MAX_CHAT_BODY_BYTES: usize = 1 << 20;
 
-/// Minimal probe over the request body — we only need the `stream` field
-/// and the `model` field to decide between buffered vs SSE forwarding and
-/// to select a worker. Deserializing into this struct (vs `serde_json::Value`)
-/// does two things:
+/// Minimal probe over the request body — we only need `stream`, `model`,
+/// and optional session ids to choose buffered vs SSE forwarding and select a
+/// worker. Deserializing into this struct (vs `serde_json::Value`) does two
+/// things:
 ///
 /// 1. Avoids the per-field heap allocation of `Value` for a 1 MiB body.
 /// 2. Pins the contract: the body MUST be a JSON object. Degenerate
@@ -64,6 +64,41 @@ struct RequestProbe {
     stream: Option<bool>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    session_id: Option<serde_json::Value>,
+    #[serde(default)]
+    nvext: Option<NvExtProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NvExtProbe {
+    #[serde(default)]
+    session_control: Option<SessionControlProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionControlProbe {
+    #[serde(default)]
+    session_id: Option<serde_json::Value>,
+}
+
+impl RequestProbe {
+    fn routing_key(&self) -> Option<String> {
+        if let Some(key) = self
+            .session_id
+            .as_ref()
+            .and_then(json_scalar_to_routing_key)
+        {
+            return Some(key);
+        }
+        self.nvext
+            .as_ref()?
+            .session_control
+            .as_ref()?
+            .session_id
+            .as_ref()
+            .and_then(json_scalar_to_routing_key)
+    }
 }
 
 /// POST /v1/chat/completions — parse model from body, select a healthy
@@ -77,8 +112,10 @@ pub async fn chat_completions(
 ) -> Result<Response<Body>, ApiError> {
     let probe = parse_probe(&body)?;
     let streaming = probe.stream.unwrap_or(false);
+    let routing_key = routing_key_from_headers(&headers).or_else(|| probe.routing_key());
     let model_str = probe
         .model
+        .clone()
         .ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?;
     let model_id = ModelId(model_str.clone());
 
@@ -106,7 +143,8 @@ pub async fn chat_completions(
         .policies
         .get(&model_id)
         .ok_or_else(|| ApiError::ModelNotFound(model_str.clone()))?;
-    let selection_ctx = SelectionContext::new(&model_id, Some(&body));
+    let selection_ctx =
+        SelectionContext::with_routing_key(&model_id, Some(&body), routing_key.as_deref());
     let worker =
         policy
             .select(&workers, &selection_ctx)
@@ -516,10 +554,10 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
     //      This rejects `null` / `[]` / `"hi"` (all valid JSON but not
     //      request shape) without walking the full value into a
     //      `serde_json::Value` per field.
-    //   2. `RequestProbe` (struct of `Option<bool>` + `Option<String>`)
-    //      lifts out only the fields we care about — `stream` and `model`.
-    //      Other fields are ignored; the worker is authoritative for the
-    //      rest of the schema.
+    //   2. `RequestProbe` lifts out only the fields we care about for
+    //      routing — `stream`, `model`, and supported session ids. Other
+    //      fields are ignored; the worker is authoritative for the rest of
+    //      the schema.
     let _: HashMap<String, IgnoredAny> = serde_json::from_slice(body).map_err(|e| {
         tracing::debug!(error = %e, "chat-completions body rejected as non-object JSON");
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
@@ -529,6 +567,31 @@ fn parse_probe(body: &Bytes) -> Result<RequestProbe, ApiError> {
         ApiError::BadRequest("invalid request: body must be a JSON object".to_string())
     })?;
     Ok(probe)
+}
+
+fn routing_key_from_headers(headers: &HeaderMap) -> Option<String> {
+    ["x-sgl-route-key", "x-sglang-routing-key"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn json_scalar_to_routing_key(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +721,41 @@ mod tests {
             ApiError::BadRequest(_) => {}
             other => panic!("expected BadRequest on duplicate `stream` key, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_probe_reads_session_id_routing_key() {
+        let b = Bytes::from_static(br#"{"model":"tiny","session_id":" session-a "}"#);
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.routing_key().as_deref(), Some("session-a"));
+    }
+
+    #[test]
+    fn parse_probe_reads_nvext_session_control_routing_key() {
+        let b = Bytes::from_static(
+            br#"{"model":"tiny","nvext":{"session_control":{"session_id":" session-a ","action":"open","timeout":300}}}"#,
+        );
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.routing_key().as_deref(), Some("session-a"));
+    }
+
+    #[test]
+    fn top_level_session_id_overrides_nvext_session_id() {
+        let b = Bytes::from_static(
+            br#"{"model":"tiny","session_id":"top","nvext":{"session_control":{"session_id":"nested"}}}"#,
+        );
+        let p = parse_probe(&b).unwrap();
+        assert_eq!(p.routing_key().as_deref(), Some("top"));
+    }
+
+    #[test]
+    fn routing_key_prefers_supported_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sglang-routing-key", "manual-a".parse().unwrap());
+        assert_eq!(
+            routing_key_from_headers(&headers).as_deref(),
+            Some("manual-a")
+        );
     }
 
     #[test]

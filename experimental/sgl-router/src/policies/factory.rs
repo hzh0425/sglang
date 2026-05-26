@@ -7,6 +7,7 @@ use crate::policies::{
     cache_aware_zmq::CacheAwareZmqPolicy,
     kv_events::{BlockSizeOracle, HashTree},
     load_based::LoadBasedPolicy,
+    policy_chain::PolicyChain,
     power_of_two::PowerOfTwoChoicesPolicy,
     random::RandomPolicy,
     round_robin::RoundRobinPolicy,
@@ -34,6 +35,7 @@ pub fn build_policy(
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::StickySessionLoadBased => Arc::new(PolicyChain::sticky_session_load_based()),
         PolicyKind::CacheAwareZmq => {
             let cache_cfg = model.cache_aware.unwrap_or_default();
             Arc::new(CacheAwareZmqPolicy::new(
@@ -57,6 +59,7 @@ pub fn build_policy_kind_only(kind: PolicyKind) -> Arc<dyn Policy> {
         PolicyKind::Random => Arc::new(RandomPolicy::new()),
         PolicyKind::PowerOfTwo => Arc::new(PowerOfTwoChoicesPolicy::new()),
         PolicyKind::LoadBased => Arc::new(LoadBasedPolicy::new()),
+        PolicyKind::StickySessionLoadBased => Arc::new(PolicyChain::sticky_session_load_based()),
         PolicyKind::CacheAwareZmq => {
             // Provide an empty tree + empty tokenizer registry + fresh
             // oracle so the test policy is constructible. Production
@@ -155,6 +158,7 @@ mod tests {
         let _ = build_policy_kind_only(PolicyKind::PowerOfTwo);
         let _ = build_policy_kind_only(PolicyKind::LoadBased);
         let _ = build_policy_kind_only(PolicyKind::CacheAwareZmq);
+        let _ = build_policy_kind_only(PolicyKind::StickySessionLoadBased);
     }
 
     #[test]
@@ -199,6 +203,20 @@ mod tests {
         assert!(
             dbg.contains("LoadBasedPolicy"),
             "expected LoadBasedPolicy debug repr, got: {dbg}",
+        );
+    }
+
+    #[test]
+    fn sticky_session_load_based_builds_via_factory() {
+        let cfg = cfg_with_models(&[("modelA", PolicyKind::StickySessionLoadBased)]);
+        let tree = Arc::new(HashTree::new());
+        let tokenizers = Arc::new(TokenizerRegistry::default());
+        let reg = build_registry(&cfg, tree, tokenizers, BlockSizeOracle::new()).unwrap();
+        let p = reg.get(&ModelId("modelA".into())).unwrap();
+        let dbg = format!("{p:?}");
+        assert!(
+            dbg.contains("PolicyChain"),
+            "expected PolicyChain debug repr, got: {dbg}",
         );
     }
 }

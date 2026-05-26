@@ -6,10 +6,12 @@ pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
 pub mod load_based;
+pub mod policy_chain;
 pub mod power_of_two;
 pub mod random;
 pub mod registry;
 pub mod round_robin;
+pub mod sticky_session;
 
 use crate::discovery::ModelId;
 use crate::workers::Worker;

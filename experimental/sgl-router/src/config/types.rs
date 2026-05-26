@@ -68,7 +68,8 @@ impl Default for ActiveLoadConfig {
 /// the policy factory.
 ///
 /// Serialized as `"round_robin"` / `"random"` / `"power_of_two"` /
-/// `"load_based"` / `"cache_aware_zmq"`.
+/// `"load_based"` / `"cache_aware_zmq"` /
+/// `"sticky_session_load_based"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
@@ -82,6 +83,11 @@ pub enum PolicyKind {
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.
     CacheAwareZmq,
+    /// Ordered chain: sticky session -> load-based fallback.
+    ///
+    /// Sticky routing uses `x-sgl-route-key`, `x-sglang-routing-key`, or
+    /// a request-body session id.
+    StickySessionLoadBased,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
