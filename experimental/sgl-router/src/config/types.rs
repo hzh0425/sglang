@@ -67,8 +67,8 @@ impl Default for ActiveLoadConfig {
 /// values at deserialization time and removes the runtime string match in
 /// the policy factory.
 ///
-/// Serialised as `"round_robin"` / `"random"` / `"power_of_two"` /
-/// `"cache_aware_zmq"`.
+/// Serialized as `"round_robin"` / `"random"` / `"power_of_two"` /
+/// `"load_based"` / `"cache_aware_zmq"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyKind {
@@ -76,6 +76,8 @@ pub enum PolicyKind {
     RoundRobin,
     Random,
     PowerOfTwo,
+    /// Selects the currently least-loaded worker.
+    LoadBased,
     /// Cache-aware routing fed by SGLang's ZMQ KV-cache event publisher.
     /// Requires the model to have a tokenizer loaded; cache_aware tuning
     /// lives on `ModelConfig::cache_aware`.

@@ -248,10 +248,25 @@ def router(sglang_server):  # noqa: ARG001  (sglang_server must start first)
 # ---------------------------------------------------------------------------
 
 
-def _detect_gpu_count() -> int:
-    """Count visible GPUs via ``nvidia-smi``. Returns 0 when no NVIDIA GPU
-    is available (CI on CPU-only runners, dev laptops, etc.).
+def _detect_gpu_ids() -> list[int]:
+    """Return GPU ids available to real-GPU e2e tests.
+
+    CI or local runs can set ``SGLANG_ROUTER_E2E_GPU_IDS=5,6,7`` to keep the
+    tests inside a reserved slice of a shared host. Without the override
+    we use every index reported by ``nvidia-smi``.
     """
+    allowed = os.environ.get("SGLANG_ROUTER_E2E_GPU_IDS") or os.environ.get(
+        "SGL_ROUTER_E2E_GPU_IDS"
+    )
+    if allowed:
+        ids: list[int] = []
+        for raw in allowed.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            ids.append(int(raw))
+        return ids
+
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
@@ -259,8 +274,8 @@ def _detect_gpu_count() -> int:
             timeout=5.0,
         )
     except (FileNotFoundError, subprocess.SubprocessError):
-        return 0
-    return len([ln for ln in out.decode().splitlines() if ln.strip()])
+        return []
+    return [int(ln.strip()) for ln in out.decode().splitlines() if ln.strip()]
 
 
 class GPUAllocator:
@@ -269,9 +284,9 @@ class GPUAllocator:
     full GPU set. Acceptance tests run serially, so this is fine.
     """
 
-    def __init__(self, total: int):
-        self.total = total
-        self._free: list[int] = list(range(total))
+    def __init__(self, gpu_ids: list[int]):
+        self.total = len(gpu_ids)
+        self._free: list[int] = list(gpu_ids)
         self._lock = threading.Lock()
 
     def acquire(self, n: int = 1) -> list[int]:
@@ -319,9 +334,9 @@ def gpu_allocator() -> Iterator[GPUAllocator]:
     no GPUs are visible — acceptance tests under chat_completions/ are
     real-GPU.
     """
-    n = _detect_gpu_count()
-    if n == 0:
+    gpu_ids = _detect_gpu_ids()
+    if not gpu_ids:
         pytest.skip(
             "no NVIDIA GPUs visible to nvidia-smi; acceptance tests are GPU-only"
         )
-    yield GPUAllocator(n)
+    yield GPUAllocator(gpu_ids)

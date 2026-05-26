@@ -215,6 +215,28 @@ urls = ["http://10.0.0.1:30000", "http://10.0.0.2:30000"]
     }
 
     #[test]
+    fn loads_load_based_policy() {
+        let c = load(
+            "toml",
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8090
+[[models]]
+id = "qwen3-0.6b"
+tokenizer_path = "/tmp/qwen.json"
+policy = "load_based"
+[discovery]
+backend = "static_urls"
+[discovery.static_urls]
+urls = ["http://10.0.0.1:30000"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.models[0].policy, PolicyKind::LoadBased);
+    }
+
+    #[test]
     fn rejects_static_urls_with_empty_list() {
         let err = load(
             "toml",

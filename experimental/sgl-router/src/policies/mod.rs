@@ -5,6 +5,7 @@ pub mod active_load;
 pub mod cache_aware_zmq;
 pub mod factory;
 pub mod kv_events;
+pub mod load_based;
 pub mod power_of_two;
 pub mod random;
 pub mod registry;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 pub struct SelectionContext<'a> {
     model: &'a ModelId,
     request_body: Option<&'a [u8]>,
+    routing_key: Option<&'a str>,
 }
 
 impl<'a> SelectionContext<'a> {
@@ -32,6 +34,19 @@ impl<'a> SelectionContext<'a> {
         Self {
             model,
             request_body,
+            routing_key: None,
+        }
+    }
+
+    pub fn with_routing_key(
+        model: &'a ModelId,
+        request_body: Option<&'a [u8]>,
+        routing_key: Option<&'a str>,
+    ) -> Self {
+        Self {
+            model,
+            request_body,
+            routing_key,
         }
     }
 
@@ -41,6 +56,10 @@ impl<'a> SelectionContext<'a> {
 
     pub fn request_body(&self) -> Option<&[u8]> {
         self.request_body
+    }
+
+    pub fn routing_key(&self) -> Option<&str> {
+        self.routing_key
     }
 }
 
