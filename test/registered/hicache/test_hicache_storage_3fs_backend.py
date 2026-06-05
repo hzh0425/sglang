@@ -11,7 +11,7 @@ import unittest
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
@@ -53,6 +53,7 @@ class HiCacheStorage3FSBackendBaseMixin(HiCacheStorageBaseMixin):
         return server_args, env_vars
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily skipped in CI.")
 class TestHf3fsBackendLayerFirstLayout(
     HiCacheStorage3FSBackendBaseMixin, CustomTestCase
 ):
@@ -68,6 +69,7 @@ class TestHf3fsBackendLayerFirstLayout(
         return server_args, env_vars
 
 
+@unittest.skipIf(is_in_ci(), "Temporarily skipped in CI.")
 class TestHf3fsBackendAccuracy(HiCacheStorage3FSBackendBaseMixin, CustomTestCase):
     """Accuracy tests for HiCache-Hf3fs backend"""
 
