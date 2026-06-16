@@ -579,6 +579,32 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                if (
+                    host_indices.numel() % self.page_size != 0
+                    or device_indices.numel() % self.page_size != 0
+                ):
+                    host_pages = torch.div(
+                        host_indices, self.page_size, rounding_mode="floor"
+                    )
+                    host_offsets = torch.remainder(host_indices, self.page_size)
+                    device_indices = device_indices.to(
+                        device_pool.device, non_blocking=True
+                    )
+                    device_pool.k_buffer[layer_id].index_copy_(
+                        0,
+                        device_indices,
+                        self.k_buffer[host_pages, layer_id, host_offsets].to(
+                            device_pool.device, non_blocking=True
+                        ),
+                    )
+                    device_pool.v_buffer[layer_id].index_copy_(
+                        0,
+                        device_indices,
+                        self.v_buffer[host_pages, layer_id, host_offsets].to(
+                            device_pool.device, non_blocking=True
+                        ),
+                    )
+                    return
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer, self.v_buffer],
                     dst_ptrs=[

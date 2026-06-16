@@ -443,9 +443,17 @@ class HybridCacheController(BaseHiCacheController):
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         else:
-            device_indices = full_allocator.alloc(len(host_indices))
+            alloc_tokens = len(host_indices)
+            page_size = getattr(full_allocator, "page_size", 1) or 1
+            if page_size > 1 and alloc_tokens % page_size != 0:
+                alloc_tokens = (
+                    (alloc_tokens + page_size - 1) // page_size * page_size
+                )
+            device_indices = full_allocator.alloc(alloc_tokens)
             if device_indices is None:
                 return None
+            if len(device_indices) != len(host_indices):
+                device_indices = device_indices[: len(host_indices)]
 
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,

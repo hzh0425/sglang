@@ -702,6 +702,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if request_owned_l1
             else 0
         )
+        # Fake-transfer warmup requests may temporarily load_back a host-only
+        # prefix into device without wanting to keep that device copy alive.
+        skip_insert_cleanup = request_owned_l1 and getattr(
+            req, "skip_radix_cache_insert", False
+        )
         prev_prefix_len = (
             borrowed_prefix_len if request_owned_l1 else req.cache_protected_len
         )
@@ -758,17 +763,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     self._demote_backuped_path_to_host(inserted_device_node)
 
             # Free unaligned tail
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
-        else:
             free_start = (
-                borrowed_prefix_len if request_owned_l1 else req.cache_protected_len
+                max(page_aligned_len, borrowed_prefix_len)
+                if request_owned_l1
+                else page_aligned_len
             )
+            self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
+        else:
+            if skip_insert_cleanup:
+                free_start = (
+                    (borrowed_prefix_len + self.page_size - 1) // self.page_size
+                ) * self.page_size
+            else:
+                free_start = (
+                    borrowed_prefix_len
+                    if request_owned_l1
+                    else req.cache_protected_len
+                )
             self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
 
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
+        if skip_insert_cleanup and req.last_node is not None and req.last_node.backuped:
+            self._demote_backuped_path_to_host(req.last_node)
 
         # cleanup
         for comp in self._components_tuple:
@@ -1711,7 +1730,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
         kv_tokens = len(kv_xfer.host_indices)
-
         # Build aux transfers, keyed per component.
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
@@ -1744,6 +1762,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
             if result.num_tokens_evicted < needed:
+                logger.warning(
+                    "load_back_evict_failed: rid=%s node=%d needed=%d evicted=%d avail=%d",
+                    getattr(req, "rid", None),
+                    best_match_node.id,
+                    needed,
+                    result.num_tokens_evicted,
+                    avail,
+                )
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
                 return False
@@ -1759,6 +1785,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
+            logger.warning(
+                "load_back_alloc_failed: rid=%s node=%d kv_tokens=%d",
+                getattr(req, "rid", None),
+                best_match_node.id,
+                kv_tokens,
+            )
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
@@ -2486,14 +2518,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(
+            load_back_ok = self.load_back(
                 best_match_node,
                 mem_quota,
                 req=req,
                 force=params.force_load_back,
-            ):
+            )
+            if load_back_ok:
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
+                    logger.warning(
+                        "init_load_back_empty: rid=%s node=%d host_hit=%d force=%s last_device_node=%s",
+                        getattr(req, "rid", None),
+                        best_match_node.id,
+                        params.host_hit_length,
+                        params.force_load_back,
+                        getattr(last_best_match_device_node, "id", None),
+                    )
                     return (
                         self._empty_match_result.device_indices,
                         last_best_match_device_node,
@@ -2510,6 +2551,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     len(new_indices),
                 )
                 return new_indices, best_match_node
+            logger.warning(
+                "init_load_back_failed: rid=%s node=%d host_hit=%d force=%s",
+                getattr(req, "rid", None),
+                best_match_node.id,
+                params.host_hit_length,
+                params.force_load_back,
+            )
 
         return (
             self._empty_match_result.device_indices,
