@@ -974,7 +974,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
             if prefix_match is not None:
-                reserved_restore_tokens += prefix_match.restore_token_count
+                reserved_restore_tokens += self._hicache_restore_token_count(
+                    prefix_match,
+                    post_transfer_restore=decode_req.hicache_post_transfer_restore,
+                    restore_target_len=decode_req.hicache_restore_target_len,
+                )
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,

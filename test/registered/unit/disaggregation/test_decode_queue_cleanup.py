@@ -2,12 +2,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_hicache_mixin import DecodePrefixMatch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
@@ -29,6 +32,41 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_hicache_pending_restore_tokens_uses_post_transfer_target_len(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(enable_decode_hicache=True)
+
+        queue.transfer_queue = SimpleNamespace(
+            queue=[
+                SimpleNamespace(
+                    prefix_match=DecodePrefixMatch(
+                        prefix_indices=torch.tensor([11, 12], dtype=torch.int64),
+                        l2_host_hit_length=3,
+                        l3_storage_hit_length=0,
+                        last_device_node=None,
+                    ),
+                    hicache_restore_status=HiCacheRestoreResult.PENDING,
+                    hicache_restored_node=None,
+                    hicache_post_transfer_restore=True,
+                    hicache_restore_target_len=7,
+                ),
+                SimpleNamespace(
+                    prefix_match=DecodePrefixMatch(
+                        prefix_indices=torch.tensor([21, 22], dtype=torch.int64),
+                        l2_host_hit_length=2,
+                        l3_storage_hit_length=1,
+                        last_device_node=None,
+                    ),
+                    hicache_restore_status=HiCacheRestoreResult.PENDING,
+                    hicache_restored_node=None,
+                    hicache_post_transfer_restore=False,
+                    hicache_restore_target_len=-1,
+                ),
+            ]
+        )
+
+        self.assertEqual(queue._hicache_pending_restore_tokens(), 9)
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(

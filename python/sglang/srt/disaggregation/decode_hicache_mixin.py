@@ -145,20 +145,32 @@ class DecodeHiCachePreallocMixin:
             prefix_match.l3_storage_hit_length = 0
             prefix_match.prefetch_registered = False
 
+    def _hicache_restore_token_count(
+        self,
+        prefix_match: Optional[DecodePrefixMatch],
+        *,
+        post_transfer_restore: bool = False,
+        restore_target_len: int = -1,
+    ) -> int:
+        if prefix_match is None:
+            return 0
+
+        target_len = (
+            restore_target_len
+            if post_transfer_restore and restore_target_len >= 0
+            else prefix_match.decode_prefix_len
+        )
+        return max(0, target_len - prefix_match.l1_prefix_len)
+
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
         if not self.scheduler.enable_decode_hicache:
             return 0
         return sum(
-            max(
-                0,
-                (
-                    dr.hicache_restore_target_len
-                    if dr.hicache_post_transfer_restore
-                    and dr.hicache_restore_target_len >= 0
-                    else dr.prefix_match.decode_prefix_len
-                )
-                - dr.prefix_match.l1_prefix_len,
+            self._hicache_restore_token_count(
+                dr.prefix_match,
+                post_transfer_restore=dr.hicache_post_transfer_restore,
+                restore_target_len=dr.hicache_restore_target_len,
             )
             for dr in self.transfer_queue.queue
             if dr.prefix_match is not None
