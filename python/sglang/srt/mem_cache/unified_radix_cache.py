@@ -1265,6 +1265,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         result.inserted_host_node = new_node
         return result
 
+    def publish_request_owned_host_pages(
+        self,
+        *,
+        req: Req,
+        anchor_node: UnifiedTreeNode,
+        token_ids: array[int],
+        host_indices: torch.Tensor,
+    ) -> UnifiedTreeNode:
+        if self.cache_controller is None:
+            raise RuntimeError("request-owned host publish requires hicache")
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        anchor = anchor_node or self.root_node
+        key = RadixKey(token_ids, req.extra_key, is_bigram=self.is_eagle)
+        last_hash = anchor.get_last_hash_value()
+        hash_value: list[str] = []
+        for offset in range(0, len(key) // self.page_size * self.page_size, self.page_size):
+            page_tokens = token_ids[offset : offset + self.page_size]
+            last_hash = get_hash_str(page_tokens, last_hash)
+            hash_value.append(last_hash)
+
+        insert_result = self._insert_helper_host(anchor, key, host_indices, hash_value)
+        if insert_result.prefix_len > 0:
+            self.cache_controller.mem_pool_host.free(
+                host_indices[: insert_result.prefix_len]
+            )
+        return insert_result.inserted_host_node or anchor
+
     # ---- Evict Helpers ----
 
     def _cascade_evict(
@@ -1666,6 +1694,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_node: UnifiedTreeNode,
         mem_quota: Optional[int] = None,
         req=None,
+        force: bool = False,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
         if self.cache_controller is None:
@@ -1700,7 +1729,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
         # when the Full-KV load is skipped by thresholding.
-        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+        if (not force and kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
@@ -2409,6 +2438,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
             finish_count -= 1
 
+    def is_load_back_event_done(self, consumer_index: int) -> bool:
+        if consumer_index < 0 or self.cache_controller is None:
+            return True
+
+        finish_event = self.cache_controller.layer_done_counter.events[
+            consumer_index
+        ].finish_event
+        if not finish_event.query():
+            return False
+
+        self.loading_check()
+        return True
+
     # ---- HiCache: Scheduler Entry Points ----
 
     def init_load_back(
@@ -2444,7 +2486,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
-            if self.load_back(best_match_node, mem_quota, req=req):
+            if self.load_back(
+                best_match_node,
+                mem_quota,
+                req=req,
+                force=params.force_load_back,
+            ):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
                     return (

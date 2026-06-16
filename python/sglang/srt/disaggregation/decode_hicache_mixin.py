@@ -27,7 +27,9 @@ class DecodePrefixMatch:
     l3_storage_hit_length: int
     last_device_node: Any
     last_host_node: Any = None
+    best_match_node: Any = None
     prefetch_registered: bool = False
+    post_transfer_restore: bool = False
 
     @property
     def l1_prefix_len(self) -> int:
@@ -58,6 +60,9 @@ class HiCacheRestoreResult(Enum):
 class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
+    def _decode_uses_request_owned_l1(self) -> bool:
+        return bool(getattr(self.tree_cache, "is_request_owned_l1", lambda: False)())
+
     def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
         """Convert a ``match_prefix_for_req`` result into ``DecodePrefixMatch``.
 
@@ -69,8 +74,9 @@ class DecodeHiCachePreallocMixin:
         l2_host_hit_length = result.host_hit_length
 
         l3_storage_hit_length = 0
-        last_host_node = None
-        if self.scheduler.enable_decode_hicache:
+        last_host_node = result.last_host_node
+        use_request_owned_l1 = self._decode_uses_request_owned_l1()
+        if self.scheduler.enable_decode_hicache and not use_request_owned_l1:
             last_host_node = result.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 matched_len = l1_prefix_len + l2_host_hit_length
@@ -93,7 +99,9 @@ class DecodeHiCachePreallocMixin:
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
-            last_host_node=last_host_node if l3_storage_hit_length > 0 else None,
+            last_host_node=last_host_node,
+            best_match_node=result.best_match_node,
+            post_transfer_restore=use_request_owned_l1,
         )
 
     def _start_hicache_prefetch(
@@ -105,6 +113,7 @@ class DecodeHiCachePreallocMixin:
         """
         if (
             prefix_match is None
+            or prefix_match.post_transfer_restore
             or prefix_match.l3_storage_hit_length <= 0
             or prefix_match.last_host_node is None
         ):
@@ -141,7 +150,16 @@ class DecodeHiCachePreallocMixin:
         if not self.scheduler.enable_decode_hicache:
             return 0
         return sum(
-            dr.prefix_match.restore_token_count
+            max(
+                0,
+                (
+                    dr.hicache_restore_target_len
+                    if dr.hicache_post_transfer_restore
+                    and dr.hicache_restore_target_len >= 0
+                    else dr.prefix_match.decode_prefix_len
+                )
+                - dr.prefix_match.l1_prefix_len,
+            )
             for dr in self.transfer_queue.queue
             if dr.prefix_match is not None
             and dr.hicache_restore_status == HiCacheRestoreResult.PENDING
@@ -157,6 +175,8 @@ class HiCacheRestoreGatedKVReceiver:
 
     def poll(self) -> KVPoll:
         poll = self.decode_req.kv_receiver.poll()
+        if self.decode_req.hicache_post_transfer_restore:
+            return poll
         if (
             poll == KVPoll.Success
             and self.decode_req.hicache_restore_status == HiCacheRestoreResult.PENDING
@@ -174,6 +194,11 @@ class DecodeHiCacheTransferMixin:
             and decode_req.prefix_match.prefetch_registered
         ):
             self.tree_cache.release_aborted_request(decode_req.req.rid)
+        if decode_req.l2_only_dst_host_indices is not None:
+            self.tree_cache.cache_controller.mem_pool_host.free(
+                decode_req.l2_only_dst_host_indices
+            )
+            decode_req.l2_only_dst_host_indices = None
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
             decode_req.hicache_restored_node = None
@@ -237,6 +262,62 @@ class DecodeHiCacheTransferMixin:
             return False
         return True
 
+    def _try_hicache_queue_post_transfer_load_back(self, dr: DecodeRequest) -> bool:
+        pm = dr.prefix_match
+        target_len = dr.hicache_restore_target_len
+        if pm is None or target_len <= 0:
+            dr.hicache_restore_status = HiCacheRestoreResult.READY
+            return False
+
+        if dr.hicache_published_node is None:
+            publisher = getattr(self.tree_cache, "publish_request_owned_host_pages", None)
+            if not callable(publisher):
+                logger.error(
+                    "request-owned decode hicache requires host publish support: %s",
+                    type(self.tree_cache).__name__,
+                )
+                dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+                return False
+            actual_len = len(dr.l2_only_delta_token_ids)
+            dr.hicache_published_node = publisher(
+                req=dr.req,
+                anchor_node=pm.best_match_node,
+                token_ids=dr.l2_only_delta_token_ids,
+                host_indices=dr.l2_only_dst_host_indices[:actual_len],
+            )
+            if actual_len < len(dr.l2_only_dst_host_indices):
+                self.tree_cache.cache_controller.mem_pool_host.free(
+                    dr.l2_only_dst_host_indices[actual_len:]
+                )
+            dr.l2_only_dst_host_indices = None
+
+        new_indices, restored_node = self.tree_cache.init_load_back(
+            InitLoadBackParams(
+                best_match_node=dr.hicache_published_node,
+                host_hit_length=target_len,
+                req=dr.req,
+                force_load_back=True,
+            )
+        )
+        if len(new_indices) < target_len:
+            logger.warning(
+                "HiCache post-transfer load_back failed for rid=%s: new_indices=%d, expected=%d",
+                dr.req.rid,
+                len(new_indices),
+                target_len,
+            )
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
+
+        dr.hicache_restored_kv_indices = new_indices
+        dr.hicache_restored_node = restored_node
+        self.tree_cache.inc_lock_ref(restored_node)
+
+        if len(new_indices) == 0:
+            dr.hicache_restore_status = HiCacheRestoreResult.READY
+            return False
+        return True
+
     def _process_hicache_local_restores(self, decode_reqs: List[DecodeRequest]) -> None:
         if not hasattr(self.tree_cache, "is_load_back_event_done"):
             return
@@ -246,6 +327,8 @@ class DecodeHiCacheTransferMixin:
         active: List[DecodeRequest] = []
         for dr in decode_reqs:
             if dr.hicache_restore_status != HiCacheRestoreResult.PENDING:
+                continue
+            if dr.hicache_post_transfer_restore:
                 continue
             pm = dr.prefix_match
             if pm is None or not pm.needs_local_restore:
@@ -291,15 +374,23 @@ class DecodeHiCacheTransferMixin:
 
     def _commit_hicache_local_restore_to_req(self, decode_req: DecodeRequest) -> None:
         prefix_match = decode_req.prefix_match
-        if prefix_match is None or not prefix_match.needs_local_restore:
+        if prefix_match is None or (
+            not prefix_match.needs_local_restore
+            and not decode_req.hicache_post_transfer_restore
+        ):
             return
 
         self.tree_cache.dec_lock_ref(prefix_match.last_device_node)
+        target_len = (
+            decode_req.hicache_restore_target_len
+            if decode_req.hicache_restore_target_len >= 0
+            else prefix_match.decode_prefix_len
+        )
 
         self.tree_cache.req_to_token_pool.write(
             (
                 decode_req.req.req_pool_idx,
-                slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
+                slice(prefix_match.l1_prefix_len, target_len),
             ),
             decode_req.hicache_restored_kv_indices,
         )
@@ -307,3 +398,7 @@ class DecodeHiCacheTransferMixin:
             [prefix_match.prefix_indices, decode_req.hicache_restored_kv_indices]
         )
         decode_req.req.last_node = decode_req.hicache_restored_node
+        decode_req.req.best_match_node = (
+            decode_req.hicache_published_node or prefix_match.best_match_node
+        )
+        decode_req.req.last_host_node = decode_req.req.best_match_node

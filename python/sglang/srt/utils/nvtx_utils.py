@@ -117,3 +117,7 @@ def profile_method(
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+
+# Backward-compatible aliases for older scheduler/disaggregation call sites.
+nvtx_annotated_method = scheduler_nvtx_method
+nvtx_range = partial(profile_range, nvtx_enabled=NVTX_SCHEDULER_ENABLED)

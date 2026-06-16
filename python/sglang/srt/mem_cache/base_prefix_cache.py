@@ -150,6 +150,7 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    force_load_back: bool = False
 
 
 class MatchResult(NamedTuple):

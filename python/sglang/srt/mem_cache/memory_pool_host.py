@@ -429,6 +429,16 @@ class MHATokenToKVPoolHost(HostKVCache):
             device=self.device_pool.device,
         )
 
+    def get_contiguous_buf_infos(self):
+        data_ptrs = [int(ptr.item()) for ptr in self.k_data_ptrs] + [
+            int(ptr.item()) for ptr in self.v_data_ptrs
+        ]
+        data_lens = [buf.nbytes for buf in self.k_data_refs] + [
+            buf.nbytes for buf in self.v_data_refs
+        ]
+        _, _, item_lens = self.device_pool.get_contiguous_buf_infos()
+        return data_ptrs, data_lens, item_lens
+
     def get_size_per_token(self):
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
