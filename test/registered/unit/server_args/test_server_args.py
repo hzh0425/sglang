@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -666,6 +667,50 @@ class TestHiCacheArgs(unittest.TestCase):
         args._handle_hicache()
 
         self.assertEqual(args.decode_attention_backend, "triton")
+
+    def test_unified_tree_l2_only_requires_hierarchical_cache(self):
+        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override("1"):
+            args = self._make_args(
+                unified_tree_l2_only_mode=True,
+                enable_hierarchical_cache=False,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "--enable-hierarchical-cache"
+            ):
+                args._handle_cache_compatibility()
+
+    def test_unified_tree_l2_only_rejects_disable_radix_cache(self):
+        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override("1"):
+            args = self._make_args(
+                unified_tree_l2_only_mode=True,
+                enable_hierarchical_cache=True,
+                disable_radix_cache=True,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "enable-hierarchical-cache and disable-radix-cache"
+            ):
+                args._handle_cache_compatibility()
+
+    def test_unified_tree_l2_only_requires_unified_tree_env(self):
+        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override("0"):
+            args = self._make_args(
+                unified_tree_l2_only_mode=True,
+                enable_hierarchical_cache=True,
+            )
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1"
+            ):
+                args._handle_cache_compatibility()
+
+    def test_unified_tree_l2_only_requires_write_through(self):
+        with envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.override("1"):
+            args = self._make_args(
+                unified_tree_l2_only_mode=True,
+                enable_hierarchical_cache=True,
+                hicache_write_policy="write_back",
+            )
+            with self.assertRaisesRegex(ValueError, "write_through"):
+                args._handle_cache_compatibility()
 
 
 class TestNgramExternalSamArgs(CustomTestCase):

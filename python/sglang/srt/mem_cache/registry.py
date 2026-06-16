@@ -145,6 +145,7 @@ def _create_unified_radix_cache(
     params: CacheInitParams,
 ) -> BasePrefixCache:
     """Initialize a UnifiedRadixCache with proper components and optional HiCache."""
+    from sglang.srt.mem_cache.cache_init_params import L1ResidencyMode
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
@@ -155,6 +156,11 @@ def _create_unified_radix_cache(
         tree_components.append(ComponentType.MAMBA)
 
     params.tree_components = tuple(tree_components)
+    params.l1_residency_mode = (
+        L1ResidencyMode.REQUEST_OWNED_DEVICE
+        if server_args.unified_tree_l2_only_mode
+        else L1ResidencyMode.INDEXED_DEVICE
+    )
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
             MlxAuxiliaryStateComponent,

@@ -27,6 +27,33 @@ def format_longbench_v2_example(example):
     return f"{context} {question}"
 
 
+def _build_offline_input_ids(tokenizer, max_prompt_tokens, num_samples):
+    passages = [
+        "A research team compared multiple cache layouts across long-context decoding workloads and recorded latency, hit rate, and memory pressure after each replay.",
+        "The deployment runbook explains how operators stage models, validate health endpoints, rotate traffic, and confirm that prefix reuse metrics continue to rise during replay traffic.",
+        "During benchmarking, each prompt contains a narrative section, a table description, and a short reasoning task so that the tokenizer sees varied punctuation, numbers, and structured language.",
+        "An engineer investigating regressions writes down the timeline, the suspected ownership boundary, the expected invariants, and the evidence collected from logs, counters, and targeted tests.",
+        "A product brief describes customer requests, edge cases, and acceptance criteria in enough detail that the resulting prompt exercises both retrieval-style context and answer synthesis.",
+        "System notes include host memory allocation summaries, device residency transitions, and cache publication events so replayed requests have realistic long prefixes to recover from storage.",
+    ]
+
+    input_ids = []
+    for sample_idx in range(num_samples):
+        target_len = int(max_prompt_tokens * (0.55 + 0.1 * (sample_idx % 6)))
+        tokens = []
+        chunk_idx = 0
+        while len(tokens) < target_len:
+            passage = passages[(sample_idx + chunk_idx) % len(passages)]
+            chunk = (
+                f"Sample {sample_idx} chunk {chunk_idx}. "
+                f"{passage} Summary marker {sample_idx * 17 + chunk_idx}."
+            )
+            tokens.extend(tokenizer.encode(chunk))
+            chunk_idx += 1
+        input_ids.append(tokens[:target_len])
+    return input_ids
+
+
 def get_input_ids(
     tokenizer_path, max_prompt_tokens=DEFAULT_PROMPT_TOKENS, num_samples=None
 ):
@@ -69,20 +96,25 @@ def get_input_ids(
 
     tokenizer = get_tokenizer(tokenizer_path)
 
-    print(f"Downloading {num_samples} samples from LongBench V2 (streaming)...")
-    dataset = load_dataset(
-        LONGBENCH_V2_DATASET, split=LONGBENCH_V2_SPLIT, streaming=True
-    )
+    try:
+        print(f"Downloading {num_samples} samples from LongBench V2 (streaming)...")
+        dataset = load_dataset(
+            LONGBENCH_V2_DATASET, split=LONGBENCH_V2_SPLIT, streaming=True
+        )
 
-    input_ids = []
-    for i, example in enumerate(dataset):
-        if len(input_ids) >= num_samples:
-            break
-        text = format_longbench_v2_example(example)
-        tokens = tokenizer.encode(text)
-        # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
-        truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
-        input_ids.append(tokens[:truncate_len])
+        input_ids = []
+        for example in dataset:
+            if len(input_ids) >= num_samples:
+                break
+            text = format_longbench_v2_example(example)
+            tokens = tokenizer.encode(text)
+            truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
+            input_ids.append(tokens[:truncate_len])
+    except Exception as exc:
+        print(f"Falling back to offline synthetic prompts for KL tests: {exc}")
+        input_ids = _build_offline_input_ids(
+            tokenizer, max_prompt_tokens=max_prompt_tokens, num_samples=num_samples
+        )
 
     # Save to local cache
     with open(cache_file, "w") as f:

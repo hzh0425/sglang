@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -12,6 +13,11 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache_components.tree_component import (
         TreeComponent,
     )
+
+
+class L1ResidencyMode(str, Enum):
+    INDEXED_DEVICE = "indexed_device"
+    REQUEST_OWNED_DEVICE = "request_owned_device"
 
 
 @dataclasses.dataclass
@@ -52,3 +58,4 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+    l1_residency_mode: L1ResidencyMode = L1ResidencyMode.INDEXED_DEVICE

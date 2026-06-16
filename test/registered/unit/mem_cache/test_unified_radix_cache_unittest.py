@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams, L1ResidencyMode
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import (
@@ -74,6 +74,7 @@ class CacheConfig:
     # Tree
     page_size: int = 1
     components: tuple[ComponentType, ...] = (ComponentType.FULL,)
+    l1_residency_mode: L1ResidencyMode = L1ResidencyMode.INDEXED_DEVICE
 
     # Layer split (only matters for SWA/Mamba)
     num_layers: int = 24
@@ -329,6 +330,7 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
         enable_kv_cache_events=enable_kv_cache_events,
         eviction_policy=cfg.eviction_policy,
         is_eagle=cfg.is_eagle,
+        l1_residency_mode=cfg.l1_residency_mode,
     )
     tree = UnifiedRadixCache(params=cache_init_params)
     tree.cache_init_params = cache_init_params
@@ -2480,11 +2482,20 @@ class UnifiedRadixCacheSuite:
             # Background prefetch/backup threads are daemon; stop them per-test.
             self.addCleanup(tree.cache_controller._stop_storage_threads)
 
-    def _build_hicache_fixture(self):
-        fixture = build_fixture(self.cfg)
+    def _build_hicache_fixture(self, cfg_override: Optional[CacheConfig] = None):
+        fixture = build_fixture(cfg_override or self.cfg)
         tree, _, _ = fixture
         self._init_hicache(tree)
         return fixture
+
+    def _build_request_owned_hicache_fixture(self):
+        if self.cfg.has_mamba:
+            self.skipTest("request-owned L1 mode is not covered for Mamba in iter1")
+        cfg = replace(
+            self.cfg,
+            l1_residency_mode=L1ResidencyMode.REQUEST_OWNED_DEVICE,
+        )
+        return self._build_hicache_fixture(cfg)
 
     def _backup_node(self, tree, node):
         # Parent-first backup over the whole path: one insert can span several
@@ -3002,7 +3013,7 @@ class UnifiedRadixCacheSuite:
             self._insert(tree, allocator, req_to_token_pool, seq)
         m = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         chain: list = []
-        cur = m.last_device_node
+        cur = m.last_device_node or m.best_match_node
         while cur is not tree.root_node:
             chain.append(cur)
             cur = cur.parent
@@ -3016,6 +3027,11 @@ class UnifiedRadixCacheSuite:
             tree.dec_lock_ref(node, lock_params)
             tree.dec_host_lock_ref(node, host_lock_params)
         tree.ongoing_load_back.clear()
+
+    def _finish_pending_writes(self, tree):
+        for _, finish_event, _ in list(tree.cache_controller.ack_write_queue):
+            finish_event.synchronize()
+        tree.writing_check()
 
     def _finish_pending_loads(self, tree):
         producer_id = tree.ready_to_load_host_cache()
@@ -3269,6 +3285,301 @@ class UnifiedRadixCacheSuite:
         self.assertIs(new_node, match.last_device_node)
         self.assertIsNone(leaf.component_data[ComponentType.FULL].value)
         self.assertIsNone(leaf.component_data[ComponentType.MAMBA].value)
+
+    def test_request_owned_hicache_match_returns_host_anchor_only(self):
+        if self.cfg.has_mamba:
+            self.skipTest("iter1 request-owned mode only covers Full/SWA")
+
+        tree, allocator, req_to_token_pool = self._build_request_owned_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+        self._backup_node(tree, leaf)
+        tree.evict(EvictParams(num_tokens=len(leaf.key)))
+
+        req = self._make_req(req_to_token_pool)
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+
+        self.assertIs(match.best_match_node, leaf)
+        self.assertIs(match.last_host_node, leaf)
+        self.assertIsNone(match.last_device_node)
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertGreater(match.host_hit_length, 0)
+
+        self._apply_match_to_req(req, match)
+        new_indices, new_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+
+        self.assertIs(new_node, leaf)
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertEqual(len(new_indices), len(tokens))
+        self._finish_pending_loads(tree)
+        self._release_ongoing_load_back_locks(tree)
+
+    def test_request_owned_hicache_cache_unfinished_preserves_load_back_anchor(self):
+        if self.cfg.has_mamba:
+            self.skipTest("iter1 request-owned mode only covers Full/SWA")
+
+        tree, allocator, req_to_token_pool = self._build_request_owned_hicache_fixture()
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, 3)
+        if len(chain) < 3:
+            self.skipTest("chain too short")
+
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(chain)
+        self._backup_node(tree, leaf)
+        tree.evict(EvictParams(num_tokens=len(leaf.key)))
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(tokens)
+        req.kv_committed_len = len(tokens)
+        req.kv_allocated_len = len(tokens)
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        new_indices, new_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+        req.prefix_indices = new_indices
+        req.last_node = new_node
+        req.cache_protected_len = len(new_indices)
+
+        tree.cache_unfinished_req(req)
+        self.assertIs(req.last_node, new_node)
+
+        self._finish_pending_loads(tree)
+        self._release_ongoing_load_back_locks(tree)
+
+    def test_request_owned_hicache_cache_finished_req_demotes_after_ack(self):
+        if self.cfg.has_mamba:
+            self.skipTest("iter1 request-owned mode only covers Full/SWA")
+
+        tree, allocator, req_to_token_pool = self._build_request_owned_hicache_fixture()
+        tree.write_through_threshold = 1
+        ps = self.cfg.page_size
+        tokens = self._make_seq(1, 2)
+        if self.cfg.has_swa and len(tokens) <= self.cfg.sliding_window_size:
+            tokens.extend(self._make_seq(5000, 1))
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.kv_committed_len = len(tokens)
+        req.kv_allocated_len = len(tokens)
+        req.last_node = tree.root_node
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+        if self.cfg.has_mamba:
+            req.mamba_last_track_seqlen = len(tokens)
+
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+
+        available_before_finish = allocator.available_size()
+        tree.cache_finished_req(req, is_insert=True)
+        self._finish_pending_writes(tree)
+
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self.assertIsNone(match.last_device_node)
+        self.assertGreaterEqual(match.host_hit_length, ps)
+        self.assertIsNot(match.best_match_node, tree.root_node)
+        self.assertTrue(match.best_match_node.backuped)
+        self.assertTrue(match.best_match_node.evicted)
+        self.assertEqual(
+            allocator.available_size(),
+            available_before_finish + len(tokens),
+        )
+
+    def test_request_owned_hicache_finish_keeps_borrowed_load_back_prefix_owned_by_tree(
+        self,
+    ):
+        if self.cfg.has_mamba:
+            self.skipTest("iter1 request-owned mode only covers Full/SWA")
+
+        tree, allocator, req_to_token_pool = self._build_request_owned_hicache_fixture()
+        tree.write_through_threshold = 1
+        tokens = self._make_seq(1, 2)
+        if self.cfg.has_swa and len(tokens) <= self.cfg.sliding_window_size:
+            tokens.extend(self._make_seq(5000, 1))
+
+        seed_req = self._make_req(req_to_token_pool)
+        seed_req.origin_input_ids = array("q", tokens)
+        seed_req.output_ids = array("q")
+        seed_req.full_untruncated_fill_ids = array("q", tokens)
+        seed_req.fill_len = len(seed_req.full_untruncated_fill_ids)
+        seed_req.kv_committed_len = len(tokens)
+        seed_req.kv_allocated_len = len(tokens)
+        seed_req.last_node = tree.root_node
+        seed_req.cache_protected_len = 0
+        seed_req.swa_uuid_for_lock = None
+        seed_req.extra_key = None
+
+        seed_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write(
+            (seed_req.req_pool_idx, slice(0, len(tokens))),
+            seed_indices,
+        )
+        tree.cache_finished_req(seed_req, is_insert=True)
+        self._finish_pending_writes(tree)
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.kv_committed_len = len(tokens)
+        req.kv_allocated_len = len(tokens)
+        req.extra_key = None
+
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self._apply_match_to_req(req, match)
+        self.assertIsNone(req.last_node)
+        self.assertGreater(req.host_hit_length, 0)
+
+        new_indices, new_node = tree.init_load_back(
+            InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                req=req,
+            )
+        )
+        self._finish_pending_loads(tree)
+        req.prefix_indices = new_indices
+        req.last_node = new_node
+        req.cache_protected_len = len(new_indices)
+        req_to_token_pool.write(
+            (req.req_pool_idx, slice(0, len(new_indices))),
+            new_indices,
+        )
+        req_lock = tree.inc_lock_ref(req.last_node)
+        req.swa_uuid_for_lock = req_lock.swa_uuid_for_lock
+
+        if self.cfg.has_swa:
+            available_before_finish = allocator.full_available_size()
+            total_full_tokens = allocator.size_full
+        else:
+            available_before_finish = allocator.available_size()
+            total_full_tokens = allocator.size
+
+        tree.cache_finished_req(req, is_insert=True)
+
+        if self.cfg.has_swa:
+            available_after_finish = allocator.full_available_size()
+        else:
+            available_after_finish = allocator.available_size()
+
+        self.assertEqual(available_after_finish, available_before_finish)
+        self.assertEqual(
+            available_after_finish + tree.full_evictable_size() + tree.full_protected_size(),
+            total_full_tokens,
+        )
+
+    def test_request_owned_hicache_overlap_finish_leaves_no_device_protection(self):
+        if self.cfg.has_mamba:
+            self.skipTest("iter1 request-owned mode only covers Full/SWA")
+
+        tree, allocator, req_to_token_pool = self._build_request_owned_hicache_fixture()
+        tree.write_through_threshold = 1
+        ps = self.cfg.page_size
+        base = self._make_seq(1, 2)
+        if self.cfg.has_swa and len(base) <= self.cfg.sliding_window_size:
+            base.extend(self._make_seq(5000, 1))
+        overlap = base + self._make_seq(9000, 1)
+
+        def finish_req(tokens):
+            req = self._make_req(req_to_token_pool)
+            req.origin_input_ids = array("q", tokens)
+            req.output_ids = array("q")
+            req.full_untruncated_fill_ids = array("q", tokens)
+            req.fill_len = len(req.full_untruncated_fill_ids)
+            req.kv_committed_len = len(tokens)
+            req.kv_allocated_len = len(tokens)
+            req.last_node = None
+            req.cache_protected_len = 0
+            req.swa_uuid_for_lock = None
+            req.extra_key = None
+
+            kv_indices = self._alloc(allocator, len(tokens))
+            req_to_token_pool.write(
+                (req.req_pool_idx, slice(0, len(tokens))), kv_indices
+            )
+            tree.cache_unfinished_req(req)
+            tree.cache_finished_req(req, is_insert=True)
+
+        finish_req(base)
+        self._finish_pending_writes(tree)
+        finish_req(overlap)
+        self._finish_pending_writes(tree)
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", overlap))))
+        self.assertIsNone(match.last_device_node)
+        self.assertGreaterEqual(match.host_hit_length, 2 * ps)
+        self.assertEqual(tree.full_protected_size(), 0)
+
+    def test_request_owned_hicache_finish_ignores_unfinished_prefix_len(self):
+        if self.cfg.has_mamba:
+            self.skipTest("iter1 request-owned mode only covers Full/SWA")
+
+        tree, allocator, req_to_token_pool = self._build_request_owned_hicache_fixture()
+        tree.write_through_threshold = 1
+        tokens = self._make_seq(1, 2)
+        if self.cfg.has_swa and len(tokens) <= self.cfg.sliding_window_size:
+            tokens.extend(self._make_seq(5000, 1))
+
+        req = self._make_req(req_to_token_pool)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.fill_len = len(req.full_untruncated_fill_ids)
+        req.kv_committed_len = len(tokens)
+        req.kv_allocated_len = len(tokens)
+        req.last_node = None
+        req.cache_protected_len = 0
+        req.swa_uuid_for_lock = None
+        req.extra_key = None
+
+        kv_indices = self._alloc(allocator, len(tokens))
+        req_to_token_pool.write((req.req_pool_idx, slice(0, len(tokens))), kv_indices)
+
+        tree.cache_unfinished_req(req)
+        self.assertEqual(req.cache_protected_len, 0)
+
+        available_before_finish = allocator.available_size()
+        tree.cache_finished_req(req, is_insert=True)
+        self._finish_pending_writes(tree)
+
+        self.assertEqual(
+            allocator.available_size(),
+            available_before_finish + len(tokens),
+        )
 
     def test_hicache_swa_load_back_min_suffix(self):
         """LOAD_BACK collects only the suffix nodes needed to cover sliding_window_size."""

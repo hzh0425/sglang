@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.cache_init_params import L1ResidencyMode
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
@@ -289,6 +290,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
+        self.l1_residency_mode = params.l1_residency_mode
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -481,6 +483,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self._record_all_cleared_event()
 
+    def is_request_owned_l1(self) -> bool:
+        return self.l1_residency_mode == L1ResidencyMode.REQUEST_OWNED_DEVICE
+
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
@@ -618,6 +623,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
+        if node is None:
+            return IncLockRefResult()
         result = self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
@@ -633,6 +640,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def dec_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
+        if node is None:
+            return DecLockRefResult()
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
             return result
@@ -687,13 +696,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
+        request_owned_l1 = self.is_request_owned_l1()
+        borrowed_prefix_len = (
+            self._borrowed_prefix_len(req, kv_committed_len)
+            if request_owned_l1
+            else 0
+        )
+        prev_prefix_len = (
+            borrowed_prefix_len if request_owned_l1 else req.cache_protected_len
+        )
 
         result = None
         insert_params = None
 
         if is_insert:
             insert_params = InsertParams(
-                prev_prefix_len=req.cache_protected_len,
+                prev_prefix_len=prev_prefix_len,
                 priority=getattr(req, "priority", 0) or 0,
             )
 
@@ -711,7 +729,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # Truncate if needed
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
+                free_start = (
+                    max(effective_cache_len, borrowed_prefix_len)
+                    if request_owned_l1
+                    else max(effective_cache_len, req.cache_protected_len)
+                )
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
@@ -726,10 +748,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
+            if self.is_request_owned_l1():
+                inserted_device_node = result.inserted_device_node
+                if (
+                    inserted_device_node is not None
+                    and inserted_device_node.write_through_pending_id is None
+                    and inserted_device_node.backuped
+                ):
+                    self._demote_backuped_path_to_host(inserted_device_node)
+
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            free_start = (
+                borrowed_prefix_len if request_owned_l1 else req.cache_protected_len
+            )
+            self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
 
         self.dec_lock_ref(
             req.last_node,
@@ -744,6 +778,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
+            return
+
+        if self.is_request_owned_l1():
+            token_ids = req.get_fill_ids()
+            kv_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(token_ids)
+            ]
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         token_ids = req.get_fill_ids()
@@ -959,9 +1001,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices = torch.cat(value[:best_match_device_value_len])
         else:
             device_indices = self._empty_match_result.device_indices
+        last_device_node = best_match_device_node
+        if self.is_request_owned_l1() and self.cache_controller is not None:
+            device_indices = self._empty_match_result.device_indices
+            last_device_node = None
         result = MatchResult(
             device_indices=device_indices,
-            last_device_node=best_match_device_node,
+            last_device_node=last_device_node,
             last_host_node=last_host_node,
             best_match_node=best_match_node,
             host_hit_length=0,
@@ -1166,6 +1212,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
+        result.inserted_device_node = target_node
         return result
 
     def _insert_helper_host(
@@ -1603,6 +1650,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_store_event(node, medium=StorageMedium.CPU)
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
+        if self.is_request_owned_l1():
+            for node in sorted(
+                publish_nodes, key=lambda current: len(current.key), reverse=True
+            ):
+                self._demote_backuped_path_to_host(node)
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
@@ -2369,7 +2421,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
-        last_best_match_device_node = req.last_node
+        last_best_match_device_node = req.last_node or self.root_node
 
         def _collect_new_prefix_indices() -> torch.Tensor:
             prefix_chunks: list[torch.Tensor] = []
@@ -2400,10 +2452,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         last_best_match_device_node,
                     )
 
-                logger.debug(
-                    "init_load_back success: loaded %d tokens for node %d",
-                    len(new_indices),
+                logger.info(
+                    "init_load_back: rid=%s node=%d host_hit=%d swa_host_hit=%d "
+                    "mamba_host_hit=%d load_back_tokens=%d",
+                    getattr(req, "rid", None),
                     best_match_node.id,
+                    params.host_hit_length,
+                    getattr(req, "swa_host_hit_length", 0),
+                    getattr(req, "mamba_host_hit_length", 0),
+                    len(new_indices),
                 )
                 return new_indices, best_match_node
 
@@ -2411,6 +2468,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._empty_match_result.device_indices,
             last_best_match_device_node,
         )
+
+    def _borrowed_prefix_len(self, req: Req, kv_committed_len: int) -> int:
+        anchor = req.last_node
+        if anchor is None or anchor is self.root_node:
+            return 0
+        prefix_len = 0
+        node = anchor
+        while node is not self.root_node:
+            prefix_len += len(node.key)
+            node = node.parent
+        return min(prefix_len, kv_committed_len)
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
@@ -2433,6 +2501,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
+
+    def _demote_backuped_path_to_host(self, start_node: UnifiedTreeNode) -> None:
+        tracker = {ct: 0 for ct in self.tree_components}
+        node = start_node
+        while node is not None and node is not self.root_node:
+            if not node.backuped or not self._is_device_leaf(node):
+                break
+            self._evict_to_host(node, tracker)
+            node = node.parent
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.

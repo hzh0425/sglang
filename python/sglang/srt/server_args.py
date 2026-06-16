@@ -705,6 +705,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    unified_tree_l2_only_mode: bool = False
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -4409,6 +4410,24 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.unified_tree_l2_only_mode:
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--unified-tree-l2-only-mode requires --enable-hierarchical-cache."
+                )
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "--unified-tree-l2-only-mode is incompatible with --disable-radix-cache."
+                )
+            if not envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+                raise ValueError(
+                    "--unified-tree-l2-only-mode requires SGLANG_ENABLE_UNIFIED_RADIX_TREE=1."
+                )
+            if self.hicache_write_policy != "write_through":
+                raise ValueError(
+                    "--unified-tree-l2-only-mode requires --hicache-write-policy=write_through."
+                )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -6576,6 +6595,12 @@ class ServerArgs:
             type=str,
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
+        )
+        parser.add_argument(
+            "--unified-tree-l2-only-mode",
+            action="store_true",
+            help="Enable UnifiedTree host-first prefix matching mode. "
+            "Admission matches only host-backed prefixes, then loads them back to device.",
         )
 
         # Hierarchical sparse attention

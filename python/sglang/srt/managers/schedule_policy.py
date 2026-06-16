@@ -49,6 +49,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import page_align_floor
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 
@@ -312,7 +313,10 @@ class SchedulePolicy:
         """Sorts the waiting queue based on a depth-first search weighting."""
         last_node_to_reqs = defaultdict(list)
         for req in waiting_queue:
-            last_node_to_reqs[req.last_node].append(req)
+            anchor = req.last_node
+            if anchor is None:
+                anchor = req.best_match_node or tree_cache.root_node
+            last_node_to_reqs[anchor].append(req)
 
         node_to_weight = defaultdict(int)
         for node in last_node_to_reqs:
@@ -941,7 +945,14 @@ class PrefillAdder:
                     len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
                 )
                 prefix_len = len(req.prefix_indices)
-                req.cache_protected_len = prefix_len
+                if self.is_hybrid_swa and getattr(
+                    self.tree_cache, "is_request_owned_l1", lambda: False
+                )():
+                    req.cache_protected_len = page_align_floor(
+                        prefix_len, self.tree_cache.page_size
+                    )
+                else:
+                    req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
