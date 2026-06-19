@@ -34,11 +34,12 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--tp-size",
                 "2",
                 "--mem-fraction-static",
-                "0.80",
+                "0.70",
                 "--page-size",
                 "64",
+                "--radix-cache-backend",
+                "rust_unified",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

@@ -352,6 +352,10 @@ impl RustPageRadixCacheWrapper {
         self.inner.reset();
     }
 
+    fn default_root_idx(&self) -> usize {
+        self.inner.default_root_idx()
+    }
+
     fn page_size(&self) -> usize {
         self.inner.page_size()
     }
@@ -702,6 +706,10 @@ impl RustBigramRadixCacheWrapper {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    fn default_root_idx(&self) -> usize {
+        self.inner.default_root_idx()
     }
 
     fn page_size(&self) -> usize {

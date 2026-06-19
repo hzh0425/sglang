@@ -1,7 +1,7 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
 Usage (standalone):
-    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa
+    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa rust-full
     CI Test: python -m pytest test/registered/unit/mem_cache/test_unified_radix_cache_bench.py -v -s
 """
 
@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.rust_unified_radix_cache import RustUnifiedRadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -322,7 +323,9 @@ def _alloc_with_evict(env, n):
     """Alloc *n* tokens, evicting if necessary.  Returns tensor or None."""
     v = _alloc(env, n)
     if v is None:
-        env.tree.evict(EvictParams(num_tokens=n * 2, mamba_num=2))
+        env.tree.evict(
+            EvictParams(num_tokens=n * 2, mamba_num=2 if env.has_mamba else 0)
+        )
         v = _alloc(env, n)
     return v
 
@@ -544,7 +547,9 @@ def bench_evict(
     return bench_api(
         "evict",
         lambda: items,
-        lambda item: env.tree.evict(EvictParams(num_tokens=item[0], mamba_num=2)),
+        lambda item: env.tree.evict(
+            EvictParams(num_tokens=item[0], mamba_num=2 if env.has_mamba else 0)
+        ),
         num_evictions - warmup,
         evict_batch,
         warmup,
@@ -834,6 +839,7 @@ del _cfg, _name
 # ===================================================================
 _TREE_CONFIGS = {
     "full": ((ComponentType.FULL,), None),
+    "rust-full": ((ComponentType.FULL,), RustUnifiedRadixCache),
     "mamba": ((ComponentType.FULL, ComponentType.MAMBA), None),
     "swa": ((ComponentType.FULL, ComponentType.SWA), None),
     "all": ((ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA), None),

@@ -15,7 +15,7 @@
 
 Coordinates three pieces:
     1. Rust RadixCache (sglang.srt.mem_cache._mem_cache_core.RustPageRadixCacheWrapper) — owns
-       tree state and lock_ref accounting. Handles all page sizes
+       tree state, root handle, and lock_ref accounting. Handles all page sizes
        (`page_size >= 1`); `page_size=1` uses one-element page keys.
     2. Python ReqToTokenPool — owns per-request kv-index storage; unchanged.
     3. Python {Token,Paged}TokenToKVPoolAllocator — owns slot allocation and
@@ -23,7 +23,7 @@ Coordinates three pieces:
 
 Drop-in replacement for `sglang.srt.mem_cache.radix_cache.RadixCache` for the
 v1 supported configuration:
-    * Full attention; SWA when `sliding_window_size` is set (no Mamba, no HiCache).
+    * Full attention only through the registered backend (no SWA, Mamba, or HiCache).
     * page_size >= 1.
     * LRU eviction only.
     * No EAGLE bigram, no `enable_kv_cache_events`, no TTL eviction.
@@ -58,10 +58,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.registry import (
-    get_radix_cache_factory,
-    register_radix_cache_backend,
-)
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -185,6 +181,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             mamba_cache_chunk_size=self.mamba_cache_chunk_size,
             enable_hicache=self.enable_hierarchical_cache,
         )
+        self.root_node = self._rust_radix.default_root_idx()
         # Cache a single empty tensor for the disabled-cache match-result
         # path so we don't allocate per call. Callers must not mutate it
         # (empty tensors aren't typically mutated, so this is safe by
@@ -333,6 +330,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # separately. In practice, `reset()` runs at startup or warmup when
         # the allocator is already empty.
         self._rust_radix.reset()
+        self.root_node = self._rust_radix.default_root_idx()
 
     def supports_fast_match_prefix(self) -> bool:
         return True
@@ -861,7 +859,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return
 
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -897,6 +895,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 value=values,
                 chunked=chunked,
                 prev_prefix_len=req.cache_protected_len,
+                priority=getattr(req, "priority", 0) or 0,
                 mamba_value=mamba_value_forked,
             )
         )
@@ -1175,6 +1174,11 @@ def install_rust_radix_cache() -> None:
     importing the default registry path remains safe before the extension is
     built.
     """
+    from sglang.srt.mem_cache.registry import (
+        get_radix_cache_factory,
+        register_radix_cache_backend,
+    )
+
     if get_radix_cache_factory("rust_unified") is not None:
         return
 
@@ -1184,9 +1188,17 @@ def install_rust_radix_cache() -> None:
             raise RadixCacheInfraPyError(
                 "RustUnifiedRadixCache: hierarchical cache (HiCache) not supported"
             )
+        if ctx.is_hybrid_swa:
+            raise RadixCacheInfraPyError(
+                "RustUnifiedRadixCache: hybrid SWA models not supported"
+            )
         if ctx.is_hybrid_ssm:
             raise RadixCacheInfraPyError(
                 "RustUnifiedRadixCache: hybrid SSM / Mamba models not supported"
+            )
+        if ctx.server_args.enable_lmcache:
+            raise RadixCacheInfraPyError(
+                "RustUnifiedRadixCache: LMCache is not supported"
             )
         return RustUnifiedRadixCache(ctx.params)
 

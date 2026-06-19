@@ -168,6 +168,67 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 factory(_make_ctx(backend="rust_unified"))
             load_native_symbols.assert_called_once()
 
+    def test_rust_unified_factory_rejects_hierarchical_cache(self):
+        factory = get_radix_cache_factory("rust_unified")
+        self.assertIsNotNone(factory)
+
+        with (
+            patch("sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"),
+            patch(
+                "sglang.srt.mem_cache.rust_unified_radix_cache.RadixCacheInfraPyError",
+                RuntimeError,
+            ),
+            self.assertRaisesRegex(RuntimeError, "hierarchical cache"),
+        ):
+            factory(
+                _make_ctx(
+                    backend="rust_unified",
+                    enable_hierarchical_cache=True,
+                )
+            )
+
+    def test_rust_unified_factory_rejects_hybrid_swa(self):
+        factory = get_radix_cache_factory("rust_unified")
+        self.assertIsNotNone(factory)
+
+        with (
+            patch("sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"),
+            patch(
+                "sglang.srt.mem_cache.rust_unified_radix_cache.RadixCacheInfraPyError",
+                RuntimeError,
+            ),
+            self.assertRaisesRegex(RuntimeError, "SWA"),
+        ):
+            factory(_make_ctx(backend="rust_unified", is_hybrid_swa=True))
+
+    def test_rust_unified_factory_rejects_hybrid_ssm(self):
+        factory = get_radix_cache_factory("rust_unified")
+        self.assertIsNotNone(factory)
+
+        with (
+            patch("sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"),
+            patch(
+                "sglang.srt.mem_cache.rust_unified_radix_cache.RadixCacheInfraPyError",
+                RuntimeError,
+            ),
+            self.assertRaisesRegex(RuntimeError, "Mamba"),
+        ):
+            factory(_make_ctx(backend="rust_unified", is_hybrid_ssm=True))
+
+    def test_rust_unified_factory_rejects_lmcache(self):
+        factory = get_radix_cache_factory("rust_unified")
+        self.assertIsNotNone(factory)
+
+        with (
+            patch("sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"),
+            patch(
+                "sglang.srt.mem_cache.rust_unified_radix_cache.RadixCacheInfraPyError",
+                RuntimeError,
+            ),
+            self.assertRaisesRegex(RuntimeError, "LMCache"),
+        ):
+            factory(_make_ctx(backend="rust_unified", enable_lmcache=True))
+
 
 class TestDefaultRadixCacheFactory(CustomTestCase):
     """Branch coverage for the built-in radix cache selection chain.

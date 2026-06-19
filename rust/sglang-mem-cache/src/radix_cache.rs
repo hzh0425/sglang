@@ -261,6 +261,11 @@ impl<K: ChildKeyType> RadixCache<K> {
         self.named_roots.clear();
     }
 
+    /// Node index for the default namespace root (`extra_key = None`).
+    pub fn default_root_idx(&self) -> NodeIdx {
+        self.default_root
+    }
+
     fn empty_match_result(&self, last_device_node_idx: NodeIdx) -> MatchResult {
         MatchResult {
             device_indices: self.empty_tensor.shallow_clone(),
