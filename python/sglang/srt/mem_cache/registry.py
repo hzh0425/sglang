@@ -185,6 +185,11 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             )
         cache = factory(ctx)
         source = f"registered({name!r})"
+        if ctx.enable_hierarchical_cache:
+            cache.init_hicache(ctx.server_args, ctx.params)
+            ctx.tp_worker.register_hicache_layer_transfer_counter(
+                cache.cache_controller.layer_done_counter
+            )
     else:
         cache = default_radix_cache_factory(ctx)
         source = "default"

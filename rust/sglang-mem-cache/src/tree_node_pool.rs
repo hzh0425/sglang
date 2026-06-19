@@ -7,8 +7,8 @@ use tch::Tensor;
 use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
 use crate::error::{ChildKeyError, RadixCacheInitError};
 use crate::tree_node_lru::{
-    evict_full_value, ComponentPoolState, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUData,
-    LRUSlot, MambaLRUSlot, SwaLRUSlot,
+    ComponentPoolState, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUData, LRUSlot, MambaLRUSlot,
+    SwaLRUSlot, evict_full_value,
 };
 
 // TODO(Jialin): [Optimization][Major] TreeNode.children could be replaced by a more compact representation
@@ -230,6 +230,10 @@ pub struct TreeNode<K: ChildKeyType> {
     /// node with none as an (effective) leaf, regardless of whether HiCache is
     /// enabled.
     pub(crate) num_children_with_device_full: u32,
+    /// Count of children holding a FULL host value. Host eviction may only
+    /// remove host leaves; otherwise a host-only descendant can lose the
+    /// root-to-leaf source chain needed for load-back.
+    pub(crate) num_children_with_host_full: u32,
 }
 
 impl<K: ChildKeyType> TreeNode<K> {
@@ -253,6 +257,7 @@ impl<K: ChildKeyType> TreeNode<K> {
             hit_count: 0,
             swa_uuid_for_lock: None,
             num_children_with_device_full: 0,
+            num_children_with_host_full: 0,
         }
     }
 
@@ -278,6 +283,7 @@ impl<K: ChildKeyType> TreeNode<K> {
             hit_count: 0,
             swa_uuid_for_lock: None,
             num_children_with_device_full: 0,
+            num_children_with_host_full: 0,
         }
     }
 
@@ -298,6 +304,7 @@ impl<K: ChildKeyType> TreeNode<K> {
             hit_count: 0,
             swa_uuid_for_lock: None,
             num_children_with_device_full: 0,
+            num_children_with_host_full: 0,
         }
     }
 
@@ -638,7 +645,7 @@ impl<K: ChildKeyType> TreeNodePool<K> {
             // evictable/protected split (same rule as `lock` / `unlock`
             // use on the 0↔1 lock_ref transitions).
             let node = self.get(idx);
-            let value_len = node.key().len();
+            let value_len = FullLRUSlot::value_len(node);
             let lock_ref = node.lock_ref();
             FullLRUSlot::remove(self, idx);
             let state = FullLRUSlot::pool_state_mut(self);
@@ -675,12 +682,12 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         self.get_mut(parent_idx)
             .insert_child(child_key_owned, child_idx);
         // Bookkeeping updates after inserting the leaf.
-        let value_len = self.get(child_idx).key().len();
-        FullLRUSlot::bump_mru(self, child_idx);
-        FullLRUSlot::pool_state_mut(self).unlocked_size += value_len;
-        // After connecting the child, invoke postprocess_set_value so the
-        // parent's bookkeeping stays accurate.
         if FullLRUSlot::has_value(self.get(child_idx)) {
+            let value_len = FullLRUSlot::value_len(self.get(child_idx));
+            FullLRUSlot::bump_mru(self, child_idx);
+            FullLRUSlot::pool_state_mut(self).unlocked_size += value_len;
+            // After connecting the child, invoke postprocess_set_value so the
+            // parent's bookkeeping stays accurate.
             FullLRUSlot::postprocess_set_value(self, parent_idx);
         }
         Ok(child_idx)
@@ -830,6 +837,8 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         // node counters are preserved.
         self.get_mut(new_node_idx).num_children_with_device_full =
             u32::from(FullLRUSlot::has_value(self.get(node_idx)));
+        self.get_mut(new_node_idx).num_children_with_host_full =
+            u32::from(HostFullLRUSlot::has_value(self.get(node_idx)));
 
         new_node_idx
     }

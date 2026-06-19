@@ -575,6 +575,16 @@ impl RustPageRadixCacheWrapper {
         Ok(self.inner.set_host_full_values(node_indices, values)?)
     }
 
+    /// Restore device FULL values after an orchestrator-side write-back failure.
+    fn restore_full_values(
+        &mut self,
+        node_indices: Vec<usize>,
+        device_values: Vec<PyTensor>,
+    ) -> PyResult<()> {
+        let values: Vec<tch::Tensor> = device_values.into_iter().map(|v| v.0).collect();
+        Ok(self.inner.restore_full_values(node_indices, values)?)
+    }
+
     /// Populate backup host values onto the given nodes and lock device values
     /// (to avoid async copy corruption).
     fn set_host_full_values_and_lock_device(
@@ -605,6 +615,11 @@ impl RustPageRadixCacheWrapper {
             ancestor_node_idx,
             device_values.map(|v| v.0),
         )?)
+    }
+
+    /// Release host source locks and the loaded device handoff lock after H2D ack.
+    fn finish_load_back(&mut self, chain: Vec<usize>, loaded_node_idx: usize) {
+        self.inner.finish_load_back(chain, loaded_node_idx);
     }
 }
 
@@ -857,6 +872,16 @@ impl RustBigramRadixCacheWrapper {
         Ok(self.inner.set_host_full_values(node_indices, values)?)
     }
 
+    /// Restore device FULL values after an orchestrator-side write-back failure.
+    fn restore_full_values(
+        &mut self,
+        node_indices: Vec<usize>,
+        device_values: Vec<PyTensor>,
+    ) -> PyResult<()> {
+        let values: Vec<tch::Tensor> = device_values.into_iter().map(|v| v.0).collect();
+        Ok(self.inner.restore_full_values(node_indices, values)?)
+    }
+
     /// Populate backup host values onto the given nodes and lock device values
     /// (to avoid async copy corruption).
     fn set_host_full_values_and_lock_device(
@@ -887,5 +912,10 @@ impl RustBigramRadixCacheWrapper {
             ancestor_node_idx,
             device_values.map(|v| v.0),
         )?)
+    }
+
+    /// Release host source locks and the loaded device handoff lock after H2D ack.
+    fn finish_load_back(&mut self, chain: Vec<usize>, loaded_node_idx: usize) {
+        self.inner.finish_load_back(chain, loaded_node_idx);
     }
 }

@@ -22,7 +22,7 @@ use crate::component_type::ComponentType;
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
 use crate::tree_node_lru::{
-    evict_non_full, EvictRequest, EvictResult, FullLRUSlot, LRUSlot, SwaLRUSlot,
+    EvictRequest, EvictResult, FullLRUSlot, LRUSlot, SwaLRUSlot, evict_non_full,
 };
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, NodeSplit, TreeNode, TreeNodePool};
 

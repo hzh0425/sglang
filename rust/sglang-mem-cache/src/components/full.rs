@@ -7,7 +7,7 @@ use crate::component_type::ComponentType;
 use crate::deferred_action::DeferredAction;
 use crate::error::RadixCacheRuntimeError;
 use crate::tree_node_lru::{
-    evict_full, EvictRequest, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUSlot,
+    EvictRequest, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUSlot, evict_full,
 };
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNodePool};
 
@@ -81,7 +81,13 @@ impl<K: ChildKeyType> Component<K> for FullComponent {
         let target = request.num_tokens[ct];
         let already = result.evicted[ct];
         if already < target {
-            evict_full(pool, target - already, self.hicache_write_back, result);
+            evict_full(
+                pool,
+                target - already,
+                self.enable_hicache,
+                self.hicache_write_back,
+                result,
+            );
         }
     }
 

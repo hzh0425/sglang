@@ -3,7 +3,7 @@
 use super::{Component, IncLockRefResult, MatchValidator};
 use crate::component_type::ComponentType;
 use crate::error::RadixCacheInitError;
-use crate::tree_node_lru::{evict_non_full, EvictRequest, EvictResult, LRUSlot, MambaLRUSlot};
+use crate::tree_node_lru::{EvictRequest, EvictResult, LRUSlot, MambaLRUSlot, evict_non_full};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
 /// Per-component shell that hosts Mamba-specific radix-tree logic.

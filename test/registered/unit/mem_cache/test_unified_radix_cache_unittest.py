@@ -336,6 +336,164 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     return tree, allocator, req_to_token_pool
 
 
+class TestRustFullHiCacheUnit(CustomTestCase):
+    """Focused Rust Full-only L2 transition tests."""
+
+    page_size = 2
+
+    def _wrapper(self, *, write_back: bool = False):
+        try:
+            from sglang.srt.mem_cache._mem_cache_core import RustPageRadixCacheWrapper
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+        return RustPageRadixCacheWrapper(
+            device="cpu",
+            page_size=self.page_size,
+            init_node_capacity=32,
+            enable_hicache=True,
+            hicache_write_back=write_back,
+        )
+
+    def _insert(self, tree, tokens, values):
+        return tree.insert(
+            array("q", tokens),
+            torch.tensor(values, dtype=torch.int64),
+            None,
+            0,
+            0,
+            None,
+        )
+
+    def _match(self, tree, tokens):
+        return tree.match_prefix(array("q", tokens))
+
+    def _backup_from_actions(self, tree, actions, host_start=100, *, lock_device=True):
+        nodes = []
+        values = []
+        cursor = host_start
+        for action in actions:
+            if action[0] != "FullWriteThroughBackup":
+                continue
+            _, node_idx, device_value = action
+            nodes.append(node_idx)
+            values.append(
+                torch.arange(cursor, cursor + len(device_value), dtype=torch.int64)
+            )
+            cursor += len(device_value)
+        if lock_device:
+            tree.set_host_full_values_and_lock_device(nodes, values)
+            for node_idx in nodes:
+                tree.dec_lock_ref(node_idx, None)
+        elif nodes:
+            tree.set_host_full_values(nodes, values)
+        return nodes
+
+    def _single_action(self, actions, tag):
+        matched = [action for action in actions if action[0] == tag]
+        self.assertEqual(len(matched), 1, actions)
+        return matched[0]
+
+    def test_rust_full_hicache_write_through_evict_and_load_back(self):
+        tree = self._wrapper()
+        insert_result = self._insert(tree, [1, 2, 3, 4], [10, 11, 12, 13])
+        backed_nodes = self._backup_from_actions(
+            tree, insert_result.deferred_actions, host_start=110
+        )
+        self.assertEqual(len(backed_nodes), 1)
+        leaf = backed_nodes[0]
+
+        evict_result = tree.evict([4, 0, 0])
+        action = self._single_action(
+            evict_result.deferred_actions, "FullDeviceEvictOnBackedUp"
+        )
+        self.assertEqual(action[1], leaf)
+
+        match = self._match(tree, [1, 2, 3, 4])
+        self.assertEqual(match.device_indices.numel(), 0)
+        self.assertEqual(match.last_device_node_idx, tree.default_root_idx())
+        self.assertEqual(match.last_host_node_idx, leaf)
+        self.assertEqual(match.host_only_length, 4)
+
+        plan = tree.prepare_load_back(leaf)
+        self.assertEqual(plan.chain, [leaf])
+        self.assertTrue(torch.equal(plan.host_indices, torch.arange(110, 114)))
+        tree.postprocess_load_back(
+            plan.chain,
+            plan.ancestor_node_idx,
+            torch.arange(210, 214, dtype=torch.int64),
+        )
+        tree.finish_load_back(plan.chain, leaf)
+
+        loaded = self._match(tree, [1, 2, 3, 4])
+        self.assertTrue(torch.equal(loaded.device_indices, torch.arange(210, 214)))
+        self.assertEqual(loaded.host_only_length, 0)
+
+    def test_rust_full_hicache_write_back_leaf_backup_without_parent_backup(self):
+        tree = self._wrapper(write_back=True)
+        self._insert(tree, [1, 2], [10, 11])
+        self._insert(tree, [1, 2, 3, 4], [10, 11, 12, 13])
+
+        evict_result = tree.evict([2, 0, 0])
+        action = self._single_action(
+            evict_result.deferred_actions, "FullWriteBackOnEvict"
+        )
+        _, leaf, device_value = action
+        self.assertTrue(torch.equal(device_value, torch.tensor([12, 13])))
+
+        tree.set_host_full_values(
+            [leaf], [torch.tensor([112, 113], dtype=torch.int64)]
+        )
+
+        match = self._match(tree, [1, 2, 3, 4])
+        self.assertTrue(torch.equal(match.device_indices, torch.tensor([10, 11])))
+        self.assertEqual(match.last_host_node_idx, leaf)
+        self.assertEqual(match.host_only_length, 2)
+
+        plan = tree.prepare_load_back(leaf)
+        self.assertEqual(plan.chain, [leaf])
+        self.assertTrue(torch.equal(plan.host_indices, torch.tensor([112, 113])))
+        tree.postprocess_load_back(
+            plan.chain,
+            plan.ancestor_node_idx,
+            torch.tensor([212, 213], dtype=torch.int64),
+        )
+        tree.finish_load_back(plan.chain, leaf)
+
+        loaded = self._match(tree, [1, 2, 3, 4])
+        self.assertTrue(torch.equal(loaded.device_indices, torch.tensor([10, 11, 212, 213])))
+
+    def test_rust_full_hicache_host_evict_skips_host_ancestor(self):
+        tree = self._wrapper()
+        base = self._insert(tree, [1, 2], [10, 11])
+        base_node = self._backup_from_actions(tree, base.deferred_actions)[0]
+        leaf_insert = self._insert(tree, [1, 2, 3, 4], [10, 11, 12, 13])
+        leaf_node = self._backup_from_actions(
+            tree, leaf_insert.deferred_actions, host_start=120
+        )[0]
+
+        self.assertNotEqual(base_node, leaf_node)
+        evict_host = tree.evict_host(2)
+        action = self._single_action(evict_host.deferred_actions, "FullHostEvict")
+        self.assertEqual(
+            action[1],
+            leaf_node,
+            "host eviction must skip an ancestor with a host-backed descendant",
+        )
+
+    def test_rust_full_hicache_load_back_failure_releases_host_lock(self):
+        tree = self._wrapper()
+        insert_result = self._insert(tree, [1, 2, 3, 4], [10, 11, 12, 13])
+        leaf = self._backup_from_actions(tree, insert_result.deferred_actions)[0]
+        tree.evict([4, 0, 0])
+
+        plan = tree.prepare_load_back(leaf)
+        tree.postprocess_load_back(plan.chain, plan.ancestor_node_idx, None)
+
+        evict_host = tree.evict_host(4)
+        action = self._single_action(evict_host.deferred_actions, "FullHostEvict")
+        self.assertEqual(action[1], leaf)
+
+
 class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
     cfg = CacheConfig(
         page_size=4,

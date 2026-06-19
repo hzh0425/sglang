@@ -146,6 +146,22 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
 
         self.assertIs(result, inner)
 
+    def test_registered_backend_runs_hicache_second_phase(self):
+        inner = MagicMock()
+        inner.supports_streaming_session.return_value = True
+        counter = object()
+        inner.cache_controller.layer_done_counter = counter
+        register_radix_cache_backend("custom_hicache", MagicMock(return_value=inner))
+        ctx = _make_ctx(backend="custom_hicache", enable_hierarchical_cache=True)
+
+        result = create_tree_cache(ctx)
+
+        self.assertIs(result, inner)
+        inner.init_hicache.assert_called_once_with(ctx.server_args, ctx.params)
+        ctx.tp_worker.register_hicache_layer_transfer_counter.assert_called_once_with(
+            counter
+        )
+
     def test_rust_unified_registration_does_not_load_native_extension(self):
         with patch(
             "sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"
@@ -168,24 +184,23 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
                 factory(_make_ctx(backend="rust_unified"))
             load_native_symbols.assert_called_once()
 
-    def test_rust_unified_factory_rejects_hierarchical_cache(self):
+    def test_rust_unified_factory_allows_hierarchical_cache_for_full_l2(self):
         factory = get_radix_cache_factory("rust_unified")
         self.assertIsNotNone(factory)
 
         with (
             patch("sglang.srt.mem_cache.rust_unified_radix_cache._load_native_symbols"),
             patch(
-                "sglang.srt.mem_cache.rust_unified_radix_cache.RadixCacheInfraPyError",
-                RuntimeError,
-            ),
-            self.assertRaisesRegex(RuntimeError, "hierarchical cache"),
+                "sglang.srt.mem_cache.rust_unified_radix_cache.RustUnifiedRadixCache"
+            ) as cache_cls,
         ):
-            factory(
-                _make_ctx(
-                    backend="rust_unified",
-                    enable_hierarchical_cache=True,
-                )
+            cache = MagicMock()
+            cache_cls.return_value = cache
+            result = factory(
+                _make_ctx(backend="rust_unified", enable_hierarchical_cache=True)
             )
+            cache_cls.assert_called_once()
+            self.assertIs(result, cache)
 
     def test_rust_unified_factory_rejects_hybrid_swa(self):
         factory = get_radix_cache_factory("rust_unified")

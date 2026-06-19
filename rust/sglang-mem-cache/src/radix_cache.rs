@@ -6,8 +6,8 @@ use crate::components::{Component, FullComponent, IncLockRefResult, MambaCompone
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
 use crate::tree_node_lru::{
-    evict_host_full, EvictRequest, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUSlot,
-    MambaLRUSlot, SwaLRUSlot,
+    EvictRequest, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUSlot, MambaLRUSlot, SwaLRUSlot,
+    evict_host_full,
 };
 use crate::tree_node_pool::{
     ChildKeyType, MatchChildResult, NodeIdx, PageSize, TreeNode, TreeNodePool,
@@ -1115,7 +1115,7 @@ impl<K: ChildKeyType> RadixCache<K> {
                 None => {
                     return Err(RadixCacheRuntimeError::PrepareLoadBackMissingHostValue {
                         node_idx: cur_node_idx,
-                    })
+                    });
                 }
             };
             chain.push(cur_node_idx);
@@ -1170,7 +1170,7 @@ impl<K: ChildKeyType> RadixCache<K> {
             let node = self.tree_node_pool.get(idx);
             let in_list_at_entry = SwaLRUSlot::data(node).in_list;
             let value_present_at_entry = SwaLRUSlot::has_value(node);
-            let key_len = node.key().len();
+            let value_len = value.size()[0] as usize;
             // SWA value existence should be in sync with whether the node
             // is in the SWA LRU list.
             assert_eq!(
@@ -1184,7 +1184,7 @@ impl<K: ChildKeyType> RadixCache<K> {
 
             SwaLRUSlot::bump_mru(&mut self.tree_node_pool, idx);
             if !in_list_at_entry {
-                evictable_size_credit += key_len;
+                evictable_size_credit += value_len;
             }
         }
         SwaLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += evictable_size_credit;
@@ -1223,7 +1223,7 @@ impl<K: ChildKeyType> RadixCache<K> {
                     }
                 }
             }
-            let value_len = HostFullLRUSlot::value_len(node);
+            let value_len = value.size()[0] as usize;
             // Update host value
             HostFullLRUSlot::set_value(&mut self.tree_node_pool, idx, value)?;
             // Update LRU
@@ -1246,21 +1246,58 @@ impl<K: ChildKeyType> RadixCache<K> {
             Some(device_values) => self.write_load_back_values(&chain, device_values),
             None => Ok(()),
         };
-        // Release prepare_load_back's locks (host chain + device anchor).
-        for &idx in &chain {
-            HostFullLRUSlot::dec_lock_ref(&mut self.tree_node_pool, idx);
+        // Release prepare_load_back's device anchor lock. On success, keep the
+        // host source chain locked until the H2D copy ack; on failure/skip no
+        // copy will reference the host source, so release it here.
+        if write_result.is_err() || device_values.is_none() {
+            self.release_host_chain_locks(&chain);
         }
         self.dec_lock_ref(ancestor_node_idx, None);
         // On success, hand the device lock to the loaded prefix so it survives
         // until the request is scheduled.
-        // TODO(Jialin): the orchestrator must dec_lock_ref this on every path —
-        // including a request abort/failure before scheduling — or the lock leaks.
+        // The orchestrator releases this together with the host source locks
+        // in `finish_load_back` after the load ack.
         if write_result.is_ok() && device_values.is_some() {
             if let Some(&deepest) = chain.last() {
                 self.inc_lock_ref(deepest);
             }
         }
         write_result
+    }
+
+    /// Release the locks that protect a completed load-back: the host source
+    /// chain locked by `prepare_load_back`, and the loaded device prefix lock
+    /// handed off by `postprocess_load_back`.
+    pub fn finish_load_back(&mut self, chain: Vec<NodeIdx>, loaded_node_idx: NodeIdx) {
+        self.release_host_chain_locks(&chain);
+        self.dec_lock_ref(loaded_node_idx, None);
+    }
+
+    fn release_host_chain_locks(&mut self, chain: &[NodeIdx]) {
+        for &idx in chain {
+            HostFullLRUSlot::dec_lock_ref(&mut self.tree_node_pool, idx);
+        }
+    }
+
+    /// Restore device FULL values after an orchestrator-side write-back failure.
+    pub fn restore_full_values(
+        &mut self,
+        node_indices: Vec<NodeIdx>,
+        device_values: Vec<tch::Tensor>,
+    ) -> Result<(), RadixCacheRuntimeError> {
+        if node_indices.len() != device_values.len() {
+            return Err(RadixCacheRuntimeError::SetHostFullValuesMismatch {
+                indices: node_indices.len(),
+                values: device_values.len(),
+            });
+        }
+        for (idx, value) in node_indices.into_iter().zip(device_values) {
+            let value_len = value.size()[0] as usize;
+            FullLRUSlot::set_value(&mut self.tree_node_pool, idx, value)?;
+            FullLRUSlot::bump_mru(&mut self.tree_node_pool, idx);
+            FullLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += value_len;
+        }
+        Ok(())
     }
 
     /// Write loaded values onto the chain.
@@ -1273,7 +1310,7 @@ impl<K: ChildKeyType> RadixCache<K> {
         // per-node narrow below stays in-bounds.
         let expected: usize = chain
             .iter()
-            .map(|&idx| FullLRUSlot::value_len(self.tree_node_pool.get(idx)))
+            .map(|&idx| HostFullLRUSlot::value_len(self.tree_node_pool.get(idx)))
             .sum();
         let got = device_values.size()[0] as usize;
         if got != expected {
@@ -1291,7 +1328,7 @@ impl<K: ChildKeyType> RadixCache<K> {
                 0,
                 "load-back: host-only chain node {idx} has non-zero lock_ref",
             );
-            let len = FullLRUSlot::value_len(self.tree_node_pool.get(idx));
+            let len = HostFullLRUSlot::value_len(self.tree_node_pool.get(idx));
             let device_value = device_values.narrow(0, offset, len as i64);
             offset += len as i64;
             // TODO(Jialin): fold set_value + bump_mru + unlocked_size credit into
