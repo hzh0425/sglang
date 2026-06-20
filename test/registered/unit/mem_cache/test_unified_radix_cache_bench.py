@@ -1,7 +1,7 @@
 """Large-scale benchmark + fuzz correctness tests for UnifiedRadixCache.
 
 Usage (standalone):
-    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa rust-full
+    bench: python3 test/registered/unit/mem_cache/test_unified_radix_cache_bench.py --num-seqs 5000 --verify --components mamba legacy-mamba swa legacy-swa rust-full rust-swa rust-mamba
     CI Test: python -m pytest test/registered/unit/mem_cache/test_unified_radix_cache_bench.py -v -s
 """
 
@@ -158,7 +158,10 @@ def create_bench_cache(
     if has_mamba:
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
-            mamba_size=max(max_num_reqs * 2, 200),
+            # Each synthetic request may hold a cached Mamba state plus
+            # request-side ping-pong tracking buffers. Keep the fuzz harness
+            # from exhausting request plumbing before tree eviction is tested.
+            mamba_size=max(max_num_reqs * 6, 200),
             mamba_spec_state_size=max_num_reqs,
             max_context_len=max_context_len,
             device=device,
@@ -236,6 +239,7 @@ def create_bench_cache(
             disable=False,
             tree_components=components if tree_cls is UnifiedRadixCache else None,
             sliding_window_size=sliding_window_size if has_swa else None,
+            enable_mamba_extra_buffer=(page_size > 1) if has_mamba else False,
         )
     )
 
@@ -840,6 +844,11 @@ del _cfg, _name
 _TREE_CONFIGS = {
     "full": ((ComponentType.FULL,), None),
     "rust-full": ((ComponentType.FULL,), RustUnifiedRadixCache),
+    "rust-swa": ((ComponentType.FULL, ComponentType.SWA), RustUnifiedRadixCache),
+    "rust-mamba": (
+        (ComponentType.FULL, ComponentType.MAMBA),
+        RustUnifiedRadixCache,
+    ),
     "mamba": ((ComponentType.FULL, ComponentType.MAMBA), None),
     "swa": ((ComponentType.FULL, ComponentType.SWA), None),
     "all": ((ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA), None),

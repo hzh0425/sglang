@@ -41,6 +41,18 @@ pub enum DeferredAction {
         host_value: Tensor,
     },
 
+    /// Evict a host SWA value.
+    SwaHostEvict {
+        node_idx: NodeIdx,
+        host_value: Tensor,
+    },
+
+    /// Evict a host Mamba value.
+    MambaHostEvict {
+        node_idx: NodeIdx,
+        host_value: Tensor,
+    },
+
     /// Write-back a device-only victim to host on evict
     FullWriteBackOnEvict { node_idx: NodeIdx, value: Tensor },
 }

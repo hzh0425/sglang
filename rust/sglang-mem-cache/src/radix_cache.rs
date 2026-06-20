@@ -2,12 +2,13 @@ use std::collections::HashMap;
 
 use tch::{Device, Kind, Tensor};
 
+use crate::component_type::ComponentType;
 use crate::components::{Component, FullComponent, IncLockRefResult, MambaComponent, SwaComponent};
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
 use crate::tree_node_lru::{
-    EvictRequest, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUSlot, MambaLRUSlot, SwaLRUSlot,
-    evict_host_full,
+    EvictRequest, EvictResult, FullLRUSlot, HostFullLRUSlot, HostMambaLRUSlot, HostSwaLRUSlot,
+    LRUSlot, MambaLRUSlot, SwaLRUSlot, evict_host_full, evict_host_non_full,
 };
 use crate::tree_node_pool::{
     ChildKeyType, MatchChildResult, NodeIdx, PageSize, TreeNode, TreeNodePool,
@@ -25,18 +26,25 @@ pub struct MatchResult {
     /// The scheduler may use this field to snapshot mid-prefill SSM
     /// state at the repair boundary.
     pub mamba_branching_seqlen: Option<usize>,
-    /// Cached Mamba state at `last_device_node_idx`. `None` indicates
+    /// Cached Mamba state at `best_match_node_idx`. `None` indicates
     /// cache miss, where prefill starts from scratch.
     pub mamba_value: Option<Tensor>,
 
     // --- HiCache ---
     /// Deepest host-backed node on the matched path (the load-back start).
     pub last_host_node_idx: NodeIdx,
+    /// Deepest node accepted by all configured components when host values are
+    /// allowed. This is the load-back target for Full/SWA/Mamba.
+    pub best_match_node_idx: NodeIdx,
     /// FULL KV length of the host-only suffix — host-backed, device-evicted nodes
     /// past `last_device_node_idx` (the tokens load-back restores H->D). When
     /// non-zero, `last_device_node_idx` is `host_only_length` above
     /// `last_host_node_idx`.
     pub host_only_length: usize,
+    /// SWA host-token length that needs host->device restoration.
+    pub swa_host_hit_length: usize,
+    /// Mamba host-state count that needs host->device restoration.
+    pub mamba_host_hit_length: usize,
 }
 
 /// Result of `prepare_load_back`: the host-only chain to restore H->D.
@@ -48,6 +56,14 @@ pub struct PrepareLoadBackResult {
     /// Device-present anchor the chain hangs under; device value is locked here
     /// so the whole path to root won't be evicted.
     pub ancestor_node_idx: NodeIdx,
+}
+
+/// Result of `prepare_aux_load_back`: aux host values to restore H->D.
+pub struct PrepareAuxLoadBackResult {
+    pub swa_chain: Vec<NodeIdx>,
+    pub swa_host_indices: Tensor,
+    pub mamba_chain: Vec<NodeIdx>,
+    pub mamba_host_indices: Tensor,
 }
 
 pub struct InsertResult {
@@ -90,6 +106,14 @@ impl<'a, A> PageAlignedQueryKey<'a, A> {
 
     fn as_slice(&self) -> &[A] {
         self.key
+    }
+}
+
+fn cat_or_empty(empty_tensor: &Tensor, values: Vec<Tensor>) -> Tensor {
+    if values.is_empty() {
+        empty_tensor.shallow_clone()
+    } else {
+        Tensor::cat(&values, 0)
     }
 }
 
@@ -179,6 +203,9 @@ pub struct RadixCache<K: ChildKeyType> {
     /// without re-deriving.
     has_swa_component: bool,
 
+    /// Sliding-window size when SWA is configured.
+    sliding_window_size: Option<usize>,
+
     /// Whether Mamba is configured. Parallel to `has_swa_component`.
     has_mamba_component: bool,
 
@@ -239,6 +266,7 @@ impl<K: ChildKeyType> RadixCache<K> {
             empty_tensor,
             components,
             has_swa_component,
+            sliding_window_size,
             has_mamba_component,
             mamba_cache_chunk_size,
             enable_hicache,
@@ -271,10 +299,65 @@ impl<K: ChildKeyType> RadixCache<K> {
             device_indices: self.empty_tensor.shallow_clone(),
             last_device_node_idx,
             last_host_node_idx: last_device_node_idx,
+            best_match_node_idx: last_device_node_idx,
             host_only_length: 0,
+            swa_host_hit_length: 0,
+            mamba_host_hit_length: 0,
             mamba_branching_seqlen: None,
             mamba_value: None,
         }
+    }
+
+    fn full_host_hit_length(&self, best_match: NodeIdx, last_device: NodeIdx) -> usize {
+        let mut total = 0usize;
+        let mut cur = best_match;
+        while cur != last_device {
+            let node = self.tree_node_pool.get(cur);
+            if node.is_root() {
+                break;
+            }
+            if let Some(host_value) = HostFullLRUSlot::value(node) {
+                total += host_value.size()[0] as usize;
+            }
+            let Some(parent) = node.parent() else { break };
+            cur = parent;
+        }
+        total
+    }
+
+    fn swa_host_hit_length(&self, best_match: NodeIdx) -> usize {
+        let Some(window) = self.sliding_window_size else {
+            return 0;
+        };
+        let mut total = 0usize;
+        let mut seen = 0usize;
+        let mut cur = best_match;
+        while seen < window {
+            let node = self.tree_node_pool.get(cur);
+            if node.is_root() {
+                break;
+            }
+            if SwaLRUSlot::has_value(node) {
+                seen += SwaLRUSlot::value_len(node);
+            } else if HostSwaLRUSlot::has_value(node) {
+                let len = HostSwaLRUSlot::value_len(node);
+                total += len;
+                seen += len;
+            } else {
+                break;
+            }
+            let Some(parent) = node.parent() else { break };
+            cur = parent;
+        }
+        total
+    }
+
+    fn mamba_host_hit_length(&self, best_match: NodeIdx) -> usize {
+        if !self.has_mamba_component {
+            return 0;
+        }
+        let node = self.tree_node_pool.get(best_match);
+        usize::from(!MambaLRUSlot::has_value(node) && HostMambaLRUSlot::has_value(node))
     }
 
     /// Resolve the namespace root for `extra_key`, lazily creating it on
@@ -347,23 +430,23 @@ impl<K: ChildKeyType> RadixCache<K> {
         let mut consumed = 0usize;
         let mut values: Vec<Tensor> = Vec::new();
 
-        // Stateful validators to check if a node is a valid node for prefix
-        // match. Mainly used by SWA: after walking through tombstone nodes, the
-        // matched length must be no less than the sliding window size.
-        let mut validators: Vec<Box<dyn crate::components::MatchValidator<K>>> = self
-            .components
-            .iter()
-            .filter_map(|c| c.create_match_validator())
-            .collect();
-
         // The match walk could be split into 2 parts: nodes with device values,
         // and nodes with host-only values.
         let mut last_matched_node_idx = root;
         let mut last_device_node_idx = root;
-        let mut last_host_node_idx = root;
         let mut last_device_value_len: usize = 0;
         let mut passed_host_only = false;
-        let mut host_only_length: usize = 0;
+
+        let mut validators: Vec<Box<dyn crate::components::MatchValidator<K>>> = self
+            .components
+            .iter()
+            .filter_map(|c| c.create_match_validator(!self.enable_hicache))
+            .collect();
+        let mut device_validators: Vec<Box<dyn crate::components::MatchValidator<K>>> = self
+            .components
+            .iter()
+            .filter_map(|c| c.create_match_validator(true))
+            .collect();
 
         while consumed < key_len {
             let remaining_key = &key[consumed..];
@@ -403,9 +486,8 @@ impl<K: ChildKeyType> RadixCache<K> {
                         });
                     }
                     match HostFullLRUSlot::value(self.tree_node_pool.get(matched_node_idx)) {
-                        Some(host_value) => {
+                        Some(_) => {
                             passed_host_only = true;
-                            host_only_length += host_value.size()[0] as usize;
                         }
                         // Dead node (device + host absent) — stop. TODO(Jialin):
                         // once husks are reclaimed and write-through keeps the host
@@ -419,21 +501,21 @@ impl<K: ChildKeyType> RadixCache<K> {
             node_idx = matched_node_idx;
 
             let matched_node = self.tree_node_pool.get(matched_node_idx);
-            let mut all_valid = true;
+            let mut host_valid = true;
+            let mut device_valid = !passed_host_only;
             // Due to statefulness, ensure all validators run without short circuit.
             for v in validators.iter_mut() {
-                all_valid &= v.validate(matched_node);
+                host_valid &= v.validate(matched_node);
             }
-            if all_valid {
+            for v in device_validators.iter_mut() {
+                device_valid &= v.validate(matched_node);
+            }
+            if host_valid {
                 last_matched_node_idx = matched_node_idx;
-                // Track the deepest backed-up node (the load-back start).
-                if HostFullLRUSlot::has_value(matched_node) {
-                    last_host_node_idx = matched_node_idx;
-                }
-                if !passed_host_only {
-                    last_device_value_len = values.len();
-                    last_device_node_idx = matched_node_idx;
-                }
+            }
+            if device_valid {
+                last_device_value_len = values.len();
+                last_device_node_idx = matched_node_idx;
             }
             if terminated {
                 break;
@@ -454,14 +536,18 @@ impl<K: ChildKeyType> RadixCache<K> {
         let (mamba_branching_seqlen, mamba_value) = match self.mamba_cache_chunk_size {
             Some(chunk_size) => {
                 // branching_seqlen is populated only on a partial match (walk
-                // extended past the validator-approved boundary).
-                let branching_seqlen = if last_device_value_len < values.len() {
-                    let total: usize = values.iter().map(|v| v.size()[0] as usize).sum();
-                    let aligned = total / chunk_size * chunk_size;
-                    (aligned > 0).then_some(aligned)
-                } else {
-                    None
-                };
+                // extended past the device-validator-approved boundary).
+                // Unified Mamba HiCache restores the missing host Mamba state
+                // before extend, so it intentionally skips the synthetic
+                // branch-state fill used by L1-only Mamba.
+                let branching_seqlen =
+                    if !self.enable_hicache && last_device_value_len < values.len() {
+                        let total: usize = values.iter().map(|v| v.size()[0] as usize).sum();
+                        let aligned = total / chunk_size * chunk_size;
+                        (aligned > 0).then_some(aligned)
+                    } else {
+                        None
+                    };
                 let mv = MambaLRUSlot::value(self.tree_node_pool.get(last_matched_node_idx))
                     .map(|t| t.shallow_clone());
                 (branching_seqlen, mv)
@@ -469,11 +555,24 @@ impl<K: ChildKeyType> RadixCache<K> {
             None => (None, None),
         };
 
+        let host_only_length =
+            self.full_host_hit_length(last_matched_node_idx, last_device_node_idx);
+        let swa_host_hit_length = self.swa_host_hit_length(last_matched_node_idx);
+        let mamba_host_hit_length = self.mamba_host_hit_length(last_matched_node_idx);
+        let last_host_node_idx = if self.enable_hicache {
+            last_matched_node_idx
+        } else {
+            last_device_node_idx
+        };
+
         Ok(MatchResult {
             device_indices,
             last_device_node_idx,
             last_host_node_idx,
+            best_match_node_idx: last_matched_node_idx,
             host_only_length,
+            swa_host_hit_length,
+            mamba_host_hit_length,
             mamba_branching_seqlen,
             mamba_value,
         })
@@ -616,6 +715,7 @@ impl<K: ChildKeyType> RadixCache<K> {
         deferred: &mut Vec<DeferredAction>,
     ) -> Result<usize, RadixCacheRuntimeError> {
         let mut consumed_from = node_key_len;
+        let full_had_value_at_entry = FullLRUSlot::has_value(self.tree_node_pool.get(child_idx));
         for comp in self.components.iter() {
             let comp_consumed = comp.consume_value(
                 &mut self.tree_node_pool,
@@ -626,6 +726,7 @@ impl<K: ChildKeyType> RadixCache<K> {
                 prev_prefix_len,
                 value_slice,
                 swa_evicted_seqlen,
+                full_had_value_at_entry,
                 deferred,
             )?;
             consumed_from = consumed_from.min(comp_consumed);
@@ -977,6 +1078,54 @@ impl<K: ChildKeyType> RadixCache<K> {
         MambaLRUSlot::locked_size(&self.tree_node_pool)
     }
 
+    fn recompute_device_slot_size<S: LRUSlot>(&self) -> (usize, usize) {
+        let mut unlocked = 0usize;
+        let mut locked = 0usize;
+        for idx in self.tree_node_pool.live_node_indices() {
+            let node = self.tree_node_pool.get(idx);
+            if !S::has_value(node) {
+                continue;
+            }
+            let len = S::value_len(node);
+            if S::lock_ref(node) == 0 {
+                unlocked += len;
+            } else {
+                locked += len;
+            }
+        }
+        (unlocked, locked)
+    }
+
+    fn check_device_slot_size<S: LRUSlot>(&self, name: &str, failures: &mut Vec<String>) {
+        let (actual_unlocked, actual_locked) = self.recompute_device_slot_size::<S>();
+        let counter_unlocked = S::unlocked_size(&self.tree_node_pool);
+        let counter_locked = S::locked_size(&self.tree_node_pool);
+        if actual_unlocked != counter_unlocked || actual_locked != counter_locked {
+            failures.push(format!(
+                "{name}: actual unlocked/locked={actual_unlocked}/{actual_locked}, \
+                 counters={counter_unlocked}/{counter_locked}"
+            ));
+        }
+    }
+
+    pub fn sanity_check(&self) -> Result<(), RadixCacheRuntimeError> {
+        let mut failures = Vec::new();
+        self.check_device_slot_size::<FullLRUSlot>("FullDevice", &mut failures);
+        if self.has_swa_component {
+            self.check_device_slot_size::<SwaLRUSlot>("SwaDevice", &mut failures);
+        }
+        if self.has_mamba_component {
+            self.check_device_slot_size::<MambaLRUSlot>("MambaDevice", &mut failures);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RadixCacheRuntimeError::SanityCheckFailed {
+                message: failures.join("; "),
+            })
+        }
+    }
+
     /// Pure-dispatcher acquire. Iterates `self.components` forward
     /// (FULL first, then SWA — order set by `build_components` at
     /// construction, matching OSS `unified_radix_cache.py`'s
@@ -1072,6 +1221,48 @@ impl<K: ChildKeyType> RadixCache<K> {
         delta
     }
 
+    fn inc_full_lock_ref(&mut self, node_idx: NodeIdx) -> i64 {
+        let mut delta: i64 = 0;
+        let mut current = node_idx;
+        while let Some(parent) = self.tree_node_pool.get(current).parent() {
+            delta += FullLRUSlot::inc_lock_ref(&mut self.tree_node_pool, current);
+            current = parent;
+        }
+        delta
+    }
+
+    fn dec_full_lock_ref(&mut self, node_idx: NodeIdx) -> i64 {
+        let mut delta: i64 = 0;
+        let mut current = node_idx;
+        while let Some(parent) = self.tree_node_pool.get(current).parent() {
+            delta += FullLRUSlot::dec_lock_ref(&mut self.tree_node_pool, current);
+            current = parent;
+        }
+        delta
+    }
+
+    /// Lock the node-local device values used as D2H backup sources.
+    pub fn inc_backup_lock_ref(&mut self, node_idx: NodeIdx) {
+        FullLRUSlot::inc_lock_ref(&mut self.tree_node_pool, node_idx);
+        if SwaLRUSlot::has_value(self.tree_node_pool.get(node_idx)) {
+            SwaLRUSlot::inc_lock_ref(&mut self.tree_node_pool, node_idx);
+        }
+        if MambaLRUSlot::has_value(self.tree_node_pool.get(node_idx)) {
+            MambaLRUSlot::inc_lock_ref(&mut self.tree_node_pool, node_idx);
+        }
+    }
+
+    /// Release `inc_backup_lock_ref`.
+    pub fn dec_backup_lock_ref(&mut self, node_idx: NodeIdx) {
+        if MambaLRUSlot::lock_ref(self.tree_node_pool.get(node_idx)) > 0 {
+            MambaLRUSlot::dec_lock_ref(&mut self.tree_node_pool, node_idx);
+        }
+        if SwaLRUSlot::lock_ref(self.tree_node_pool.get(node_idx)) > 0 {
+            SwaLRUSlot::dec_lock_ref(&mut self.tree_node_pool, node_idx);
+        }
+        FullLRUSlot::dec_lock_ref(&mut self.tree_node_pool, node_idx);
+    }
+
     /// Best-effort to evict at least `num_tokens` per component.
     pub fn evict(&mut self, request: EvictRequest) -> EvictResult {
         let mut result = EvictResult::default();
@@ -1088,6 +1279,36 @@ impl<K: ChildKeyType> RadixCache<K> {
         let mut result = EvictResult::default();
         evict_host_full(&mut self.tree_node_pool, num_tokens, &mut result);
         result
+    }
+
+    /// Best-effort to evict at least `num_tokens` host SWA values.
+    pub fn evict_host_swa(&mut self, num_tokens: usize) -> EvictResult {
+        let mut result = EvictResult::default();
+        evict_host_non_full::<K, HostSwaLRUSlot>(&mut self.tree_node_pool, num_tokens, &mut result);
+        result
+    }
+
+    /// Best-effort to evict at least `num_tokens` host Mamba values.
+    pub fn evict_host_mamba(&mut self, num_tokens: usize) -> EvictResult {
+        let mut result = EvictResult::default();
+        evict_host_non_full::<K, HostMambaLRUSlot>(
+            &mut self.tree_node_pool,
+            num_tokens,
+            &mut result,
+        );
+        result
+    }
+
+    pub fn get_full_device_value(&self, node_idx: NodeIdx) -> Option<Tensor> {
+        FullLRUSlot::value(self.tree_node_pool.get(node_idx)).map(|v| v.shallow_clone())
+    }
+
+    pub fn get_swa_device_value(&self, node_idx: NodeIdx) -> Option<Tensor> {
+        SwaLRUSlot::value(self.tree_node_pool.get(node_idx)).map(|v| v.shallow_clone())
+    }
+
+    pub fn get_mamba_device_value(&self, node_idx: NodeIdx) -> Option<Tensor> {
+        MambaLRUSlot::value(self.tree_node_pool.get(node_idx)).map(|v| v.shallow_clone())
     }
 
     /// Walk the host-only (device-evicted, host-backed) chain from `node_idx`
@@ -1130,9 +1351,7 @@ impl<K: ChildKeyType> RadixCache<K> {
         for &idx in &chain {
             HostFullLRUSlot::inc_lock_ref(&mut self.tree_node_pool, idx);
         }
-        if !chain.is_empty() {
-            self.inc_lock_ref(ancestor_node_idx);
-        }
+        self.inc_full_lock_ref(ancestor_node_idx);
 
         let host_indices = if host_values.is_empty() {
             self.empty_tensor.shallow_clone()
@@ -1144,6 +1363,111 @@ impl<K: ChildKeyType> RadixCache<K> {
             host_indices,
             ancestor_node_idx,
         })
+    }
+
+    /// Build aux host load-back transfers and lock their host source values.
+    pub fn prepare_aux_load_back(&mut self, node_idx: NodeIdx) -> PrepareAuxLoadBackResult {
+        let (swa_chain, swa_values) = self.prepare_swa_load_back(node_idx);
+        let (mamba_chain, mamba_values) = self.prepare_mamba_load_back(node_idx);
+        PrepareAuxLoadBackResult {
+            swa_chain,
+            swa_host_indices: cat_or_empty(&self.empty_tensor, swa_values),
+            mamba_chain,
+            mamba_host_indices: cat_or_empty(&self.empty_tensor, mamba_values),
+        }
+    }
+
+    /// Collect device FULL values on the path `(stop_node_idx, node_idx]`.
+    ///
+    /// This mirrors Python UnifiedRadixCache's load-back post-processor: an
+    /// auxiliary-only load-back (SWA/Mamba host state with all FULL KV already
+    /// on device) still advances the request's usable prefix. The returned
+    /// tensor is root-to-leaf ordered and excludes `stop_node_idx`, which is
+    /// the request's old `last_device_node`.
+    pub fn collect_full_device_values_between(
+        &self,
+        node_idx: NodeIdx,
+        stop_node_idx: NodeIdx,
+    ) -> Result<Tensor, RadixCacheRuntimeError> {
+        if node_idx == stop_node_idx {
+            return Ok(self.empty_tensor.shallow_clone());
+        }
+
+        let mut values: Vec<Tensor> = Vec::new();
+        let mut cur = node_idx;
+        loop {
+            if cur == stop_node_idx {
+                break;
+            }
+            let node = self.tree_node_pool.get(cur);
+            let value = FullLRUSlot::value(node).ok_or(
+                RadixCacheRuntimeError::CollectFullDeviceValuesMissingValue { node_idx: cur },
+            )?;
+            values.push(value.shallow_clone());
+            let Some(parent) = node.parent() else {
+                return Err(
+                    RadixCacheRuntimeError::CollectFullDeviceValuesStopNotAncestor {
+                        node_idx,
+                        stop_node_idx,
+                    },
+                );
+            };
+            cur = parent;
+        }
+
+        values.reverse();
+        Ok(cat_or_empty(&self.empty_tensor, values))
+    }
+
+    fn prepare_swa_load_back(&mut self, node_idx: NodeIdx) -> (Vec<NodeIdx>, Vec<Tensor>) {
+        let Some(window) = self.sliding_window_size else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut seen = 0usize;
+        let mut chain: Vec<NodeIdx> = Vec::new();
+        let mut host_values: Vec<Tensor> = Vec::new();
+        let mut cur = node_idx;
+        while seen < window {
+            let node = self.tree_node_pool.get(cur);
+            if node.is_root() {
+                break;
+            }
+            if SwaLRUSlot::has_value(node) {
+                seen += SwaLRUSlot::value_len(node);
+            } else if let Some(host_value) = HostSwaLRUSlot::value(node) {
+                seen += host_value.size()[0] as usize;
+                chain.push(cur);
+                host_values.push(host_value.shallow_clone());
+            } else {
+                break;
+            }
+            let Some(parent) = self.tree_node_pool.get(cur).parent() else {
+                break;
+            };
+            cur = parent;
+        }
+        chain.reverse();
+        host_values.reverse();
+        for &idx in &chain {
+            HostSwaLRUSlot::inc_lock_ref(&mut self.tree_node_pool, idx);
+        }
+        (chain, host_values)
+    }
+
+    fn prepare_mamba_load_back(&mut self, node_idx: NodeIdx) -> (Vec<NodeIdx>, Vec<Tensor>) {
+        if !self.has_mamba_component {
+            return (Vec::new(), Vec::new());
+        }
+        let node = self.tree_node_pool.get(node_idx);
+        if MambaLRUSlot::has_value(node) {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(host_value) = HostMambaLRUSlot::value(node) else {
+            return (Vec::new(), Vec::new());
+        };
+        let value = host_value.shallow_clone();
+        HostMambaLRUSlot::inc_lock_ref(&mut self.tree_node_pool, node_idx);
+        (vec![node_idx], vec![value])
     }
 
     /// Write per-node SWA values back into the tree.
@@ -1233,6 +1557,172 @@ impl<K: ChildKeyType> RadixCache<K> {
         Ok(())
     }
 
+    pub fn set_host_swa_values(
+        &mut self,
+        node_indices: Vec<NodeIdx>,
+        host_values: Vec<tch::Tensor>,
+    ) -> Result<Vec<tch::Tensor>, RadixCacheRuntimeError> {
+        self.set_host_aux_values::<HostSwaLRUSlot, SwaLRUSlot>(node_indices, host_values)
+    }
+
+    pub fn has_host_swa_value(&self, node_idx: NodeIdx) -> bool {
+        HostSwaLRUSlot::has_value(self.tree_node_pool.get(node_idx))
+    }
+
+    pub fn set_host_mamba_values(
+        &mut self,
+        node_indices: Vec<NodeIdx>,
+        host_values: Vec<tch::Tensor>,
+    ) -> Result<Vec<tch::Tensor>, RadixCacheRuntimeError> {
+        self.set_host_aux_values::<HostMambaLRUSlot, MambaLRUSlot>(node_indices, host_values)
+    }
+
+    pub fn has_host_mamba_value(&self, node_idx: NodeIdx) -> bool {
+        HostMambaLRUSlot::has_value(self.tree_node_pool.get(node_idx))
+    }
+
+    fn set_host_aux_values<HostSlot: LRUSlot, DeviceSlot: LRUSlot>(
+        &mut self,
+        node_indices: Vec<NodeIdx>,
+        host_values: Vec<tch::Tensor>,
+    ) -> Result<Vec<tch::Tensor>, RadixCacheRuntimeError> {
+        if node_indices.len() != host_values.len() {
+            return Err(RadixCacheRuntimeError::SetHostFullValuesMismatch {
+                indices: node_indices.len(),
+                values: host_values.len(),
+            });
+        }
+        let mut replaced_values = Vec::new();
+        for (idx, value) in node_indices.into_iter().zip(host_values) {
+            let device_has_value = DeviceSlot::has_value(self.tree_node_pool.get(idx));
+            let host_was_in_lru = HostSlot::data(self.tree_node_pool.get(idx)).in_list;
+            let host_lock_ref = HostSlot::lock_ref(self.tree_node_pool.get(idx));
+            let old_host_len = HostSlot::value_len(self.tree_node_pool.get(idx));
+
+            if HostSlot::has_value(self.tree_node_pool.get(idx)) {
+                if host_lock_ref > 0 {
+                    // This host value may be the source of an in-flight H2D
+                    // load-back. Keep it stable until the load ack releases
+                    // the host lock; the newly allocated backup is returned to
+                    // Python so the host pool can free it.
+                    replaced_values.push(value);
+                    continue;
+                }
+                if host_was_in_lru {
+                    HostSlot::remove(&mut self.tree_node_pool, idx);
+                    HostSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size -=
+                        old_host_len;
+                }
+                let old_value = HostSlot::node_state_mut(self.tree_node_pool.get_mut(idx))
+                    .value
+                    .take()
+                    .expect("host value checked above");
+                replaced_values.push(old_value);
+            }
+            let value_len = value.size()[0] as usize;
+            HostSlot::set_value(&mut self.tree_node_pool, idx, value)?;
+            if !device_has_value {
+                if host_lock_ref == 0 {
+                    HostSlot::bump_mru(&mut self.tree_node_pool, idx);
+                    HostSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += value_len;
+                } else {
+                    HostSlot::pool_state_mut(&mut self.tree_node_pool).locked_size += value_len;
+                }
+            }
+        }
+        Ok(replaced_values)
+    }
+
+    pub fn postprocess_aux_load_back(
+        &mut self,
+        swa_chain: Vec<NodeIdx>,
+        swa_device_values: Option<Tensor>,
+        mamba_chain: Vec<NodeIdx>,
+        mamba_device_values: Option<Tensor>,
+    ) -> Result<(), RadixCacheRuntimeError> {
+        if let Some(values) = swa_device_values {
+            self.write_aux_load_back_values::<HostSwaLRUSlot, SwaLRUSlot>(&swa_chain, &values)?;
+        }
+        if let Some(values) = mamba_device_values {
+            self.write_aux_load_back_values::<HostMambaLRUSlot, MambaLRUSlot>(
+                &mamba_chain,
+                &values,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn write_aux_load_back_values<HostSlot: LRUSlot, DeviceSlot: LRUSlot>(
+        &mut self,
+        chain: &[NodeIdx],
+        device_values: &Tensor,
+    ) -> Result<(), RadixCacheRuntimeError> {
+        let expected: usize = chain
+            .iter()
+            .map(|&idx| HostSlot::value_len(self.tree_node_pool.get(idx)))
+            .sum();
+        let got = device_values.size()[0] as usize;
+        if got != expected {
+            return Err(RadixCacheRuntimeError::PostprocessLoadBackLengthMismatch {
+                got,
+                expected,
+            });
+        }
+        let mut offset: i64 = 0;
+        for &idx in chain {
+            let len = HostSlot::value_len(self.tree_node_pool.get(idx));
+            let device_value = device_values.narrow(0, offset, len as i64);
+            offset += len as i64;
+            DeviceSlot::set_value(&mut self.tree_node_pool, idx, device_value)?;
+            DeviceSlot::bump_mru(&mut self.tree_node_pool, idx);
+            DeviceSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += len;
+            // Keep the freshly allocated H2D destination out of eviction
+            // until the transfer ack arrives. Non-FULL component locks are
+            // capped by the same-node FULL lock.
+            FullLRUSlot::inc_lock_ref(&mut self.tree_node_pool, idx);
+            DeviceSlot::inc_lock_ref(&mut self.tree_node_pool, idx);
+        }
+        Ok(())
+    }
+
+    fn release_aux_host_lock<HostSlot: LRUSlot, DeviceSlot: LRUSlot>(&mut self, idx: NodeIdx) {
+        if DeviceSlot::has_value(self.tree_node_pool.get(idx))
+            && DeviceSlot::lock_ref(self.tree_node_pool.get(idx)) > 0
+        {
+            DeviceSlot::dec_lock_ref(&mut self.tree_node_pool, idx);
+            FullLRUSlot::dec_lock_ref(&mut self.tree_node_pool, idx);
+        }
+
+        let lock_ref = HostSlot::lock_ref(self.tree_node_pool.get(idx));
+        if lock_ref == 0 {
+            return;
+        }
+        if !DeviceSlot::has_value(self.tree_node_pool.get(idx)) {
+            HostSlot::dec_lock_ref(&mut self.tree_node_pool, idx);
+            return;
+        }
+        if lock_ref > 1 {
+            HostSlot::set_lock_ref(self.tree_node_pool.get_mut(idx), lock_ref - 1);
+            return;
+        }
+
+        if HostSlot::data(self.tree_node_pool.get(idx)).in_list {
+            let len = HostSlot::value_len(self.tree_node_pool.get(idx));
+            HostSlot::remove(&mut self.tree_node_pool, idx);
+            HostSlot::pool_state_mut(&mut self.tree_node_pool).locked_size -= len;
+        }
+        HostSlot::set_lock_ref(self.tree_node_pool.get_mut(idx), 0);
+    }
+
+    pub fn release_aux_host_locks(&mut self, swa_chain: Vec<NodeIdx>, mamba_chain: Vec<NodeIdx>) {
+        for idx in swa_chain {
+            self.release_aux_host_lock::<HostSwaLRUSlot, SwaLRUSlot>(idx);
+        }
+        for idx in mamba_chain {
+            self.release_aux_host_lock::<HostMambaLRUSlot, MambaLRUSlot>(idx);
+        }
+    }
+
     /// Commit the loadback results back to the radix tree. A `None`
     /// `device_values` indicates loadback failure.
     pub fn postprocess_load_back(
@@ -1246,20 +1736,21 @@ impl<K: ChildKeyType> RadixCache<K> {
             Some(device_values) => self.write_load_back_values(&chain, device_values),
             None => Ok(()),
         };
-        // Release prepare_load_back's device anchor lock. On success, keep the
-        // host source chain locked until the H2D copy ack; on failure/skip no
-        // copy will reference the host source, so release it here.
+        // Release prepare_load_back's FULL device anchor lock. On success,
+        // keep the host source chain locked until the H2D copy ack; on
+        // failure/skip no copy will reference the host source, so release it
+        // here.
         if write_result.is_err() || device_values.is_none() {
             self.release_host_chain_locks(&chain);
         }
-        self.dec_lock_ref(ancestor_node_idx, None);
-        // On success, hand the device lock to the loaded prefix so it survives
-        // until the request is scheduled.
+        self.dec_full_lock_ref(ancestor_node_idx);
+        // On success, hand the FULL device lock to the loaded prefix so it
+        // survives until the request is scheduled.
         // The orchestrator releases this together with the host source locks
         // in `finish_load_back` after the load ack.
         if write_result.is_ok() && device_values.is_some() {
             if let Some(&deepest) = chain.last() {
-                self.inc_lock_ref(deepest);
+                self.inc_full_lock_ref(deepest);
             }
         }
         write_result
@@ -1270,7 +1761,7 @@ impl<K: ChildKeyType> RadixCache<K> {
     /// handed off by `postprocess_load_back`.
     pub fn finish_load_back(&mut self, chain: Vec<NodeIdx>, loaded_node_idx: NodeIdx) {
         self.release_host_chain_locks(&chain);
-        self.dec_lock_ref(loaded_node_idx, None);
+        self.dec_full_lock_ref(loaded_node_idx);
     }
 
     fn release_host_chain_locks(&mut self, chain: &[NodeIdx]) {
@@ -1298,6 +1789,56 @@ impl<K: ChildKeyType> RadixCache<K> {
             FullLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += value_len;
         }
         Ok(())
+    }
+
+    /// Remove aux device values after the Full value has been demoted to host.
+    /// `full_value_cookie` is the Full index tensor Python's SWA allocator uses
+    /// to release the translated SWA slots.
+    pub fn demote_aux_device_values(
+        &mut self,
+        node_idx: NodeIdx,
+        full_value_cookie: Tensor,
+    ) -> EvictResult {
+        let mut result = EvictResult::default();
+        if self.has_swa_component && SwaLRUSlot::has_value(self.tree_node_pool.get(node_idx)) {
+            let len = SwaLRUSlot::value_len(self.tree_node_pool.get(node_idx));
+            SwaLRUSlot::node_state_mut(self.tree_node_pool.get_mut(node_idx))
+                .value
+                .take();
+            if SwaLRUSlot::data(self.tree_node_pool.get(node_idx)).in_list {
+                SwaLRUSlot::remove(&mut self.tree_node_pool, node_idx);
+            }
+            SwaLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size -= len;
+            result.evicted[ComponentType::Swa as usize] += len;
+            result.freed[ComponentType::Swa as usize].push(full_value_cookie.shallow_clone());
+            self.promote_host_aux_lru_if_backed::<HostSwaLRUSlot>(node_idx);
+        }
+        if self.has_mamba_component && MambaLRUSlot::has_value(self.tree_node_pool.get(node_idx)) {
+            let len = MambaLRUSlot::value_len(self.tree_node_pool.get(node_idx));
+            if let Some(value) = MambaLRUSlot::node_state_mut(self.tree_node_pool.get_mut(node_idx))
+                .value
+                .take()
+            {
+                result.evicted[ComponentType::Mamba as usize] += len;
+                result.freed[ComponentType::Mamba as usize].push(value);
+            }
+            if MambaLRUSlot::data(self.tree_node_pool.get(node_idx)).in_list {
+                MambaLRUSlot::remove(&mut self.tree_node_pool, node_idx);
+            }
+            MambaLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size -= len;
+            self.promote_host_aux_lru_if_backed::<HostMambaLRUSlot>(node_idx);
+        }
+        result
+    }
+
+    fn promote_host_aux_lru_if_backed<HostSlot: LRUSlot>(&mut self, node_idx: NodeIdx) {
+        if HostSlot::has_value(self.tree_node_pool.get(node_idx))
+            && !HostSlot::data(self.tree_node_pool.get(node_idx)).in_list
+        {
+            let len = HostSlot::value_len(self.tree_node_pool.get(node_idx));
+            HostSlot::bump_mru(&mut self.tree_node_pool, node_idx);
+            HostSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += len;
+        }
     }
 
     /// Write loaded values onto the chain.
@@ -1338,6 +1879,563 @@ impl<K: ChildKeyType> RadixCache<K> {
             FullLRUSlot::pool_state_mut(&mut self.tree_node_pool).unlocked_size += len;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tensor(len: i64) -> Tensor {
+        Tensor::zeros([len], (Kind::Int64, Device::Cpu))
+    }
+
+    fn ones(len: i64) -> Tensor {
+        Tensor::ones([len], (Kind::Int64, Device::Cpu))
+    }
+
+    fn mamba_cache() -> RadixCache<Vec<i64>> {
+        RadixCache::new(Device::Cpu, 1, 16, None, Some(1), true, false).expect("valid mamba cache")
+    }
+
+    fn mamba_l1_cache() -> RadixCache<Vec<i64>> {
+        RadixCache::new(Device::Cpu, 1, 16, None, Some(1), false, false).expect("valid mamba cache")
+    }
+
+    fn swa_cache() -> RadixCache<Vec<i64>> {
+        RadixCache::new(Device::Cpu, 1, 16, Some(2), None, false, false).expect("valid swa cache")
+    }
+
+    fn apply_swa_stamps(cache: &mut RadixCache<Vec<i64>>, actions: Vec<DeferredAction>) {
+        let mut node_indices = Vec::new();
+        let mut values = Vec::new();
+        for action in actions {
+            if let DeferredAction::SwaStamp {
+                node_idx,
+                source_value,
+            } = action
+            {
+                node_indices.push(node_idx);
+                values.push(source_value);
+            }
+        }
+        cache
+            .apply_swa_writes(node_indices, values)
+            .expect("swa stamps apply");
+    }
+
+    fn apply_swa_stamps_and_recovers(
+        cache: &mut RadixCache<Vec<i64>>,
+        actions: Vec<DeferredAction>,
+    ) {
+        let mut node_indices = Vec::new();
+        let mut values = Vec::new();
+        for action in actions {
+            match action {
+                DeferredAction::SwaStamp {
+                    node_idx,
+                    source_value,
+                }
+                | DeferredAction::SwaRecover {
+                    node_idx,
+                    source_value,
+                    ..
+                } => {
+                    node_indices.push(node_idx);
+                    values.push(source_value);
+                }
+                _ => {}
+            }
+        }
+        cache
+            .apply_swa_writes(node_indices, values)
+            .expect("swa writes apply");
+    }
+
+    fn insert_mamba_leaf(cache: &mut RadixCache<Vec<i64>>) -> NodeIdx {
+        cache
+            .insert(&[1], &tensor(1), None, 0, 0, Some(tensor(1)))
+            .expect("insert succeeds");
+        cache
+            .match_prefix(&[1], None)
+            .expect("match succeeds")
+            .best_match_node_idx
+    }
+
+    #[test]
+    fn swa_dec_lock_ref_skips_zero_ref_ancestors() {
+        let mut cache = swa_cache();
+        let insert = cache
+            .insert(&[1, 2, 3], &tensor(3), None, 0, 0, None)
+            .expect("insert succeeds");
+        apply_swa_stamps(&mut cache, insert.deferred_actions);
+
+        let leaf = cache
+            .match_prefix(&[1, 2, 3], None)
+            .expect("match succeeds")
+            .best_match_node_idx;
+        let lock = cache.inc_lock_ref(leaf);
+        cache
+            .insert(&[1, 2, 4], &tensor(3), None, 0, 0, None)
+            .expect("split insert succeeds");
+        let child = cache
+            .match_prefix(&[1, 2, 3], None)
+            .expect("match child succeeds")
+            .best_match_node_idx;
+        cache.dec_lock_ref(child, lock.swa_uuid_for_lock);
+
+        let parent = cache
+            .tree_node_pool
+            .get(child)
+            .parent()
+            .expect("split child has parent");
+        let stale_parent_uuid = cache
+            .tree_node_pool
+            .get(parent)
+            .swa_uuid_for_lock()
+            .expect("split parent keeps stale uuid");
+        assert_eq!(SwaLRUSlot::lock_ref(cache.tree_node_pool.get(parent)), 0);
+
+        // Simulate a release path that carries an older boundary uuid through
+        // a zero-ref ancestor. Python Unified skips those nodes; Rust must do
+        // the same for split/sidecar paths where structural ancestors are on
+        // the route but outside the request's SWA lock window.
+        FullLRUSlot::inc_lock_ref(&mut cache.tree_node_pool, child);
+        SwaLRUSlot::inc_lock_ref(&mut cache.tree_node_pool, child);
+        let swa = SwaComponent::new(2).expect("valid swa component");
+        <SwaComponent as Component<Vec<i64>>>::dec_lock_ref(
+            &swa,
+            &mut cache.tree_node_pool,
+            child,
+            Some(stale_parent_uuid),
+        )
+        .expect("swa release returns delta");
+
+        assert_eq!(SwaLRUSlot::lock_ref(cache.tree_node_pool.get(child)), 0);
+        assert_eq!(SwaLRUSlot::lock_ref(cache.tree_node_pool.get(parent)), 0);
+    }
+
+    #[test]
+    fn swa_dsv4_branching_decode_paths_remain_matchable() {
+        let mut cache = RadixCache::new(Device::Cpu, 256, 16, Some(128), None, true, false)
+            .expect("valid DSV4-like SWA cache");
+        let mut first_turn_paths = Vec::new();
+        for group in 0..3 {
+            let base_start = group * 10_000;
+            let base: Vec<i64> = (base_start..base_start + 512).collect();
+            for branch in 0..3 {
+                let output_start = base_start + 1_000 + branch * 1_000;
+                let output: Vec<i64> = (output_start..output_start + 512).collect();
+                let mut path = base.clone();
+                path.extend(output);
+                let value = tensor(path.len() as i64);
+                let insert = cache
+                    .insert(&path, &value, None, 0, 512, None)
+                    .expect("insert first-turn branch succeeds");
+                apply_swa_stamps_and_recovers(&mut cache, insert.deferred_actions);
+                first_turn_paths.push(path);
+            }
+        }
+
+        for (idx, path) in first_turn_paths.iter().enumerate() {
+            let mut decode_path = path.clone();
+            decode_path.extend(
+                (50_000 + idx as i64 * 1_000..50_000 + idx as i64 * 1_000 + 512)
+                    .collect::<Vec<_>>(),
+            );
+            let result = cache
+                .match_prefix(&decode_path, None)
+                .expect("decode path match succeeds");
+            assert_eq!(
+                result.device_indices.size()[0],
+                1024,
+                "branch {idx} should reuse first-turn prompt+output"
+            );
+        }
+    }
+
+    #[test]
+    fn mamba_hicache_match_skips_branching_state_fill() {
+        let mut cache = mamba_cache();
+        let leaf = insert_mamba_leaf(&mut cache);
+        cache
+            .insert(&[1, 2], &tensor(2), None, 1, 0, Some(tensor(1)))
+            .expect("insert second leaf succeeds");
+        let child = cache
+            .match_prefix(&[1, 2], None)
+            .expect("match child succeeds")
+            .best_match_node_idx;
+        assert_ne!(leaf, child);
+
+        let evicted = cache.demote_aux_device_values(child, tensor(1));
+        assert_eq!(evicted.evicted[ComponentType::Mamba as usize], 1);
+
+        let result = cache
+            .match_prefix(&[1, 2, 3], None)
+            .expect("match succeeds");
+        assert_eq!(result.best_match_node_idx, leaf);
+        assert_eq!(result.last_device_node_idx, leaf);
+        assert_eq!(result.device_indices.size()[0], 1);
+        assert_eq!(result.mamba_branching_seqlen, None);
+    }
+
+    #[test]
+    fn mamba_l1_match_keeps_branching_state_fill() {
+        let mut cache = mamba_l1_cache();
+        let leaf = insert_mamba_leaf(&mut cache);
+        cache
+            .insert(&[1, 2], &tensor(2), None, 1, 0, Some(tensor(1)))
+            .expect("insert second leaf succeeds");
+        let child = cache
+            .match_prefix(&[1, 2], None)
+            .expect("match child succeeds")
+            .best_match_node_idx;
+        assert_ne!(leaf, child);
+
+        let evicted = cache.demote_aux_device_values(child, tensor(1));
+        assert_eq!(evicted.evicted[ComponentType::Mamba as usize], 1);
+
+        let result = cache
+            .match_prefix(&[1, 2, 3], None)
+            .expect("match succeeds");
+        assert_eq!(result.best_match_node_idx, leaf);
+        assert_eq!(result.last_device_node_idx, leaf);
+        assert_eq!(result.device_indices.size()[0], 1);
+        assert_eq!(result.mamba_branching_seqlen, Some(2));
+    }
+
+    #[test]
+    fn prepare_load_back_locks_full_anchor_without_swa_value() {
+        let mut cache = RadixCache::new(Device::Cpu, 1, 16, Some(1), None, true, false)
+            .expect("valid SWA HiCache");
+        let first = cache
+            .insert(&[1], &tensor(1), None, 0, 1, None)
+            .expect("insert parent succeeds");
+        apply_swa_stamps_and_recovers(&mut cache, first.deferred_actions);
+        let second = cache
+            .insert(&[1, 2], &tensor(2), None, 1, 1, None)
+            .expect("insert child succeeds");
+        apply_swa_stamps_and_recovers(&mut cache, second.deferred_actions);
+
+        let leaf = cache
+            .match_prefix(&[1, 2], None)
+            .expect("match child succeeds")
+            .best_match_node_idx;
+        let parent = cache
+            .tree_node_pool
+            .get(leaf)
+            .parent()
+            .expect("child has parent");
+        assert!(FullLRUSlot::has_value(cache.tree_node_pool.get(parent)));
+        assert!(!SwaLRUSlot::has_value(cache.tree_node_pool.get(parent)));
+        assert!(SwaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+
+        cache
+            .set_host_full_values(vec![parent, leaf], vec![tensor(1), tensor(1)])
+            .expect("host full backup succeeds");
+        let mut request = EvictRequest::default();
+        request.num_tokens[ComponentType::Full as usize] = 1;
+        cache.evict(request);
+        assert!(!FullLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert!(HostFullLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+
+        let plan = cache
+            .prepare_load_back(leaf)
+            .expect("prepare loadback should not require SWA on full anchor");
+        assert_eq!(plan.chain, vec![leaf]);
+        assert_eq!(plan.ancestor_node_idx, parent);
+        assert_eq!(FullLRUSlot::lock_ref(cache.tree_node_pool.get(parent)), 1);
+        assert_eq!(SwaLRUSlot::lock_ref(cache.tree_node_pool.get(parent)), 0);
+
+        cache
+            .postprocess_load_back(plan.chain, plan.ancestor_node_idx, None)
+            .expect("rollback releases locks");
+        assert_eq!(FullLRUSlot::lock_ref(cache.tree_node_pool.get(parent)), 0);
+        assert_eq!(HostFullLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)), 0);
+    }
+
+    #[test]
+    fn swa_recover_after_full_unevict_does_not_free_restored_full_value() {
+        let mut cache = RadixCache::new(Device::Cpu, 1, 16, Some(2), None, true, false)
+            .expect("valid SWA HiCache");
+        let inserted = cache
+            .insert(&[1, 2], &tensor(2), None, 0, 0, None)
+            .expect("insert succeeds");
+        apply_swa_stamps_and_recovers(&mut cache, inserted.deferred_actions);
+
+        let leaf = cache
+            .match_prefix(&[1, 2], None)
+            .expect("match succeeds")
+            .best_match_node_idx;
+        assert!(FullLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert!(SwaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+
+        cache
+            .set_host_swa_values(vec![leaf], vec![tensor(2)])
+            .expect("host SWA backup succeeds");
+        let mut evict_swa = EvictRequest::default();
+        evict_swa.num_tokens[ComponentType::Swa as usize] = 2;
+        cache.evict(evict_swa);
+        assert!(FullLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert!(!SwaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+
+        cache
+            .set_host_full_values(vec![leaf], vec![tensor(2)])
+            .expect("host backup succeeds");
+        let mut evict_full = EvictRequest::default();
+        evict_full.num_tokens[ComponentType::Full as usize] = 2;
+        cache.evict(evict_full);
+        assert!(!FullLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert!(HostFullLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+
+        let recovered = cache
+            .insert(&[1, 2], &ones(2), None, 0, 0, None)
+            .expect("unevict insert succeeds");
+        assert!(
+            recovered
+                .deferred_actions
+                .iter()
+                .any(|action| matches!(action, DeferredAction::SwaStamp { .. })),
+            "SWA should be rebuilt from the restored Full value"
+        );
+        assert!(
+            recovered
+                .deferred_actions
+                .iter()
+                .all(|action| !matches!(action, DeferredAction::SwaRecover { .. })),
+            "Full value restored by the same insert must not be freed as an old tombstone"
+        );
+    }
+
+    #[test]
+    fn aux_load_back_keeps_mamba_host_source_locked_until_ack() {
+        let mut cache = mamba_cache();
+        let leaf = insert_mamba_leaf(&mut cache);
+        cache
+            .set_host_mamba_values(vec![leaf], vec![tensor(1)])
+            .expect("host mamba backup succeeds");
+
+        cache.demote_aux_device_values(leaf, tensor(1));
+        assert_eq!(HostMambaLRUSlot::unlocked_size(&cache.tree_node_pool), 1);
+
+        let aux_plan = cache.prepare_aux_load_back(leaf);
+        assert_eq!(aux_plan.mamba_chain, vec![leaf]);
+        assert_eq!(
+            HostMambaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)),
+            1
+        );
+        assert_eq!(HostMambaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+        assert_eq!(HostMambaLRUSlot::locked_size(&cache.tree_node_pool), 1);
+
+        cache
+            .postprocess_aux_load_back(
+                Vec::new(),
+                None,
+                aux_plan.mamba_chain.clone(),
+                Some(tensor(1)),
+            )
+            .expect("aux postprocess succeeds");
+        assert!(MambaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert!(HostMambaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert_eq!(
+            HostMambaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)),
+            1
+        );
+
+        let evicted = cache.evict_host_mamba(1);
+        assert_eq!(evicted.evicted[ComponentType::Mamba as usize], 0);
+        assert!(HostMambaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+
+        cache.release_aux_host_locks(Vec::new(), aux_plan.mamba_chain);
+        assert_eq!(
+            HostMambaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)),
+            0
+        );
+        assert!(!HostMambaLRUSlot::data(cache.tree_node_pool.get(leaf)).in_list);
+        assert_eq!(HostMambaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+        assert_eq!(HostMambaLRUSlot::locked_size(&cache.tree_node_pool), 0);
+    }
+
+    #[test]
+    fn aux_load_back_accounts_swa_device_until_ack() {
+        let mut cache = RadixCache::new(Device::Cpu, 1, 16, Some(2), None, true, false)
+            .expect("valid SWA HiCache");
+        let insert = cache
+            .insert(&[1, 2], &tensor(2), None, 0, 0, None)
+            .expect("insert succeeds");
+        apply_swa_stamps_and_recovers(&mut cache, insert.deferred_actions);
+        let leaf = cache
+            .match_prefix(&[1, 2], None)
+            .expect("match succeeds")
+            .best_match_node_idx;
+        cache
+            .set_host_swa_values(vec![leaf], vec![tensor(2)])
+            .expect("host swa backup succeeds");
+        cache.demote_aux_device_values(leaf, tensor(2));
+        assert_eq!(SwaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&cache.tree_node_pool), 2);
+
+        let aux_plan = cache.prepare_aux_load_back(leaf);
+        assert_eq!(aux_plan.swa_chain, vec![leaf]);
+        assert_eq!(HostSwaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)), 1);
+        cache
+            .postprocess_aux_load_back(
+                aux_plan.swa_chain.clone(),
+                Some(tensor(2)),
+                Vec::new(),
+                None,
+            )
+            .expect("aux postprocess succeeds");
+
+        assert_eq!(FullLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)), 1);
+        assert_eq!(SwaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)), 1);
+        assert_eq!(SwaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+        assert_eq!(SwaLRUSlot::locked_size(&cache.tree_node_pool), 2);
+
+        cache.release_aux_host_locks(aux_plan.swa_chain, Vec::new());
+        assert_eq!(FullLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)), 0);
+        assert_eq!(SwaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)), 0);
+        assert_eq!(SwaLRUSlot::unlocked_size(&cache.tree_node_pool), 2);
+        assert_eq!(SwaLRUSlot::locked_size(&cache.tree_node_pool), 0);
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+        assert_eq!(HostSwaLRUSlot::locked_size(&cache.tree_node_pool), 0);
+    }
+
+    #[test]
+    fn host_swa_split_keeps_s2_backup_off_host_lru() {
+        let mut cache = RadixCache::new(Device::Cpu, 1, 16, Some(2), None, true, false)
+            .expect("valid SWA HiCache");
+        let insert = cache
+            .insert(&[1, 2, 3, 4], &tensor(4), None, 0, 0, None)
+            .expect("insert succeeds");
+        apply_swa_stamps_and_recovers(&mut cache, insert.deferred_actions);
+        let leaf = cache
+            .match_prefix(&[1, 2, 3, 4], None)
+            .expect("match succeeds")
+            .best_match_node_idx;
+        cache
+            .set_host_swa_values(vec![leaf], vec![tensor(4)])
+            .expect("host swa backup succeeds");
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+
+        let parent = {
+            let components = &cache.components;
+            let pool = &mut cache.tree_node_pool;
+            pool.split_node(
+                components,
+                crate::tree_node_pool::NodeSplit {
+                    child_idx: leaf,
+                    split_len: 2,
+                },
+            )
+        };
+
+        assert_eq!(FullLRUSlot::value_len(cache.tree_node_pool.get(parent)), 2);
+        assert_eq!(FullLRUSlot::value_len(cache.tree_node_pool.get(leaf)), 2);
+        assert_eq!(SwaLRUSlot::value_len(cache.tree_node_pool.get(parent)), 2);
+        assert_eq!(SwaLRUSlot::value_len(cache.tree_node_pool.get(leaf)), 2);
+        assert_eq!(
+            HostSwaLRUSlot::value_len(cache.tree_node_pool.get(parent)),
+            2
+        );
+        assert_eq!(HostSwaLRUSlot::value_len(cache.tree_node_pool.get(leaf)), 2);
+        assert!(!HostSwaLRUSlot::data(cache.tree_node_pool.get(parent)).in_list);
+        assert!(!HostSwaLRUSlot::data(cache.tree_node_pool.get(leaf)).in_list);
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&cache.tree_node_pool), 0);
+    }
+
+    #[test]
+    fn host_swa_split_redistributes_host_only_lru_order() {
+        let mut cache = RadixCache::new(Device::Cpu, 1, 16, Some(2), None, true, false)
+            .expect("valid SWA HiCache");
+        let insert = cache
+            .insert(&[1, 2, 3, 4], &tensor(4), None, 0, 0, None)
+            .expect("insert succeeds");
+        apply_swa_stamps_and_recovers(&mut cache, insert.deferred_actions);
+        let leaf = cache
+            .match_prefix(&[1, 2, 3, 4], None)
+            .expect("match succeeds")
+            .best_match_node_idx;
+        cache
+            .set_host_swa_values(vec![leaf], vec![tensor(4)])
+            .expect("host swa backup succeeds");
+        cache.demote_aux_device_values(leaf, tensor(4));
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&cache.tree_node_pool), 4);
+
+        let parent = {
+            let components = &cache.components;
+            let pool = &mut cache.tree_node_pool;
+            pool.split_node(
+                components,
+                crate::tree_node_pool::NodeSplit {
+                    child_idx: leaf,
+                    split_len: 2,
+                },
+            )
+        };
+
+        assert!(!SwaLRUSlot::has_value(cache.tree_node_pool.get(parent)));
+        assert!(!SwaLRUSlot::has_value(cache.tree_node_pool.get(leaf)));
+        assert_eq!(
+            HostSwaLRUSlot::value_len(cache.tree_node_pool.get(parent)),
+            2
+        );
+        assert_eq!(HostSwaLRUSlot::value_len(cache.tree_node_pool.get(leaf)), 2);
+        assert!(HostSwaLRUSlot::data(cache.tree_node_pool.get(parent)).in_list);
+        assert!(HostSwaLRUSlot::data(cache.tree_node_pool.get(leaf)).in_list);
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&cache.tree_node_pool), 4);
+        assert_eq!(HostSwaLRUSlot::locked_size(&cache.tree_node_pool), 0);
+    }
+
+    #[test]
+    fn set_host_mamba_values_does_not_replace_locked_source() {
+        let mut cache = mamba_cache();
+        let leaf = insert_mamba_leaf(&mut cache);
+        cache
+            .set_host_mamba_values(vec![leaf], vec![tensor(1)])
+            .expect("host mamba backup succeeds");
+        cache.demote_aux_device_values(leaf, tensor(1));
+
+        let aux_plan = cache.prepare_aux_load_back(leaf);
+        assert_eq!(
+            HostMambaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)),
+            1
+        );
+
+        let values_to_free = cache
+            .set_host_mamba_values(vec![leaf], vec![ones(1)])
+            .expect("locked replacement is skipped");
+        assert_eq!(values_to_free.len(), 1);
+        assert_eq!(values_to_free[0].int64_value(&[0]), 1);
+        assert_eq!(
+            HostMambaLRUSlot::value(cache.tree_node_pool.get(leaf))
+                .expect("old host value remains")
+                .int64_value(&[0]),
+            0
+        );
+
+        cache.release_aux_host_locks(Vec::new(), aux_plan.mamba_chain);
+    }
+
+    #[test]
+    fn release_aux_host_locks_without_device_value_restores_host_lru() {
+        let mut cache = mamba_cache();
+        let leaf = insert_mamba_leaf(&mut cache);
+        cache
+            .set_host_mamba_values(vec![leaf], vec![tensor(1)])
+            .expect("host mamba backup succeeds");
+        cache.demote_aux_device_values(leaf, tensor(1));
+
+        let aux_plan = cache.prepare_aux_load_back(leaf);
+        cache.release_aux_host_locks(Vec::new(), aux_plan.mamba_chain);
+
+        assert_eq!(
+            HostMambaLRUSlot::lock_ref(cache.tree_node_pool.get(leaf)),
+            0
+        );
+        assert!(HostMambaLRUSlot::data(cache.tree_node_pool.get(leaf)).in_list);
+        assert_eq!(HostMambaLRUSlot::unlocked_size(&cache.tree_node_pool), 1);
+        assert_eq!(HostMambaLRUSlot::locked_size(&cache.tree_node_pool), 0);
     }
 }
 

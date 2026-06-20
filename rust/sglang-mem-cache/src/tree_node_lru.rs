@@ -319,6 +319,37 @@ pub trait LRUSlot: Sized {
         state.tail_sentinel = tail;
     }
 
+    fn rebuild_list<K: ChildKeyType>(pool: &mut TreeNodePool<K>) {
+        let head = Self::head_sentinel(pool);
+        let tail = Self::tail_sentinel(pool);
+        let mut kept = Vec::new();
+        let live_nodes: Vec<NodeIdx> = pool.live_node_indices().collect();
+
+        for idx in live_nodes {
+            if idx == head || idx == tail {
+                continue;
+            }
+            let keep = {
+                let node = pool.get(idx);
+                Self::data(node).in_list && Self::has_value(node)
+            };
+            if keep {
+                kept.push(idx);
+            } else if Self::data(pool.get(idx)).in_list {
+                Self::data_mut(pool.get_mut(idx)).in_list = false;
+            }
+        }
+
+        Self::data_mut(pool.get_mut(head)).prev = head;
+        Self::data_mut(pool.get_mut(tail)).next = tail;
+        let mut prev = head;
+        for idx in kept {
+            Self::connect::<K>(pool, prev, idx);
+            prev = idx;
+        }
+        Self::connect::<K>(pool, prev, tail);
+    }
+
     /// Ensure `idx` sits at MRU. If `idx` is already in the list, removes
     /// it first; otherwise just splices it in. Single primitive for both
     /// "first-time insert" (e.g. new leaf from `insert_leaf`) and
@@ -330,6 +361,9 @@ pub trait LRUSlot: Sized {
         }
         // Splice between head_sentinel and the current first real node.
         let head = Self::head_sentinel(pool);
+        if !pool.contains_node(Self::data(pool.get(head)).next) {
+            Self::rebuild_list(pool);
+        }
         let first_real = Self::data(pool.get(head)).next;
         Self::connect::<K>(pool, head, idx);
         Self::connect::<K>(pool, idx, first_real);
@@ -344,11 +378,18 @@ pub trait LRUSlot: Sized {
         // One mut borrow: read prev/next, clear in_list. The mut borrow
         // drops after the last field write (NLL), so `connect` re-borrows
         // the pool cleanly below.
-        let data = Self::data_mut(pool.get_mut(idx));
-        let prev = data.prev;
-        let next = data.next;
-        data.in_list = false;
-        Self::connect::<K>(pool, prev, next);
+        let (prev, next) = {
+            let data = Self::data_mut(pool.get_mut(idx));
+            let prev = data.prev;
+            let next = data.next;
+            data.in_list = false;
+            (prev, next)
+        };
+        if pool.contains_node(prev) && pool.contains_node(next) {
+            Self::connect::<K>(pool, prev, next);
+        } else {
+            Self::rebuild_list(pool);
+        }
     }
 
     /// Re-splice both halves of a `split_node` operation into the LRU at
@@ -474,6 +515,9 @@ pub trait LRUSlot: Sized {
             // points at the correct first non-bumped node because we never
             // wrote `head.next` during the loop.
             let head = Self::head_sentinel(pool);
+            if !pool.contains_node(Self::data(pool.get(head)).next) {
+                Self::rebuild_list(pool);
+            }
             let original_first = Self::data(pool.get(head)).next;
             Self::connect::<K>(pool, head, first);
             Self::connect::<K>(pool, last, original_first);
@@ -655,11 +699,14 @@ impl LRUSlot for FullLRUSlot {
         if new != 1 {
             return 0;
         }
-        let key_len = node.key().len();
+        if !Self::has_value(node) {
+            return 0;
+        }
+        let value_len = Self::value_len(node);
         let state = Self::pool_state_mut(pool);
-        state.unlocked_size -= key_len;
-        state.locked_size += key_len;
-        -(key_len as i64)
+        state.unlocked_size -= value_len;
+        state.locked_size += value_len;
+        -(value_len as i64)
     }
 
     fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
@@ -690,11 +737,14 @@ impl LRUSlot for FullLRUSlot {
         if new != 0 {
             return 0;
         }
-        let key_len = node.key().len();
+        if !Self::has_value(node) {
+            return 0;
+        }
+        let value_len = Self::value_len(node);
         let state = Self::pool_state_mut(pool);
-        state.locked_size -= key_len;
-        state.unlocked_size += key_len;
-        key_len as i64
+        state.locked_size -= value_len;
+        state.unlocked_size += value_len;
+        value_len as i64
     }
 }
 
@@ -709,7 +759,9 @@ impl LRUSlot for HostFullLRUSlot {
     /// holds a host FULL value. This preserves a contiguous root-to-leaf host
     /// chain for every host-only descendant.
     fn is_evictable<K: ChildKeyType>(n: &TreeNode<K>) -> bool {
-        Self::lock_ref(n) == 0 && n.num_children_with_host_full == 0
+        n.host_components.iter().all(|c| c.lock_ref == 0)
+            && n.num_children_with_host_full == 0
+            && (FullLRUSlot::has_value(n) || n.is_leaf())
     }
 
     /// Credit the parent's `num_children_with_host_full`.
@@ -753,6 +805,85 @@ impl LRUSlot for HostFullLRUSlot {
         // Skip the device-FULL cap: host_full_lock_ref can exceed
         // device_full_lock_ref when a preempted request's value is evicted
         // from device but kept (pinned) on the host backup.
+        Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ false)
+    }
+
+    fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::dec_lock_ref_non_full(pool, node_idx)
+    }
+}
+
+/// LRU slot for CPU/L2 SWA values.
+pub struct HostSwaLRUSlot;
+
+impl LRUSlot for HostSwaLRUSlot {
+    const COMPONENT: ComponentType = ComponentType::Swa;
+    const NAME: &'static str = "HostSwa";
+
+    fn node_components<K: ChildKeyType>(
+        node: &TreeNode<K>,
+    ) -> &[ComponentNodeState; NUM_COMPONENT_TYPES] {
+        &node.host_components
+    }
+    fn node_components_mut<K: ChildKeyType>(
+        node: &mut TreeNode<K>,
+    ) -> &mut [ComponentNodeState; NUM_COMPONENT_TYPES] {
+        &mut node.host_components
+    }
+    fn pool_components<K: ChildKeyType>(
+        pool: &TreeNodePool<K>,
+    ) -> &[ComponentPoolState; NUM_COMPONENT_TYPES] {
+        &pool.host_components
+    }
+    fn pool_components_mut<K: ChildKeyType>(
+        pool: &mut TreeNodePool<K>,
+    ) -> &mut [ComponentPoolState; NUM_COMPONENT_TYPES] {
+        &mut pool.host_components
+    }
+
+    fn inc_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ false)
+    }
+
+    fn dec_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
+        Self::dec_lock_ref_non_full(pool, node_idx)
+    }
+}
+
+/// LRU slot for CPU/L2 Mamba values.
+pub struct HostMambaLRUSlot;
+
+impl LRUSlot for HostMambaLRUSlot {
+    const COMPONENT: ComponentType = ComponentType::Mamba;
+    const NAME: &'static str = "HostMamba";
+
+    /// 1 SSM state per tree node.
+    fn value_len<K: ChildKeyType>(_node: &TreeNode<K>) -> usize {
+        1
+    }
+
+    fn node_components<K: ChildKeyType>(
+        node: &TreeNode<K>,
+    ) -> &[ComponentNodeState; NUM_COMPONENT_TYPES] {
+        &node.host_components
+    }
+    fn node_components_mut<K: ChildKeyType>(
+        node: &mut TreeNode<K>,
+    ) -> &mut [ComponentNodeState; NUM_COMPONENT_TYPES] {
+        &mut node.host_components
+    }
+    fn pool_components<K: ChildKeyType>(
+        pool: &TreeNodePool<K>,
+    ) -> &[ComponentPoolState; NUM_COMPONENT_TYPES] {
+        &pool.host_components
+    }
+    fn pool_components_mut<K: ChildKeyType>(
+        pool: &mut TreeNodePool<K>,
+    ) -> &mut [ComponentPoolState; NUM_COMPONENT_TYPES] {
+        &mut pool.host_components
+    }
+
+    fn inc_lock_ref<K: ChildKeyType>(pool: &mut TreeNodePool<K>, node_idx: NodeIdx) -> i64 {
         Self::inc_lock_ref_non_full(pool, node_idx, /* enforce_full_cap */ false)
     }
 
@@ -988,12 +1119,37 @@ pub(crate) fn evict_non_full<K: ChildKeyType, S: LRUSlot>(
         );
         let delta = S::value_len(node);
         let is_leaf = node.is_leaf();
+        let has_host_backup = match component {
+            ComponentType::Swa => HostSwaLRUSlot::has_value(node),
+            ComponentType::Mamba => HostMambaLRUSlot::has_value(node),
+            ComponentType::Full => false,
+        };
 
         S::take_value(pool.get_mut(idx), result);
         S::remove(pool, idx);
         S::pool_state_mut(pool).unlocked_size -= delta;
 
-        if is_leaf {
+        if has_host_backup {
+            match component {
+                ComponentType::Swa => {
+                    if !HostSwaLRUSlot::data(pool.get(idx)).in_list {
+                        HostSwaLRUSlot::bump_mru(pool, idx);
+                        HostSwaLRUSlot::pool_state_mut(pool).unlocked_size +=
+                            HostSwaLRUSlot::value_len(pool.get(idx));
+                    }
+                }
+                ComponentType::Mamba => {
+                    if !HostMambaLRUSlot::data(pool.get(idx)).in_list {
+                        HostMambaLRUSlot::bump_mru(pool, idx);
+                        HostMambaLRUSlot::pool_state_mut(pool).unlocked_size +=
+                            HostMambaLRUSlot::value_len(pool.get(idx));
+                    }
+                }
+                ComponentType::Full => {}
+            }
+        }
+
+        if is_leaf && !has_host_backup {
             iteratively_delete_tombstone_leaf::<K, S>(pool, idx, result);
         }
         victim = next_after;
@@ -1018,6 +1174,8 @@ pub(crate) fn evict_host_full<K: ChildKeyType>(
         let next_after = HostFullLRUSlot::next_evictable_after(pool, idx);
 
         let value_len = HostFullLRUSlot::value_len(pool.get(idx));
+        let delete_empty_after_host_evict =
+            !FullLRUSlot::has_value(pool.get(idx)) && pool.get(idx).is_leaf();
         #[allow(clippy::expect_used, reason = "host eviction never selects the root")]
         let parent_idx = pool
             .get(idx)
@@ -1036,9 +1194,111 @@ pub(crate) fn evict_host_full<K: ChildKeyType>(
             node_idx: idx,
             host_value,
         });
+        evict_attached_host_aux::<K, HostMambaLRUSlot>(pool, idx, result);
+        evict_attached_host_aux::<K, HostSwaLRUSlot>(pool, idx, result);
         HostFullLRUSlot::postprocess_take_value(pool, parent_idx);
         HostFullLRUSlot::remove(pool, idx);
         HostFullLRUSlot::pool_state_mut(pool).unlocked_size -= value_len;
+
+        if delete_empty_after_host_evict {
+            #[allow(
+                clippy::expect_used,
+                reason = "just-validated empty host leaf can be deleted"
+            )]
+            pool.delete_empty_leaf(idx)
+                .expect("just-validated empty host leaf");
+        }
+
+        victim = if HostFullLRUSlot::is_evictable(pool.get(parent_idx)) {
+            HostFullLRUSlot::next_evictable(pool)
+        } else {
+            next_after
+        };
+    }
+}
+
+fn evict_attached_host_aux<K: ChildKeyType, S: LRUSlot>(
+    pool: &mut TreeNodePool<K>,
+    idx: NodeIdx,
+    result: &mut EvictResult,
+) {
+    if !S::has_value(pool.get(idx)) {
+        return;
+    }
+
+    let value_len = S::value_len(pool.get(idx));
+    let was_in_list = S::data(pool.get(idx)).in_list;
+    if was_in_list {
+        S::remove(pool, idx);
+        S::pool_state_mut(pool).unlocked_size -= value_len;
+    } else if S::lock_ref(pool.get(idx)) > 0 {
+        S::pool_state_mut(pool).locked_size -= value_len;
+    }
+
+    #[allow(clippy::expect_used, reason = "host aux value checked before taking")]
+    let host_value = S::node_state_mut(pool.get_mut(idx))
+        .value
+        .take()
+        .expect("host aux value checked before taking");
+    result.evicted[S::COMPONENT as usize] += value_len;
+    match S::COMPONENT {
+        ComponentType::Swa => result.deferred_actions.push(DeferredAction::SwaHostEvict {
+            node_idx: idx,
+            host_value,
+        }),
+        ComponentType::Mamba => result
+            .deferred_actions
+            .push(DeferredAction::MambaHostEvict {
+                node_idx: idx,
+                host_value,
+            }),
+        ComponentType::Full => unreachable!("Full host values are evicted by evict_host_full"),
+    }
+}
+
+/// Best-effort eviction of host non-FULL values in LRU order.
+pub(crate) fn evict_host_non_full<K: ChildKeyType, S: LRUSlot>(
+    pool: &mut TreeNodePool<K>,
+    num_tokens: usize,
+    result: &mut EvictResult,
+) {
+    if num_tokens == 0 {
+        return;
+    }
+    let component = S::COMPONENT;
+    let ct = component as usize;
+    let target = result.evicted[ct] + num_tokens;
+    let mut victim = S::next_evictable(pool);
+
+    while result.evicted[ct] < target {
+        let Some(idx) = victim else { break };
+        let next_after = S::next_evictable_after(pool, idx);
+
+        let value_len = S::value_len(pool.get(idx));
+        #[allow(
+            clippy::expect_used,
+            reason = "host non-FULL LRU victim always has a host value"
+        )]
+        let host_value = S::node_state_mut(pool.get_mut(idx))
+            .value
+            .take()
+            .expect("host non-FULL LRU victim has a host value");
+        result.evicted[ct] += value_len;
+        match component {
+            ComponentType::Swa => result.deferred_actions.push(DeferredAction::SwaHostEvict {
+                node_idx: idx,
+                host_value,
+            }),
+            ComponentType::Mamba => result
+                .deferred_actions
+                .push(DeferredAction::MambaHostEvict {
+                    node_idx: idx,
+                    host_value,
+                }),
+            ComponentType::Full => unreachable!("use evict_host_full for FULL host values"),
+        }
+        S::remove(pool, idx);
+        S::pool_state_mut(pool).unlocked_size -= value_len;
 
         victim = next_after;
     }
@@ -1220,6 +1480,47 @@ mod tests {
     }
 
     #[test]
+    fn full_lock_ref_counts_tensor_len_not_key_len() {
+        let page_size = PageSize::new(64).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let leaf_idx = insert_full_leaf_with_lens(&mut pool, root, 0, 128, 64);
+
+        assert_eq!(FullLRUSlot::unlocked_size(&pool), 64);
+        assert_eq!(FullLRUSlot::locked_size(&pool), 0);
+
+        assert_eq!(FullLRUSlot::inc_lock_ref(&mut pool, leaf_idx), -64);
+        assert_eq!(FullLRUSlot::unlocked_size(&pool), 0);
+        assert_eq!(FullLRUSlot::locked_size(&pool), 64);
+
+        assert_eq!(FullLRUSlot::dec_lock_ref(&mut pool, leaf_idx), 64);
+        assert_eq!(FullLRUSlot::unlocked_size(&pool), 64);
+        assert_eq!(FullLRUSlot::locked_size(&pool), 0);
+    }
+
+    #[test]
+    fn full_lock_ref_on_structural_node_without_value_keeps_size_counters() {
+        let page_size = PageSize::new(64).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let leaf_idx = insert_full_leaf(&mut pool, root, 0);
+        let structural_idx = attach_structural_child_without_full(&mut pool, leaf_idx, 64);
+
+        assert_eq!(FullLRUSlot::unlocked_size(&pool), 64);
+        assert_eq!(FullLRUSlot::locked_size(&pool), 0);
+
+        assert_eq!(FullLRUSlot::inc_lock_ref(&mut pool, structural_idx), 0);
+        assert_eq!(FullLRUSlot::lock_ref(pool.get(structural_idx)), 1);
+        assert_eq!(FullLRUSlot::unlocked_size(&pool), 64);
+        assert_eq!(FullLRUSlot::locked_size(&pool), 0);
+
+        assert_eq!(FullLRUSlot::dec_lock_ref(&mut pool, structural_idx), 0);
+        assert_eq!(FullLRUSlot::lock_ref(pool.get(structural_idx)), 0);
+        assert_eq!(FullLRUSlot::unlocked_size(&pool), 64);
+        assert_eq!(FullLRUSlot::locked_size(&pool), 0);
+    }
+
+    #[test]
     fn host_evict_counts_tensor_len_not_key_len() {
         let page_size = PageSize::new(64).expect("valid page size");
         let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, false, false);
@@ -1239,6 +1540,128 @@ mod tests {
         assert_eq!(result.evicted[ComponentType::Full as usize], 64);
         assert!(!HostFullLRUSlot::has_value(pool.get(leaf_idx)));
         assert_eq!(HostFullLRUSlot::unlocked_size(&pool), 0);
+    }
+
+    #[test]
+    fn host_evict_restarts_after_child_exposes_parent() {
+        let page_size = PageSize::new(64).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let parent_idx = insert_full_leaf(&mut pool, root, 0);
+        let child_idx = insert_full_leaf(&mut pool, parent_idx, 64);
+        for idx in [parent_idx, child_idx] {
+            HostFullLRUSlot::set_value(&mut pool, idx, tensor(64)).expect("host backup can be set");
+            HostFullLRUSlot::bump_mru(&mut pool, idx);
+            HostFullLRUSlot::pool_state_mut(&mut pool).unlocked_size += 64;
+        }
+
+        let mut result = EvictResult::default();
+        evict_host_full(&mut pool, 128, &mut result);
+
+        assert_eq!(result.evicted[ComponentType::Full as usize], 128);
+        assert_eq!(
+            result
+                .deferred_actions
+                .iter()
+                .filter(|action| matches!(action, DeferredAction::FullHostEvict { .. }))
+                .count(),
+            2
+        );
+        assert!(!HostFullLRUSlot::has_value(pool.get(child_idx)));
+        assert!(!HostFullLRUSlot::has_value(pool.get(parent_idx)));
+        assert!(FullLRUSlot::has_value(pool.get(child_idx)));
+        assert!(FullLRUSlot::has_value(pool.get(parent_idx)));
+        assert_eq!(HostFullLRUSlot::unlocked_size(&pool), 0);
+    }
+
+    #[test]
+    fn host_evict_deletes_host_only_chain() {
+        let page_size = PageSize::new(64).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let parent_idx = insert_full_leaf(&mut pool, root, 0);
+        let child_idx = insert_full_leaf(&mut pool, parent_idx, 64);
+        for idx in [parent_idx, child_idx] {
+            HostFullLRUSlot::set_value(&mut pool, idx, tensor(64)).expect("host backup can be set");
+            HostFullLRUSlot::bump_mru(&mut pool, idx);
+            HostFullLRUSlot::pool_state_mut(&mut pool).unlocked_size += 64;
+        }
+
+        let mut device_result = EvictResult::default();
+        evict_full(&mut pool, 128, true, false, &mut device_result);
+        assert_eq!(device_result.evicted[ComponentType::Full as usize], 128);
+
+        let mut host_result = EvictResult::default();
+        evict_host_full(&mut pool, 128, &mut host_result);
+
+        assert_eq!(host_result.evicted[ComponentType::Full as usize], 128);
+        assert_eq!(
+            host_result
+                .deferred_actions
+                .iter()
+                .filter(|action| matches!(action, DeferredAction::FullHostEvict { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(pool.get(root).num_children(), 0);
+        assert_eq!(HostFullLRUSlot::unlocked_size(&pool), 0);
+    }
+
+    #[test]
+    fn host_full_evict_detaches_aux_host_backups() {
+        let page_size = PageSize::new(64).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, true, true);
+        let root = pool.alloc(TreeNode::new_root());
+        let leaf_idx = insert_full_leaf(&mut pool, root, 0);
+        HostFullLRUSlot::set_value(&mut pool, leaf_idx, tensor(64))
+            .expect("host backup can be set");
+        HostFullLRUSlot::bump_mru(&mut pool, leaf_idx);
+        HostFullLRUSlot::pool_state_mut(&mut pool).unlocked_size += 64;
+        HostSwaLRUSlot::set_value(&mut pool, leaf_idx, tensor(64))
+            .expect("host SWA backup can be set");
+        HostSwaLRUSlot::bump_mru(&mut pool, leaf_idx);
+        HostSwaLRUSlot::pool_state_mut(&mut pool).unlocked_size += 64;
+        HostMambaLRUSlot::set_value(&mut pool, leaf_idx, tensor(1))
+            .expect("host Mamba backup can be set");
+        HostMambaLRUSlot::bump_mru(&mut pool, leaf_idx);
+        HostMambaLRUSlot::pool_state_mut(&mut pool).unlocked_size += 1;
+
+        let mut result = EvictResult::default();
+        evict_host_full(&mut pool, 64, &mut result);
+
+        assert_eq!(result.evicted[ComponentType::Full as usize], 64);
+        assert_eq!(result.evicted[ComponentType::Swa as usize], 64);
+        assert_eq!(result.evicted[ComponentType::Mamba as usize], 1);
+        assert!(!HostFullLRUSlot::has_value(pool.get(leaf_idx)));
+        assert!(!HostSwaLRUSlot::has_value(pool.get(leaf_idx)));
+        assert!(!HostMambaLRUSlot::has_value(pool.get(leaf_idx)));
+        assert_eq!(HostFullLRUSlot::unlocked_size(&pool), 0);
+        assert_eq!(HostSwaLRUSlot::unlocked_size(&pool), 0);
+        assert_eq!(HostMambaLRUSlot::unlocked_size(&pool), 0);
+    }
+
+    #[test]
+    fn host_full_evict_skips_aux_host_lock() {
+        let page_size = PageSize::new(64).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 16, true, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let leaf_idx = insert_full_leaf(&mut pool, root, 0);
+        HostFullLRUSlot::set_value(&mut pool, leaf_idx, tensor(64))
+            .expect("host backup can be set");
+        HostFullLRUSlot::bump_mru(&mut pool, leaf_idx);
+        HostFullLRUSlot::pool_state_mut(&mut pool).unlocked_size += 64;
+        HostSwaLRUSlot::set_value(&mut pool, leaf_idx, tensor(64))
+            .expect("host SWA backup can be set");
+        HostSwaLRUSlot::bump_mru(&mut pool, leaf_idx);
+        HostSwaLRUSlot::pool_state_mut(&mut pool).unlocked_size += 64;
+        HostSwaLRUSlot::inc_lock_ref(&mut pool, leaf_idx);
+
+        let mut result = EvictResult::default();
+        evict_host_full(&mut pool, 64, &mut result);
+
+        assert_eq!(result.evicted[ComponentType::Full as usize], 0);
+        assert!(HostFullLRUSlot::has_value(pool.get(leaf_idx)));
+        assert!(HostSwaLRUSlot::has_value(pool.get(leaf_idx)));
     }
 }
 

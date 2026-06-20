@@ -9,7 +9,8 @@ use crate::py_interop::PyTensor;
 use crate::component_type::NUM_COMPONENT_TYPES;
 use crate::deferred_action::DeferredAction;
 use crate::radix_cache::{
-    BigramRadixCache, InsertResult, MatchResult, PageRadixCache, PrepareLoadBackResult,
+    BigramRadixCache, InsertResult, MatchResult, PageRadixCache, PrepareAuxLoadBackResult,
+    PrepareLoadBackResult,
 };
 use crate::tree_node_lru::{EvictRequest, EvictResult};
 use crate::utils::parse_device;
@@ -78,6 +79,14 @@ fn deferred_action_to_py(py: Python<'_>, action: DeferredAction) -> PyObject {
             node_idx,
             host_value,
         } => ("FullHostEvict", node_idx, PyTensor(host_value).into_py(py)).into_py(py),
+        DeferredAction::SwaHostEvict {
+            node_idx,
+            host_value,
+        } => ("SwaHostEvict", node_idx, PyTensor(host_value).into_py(py)).into_py(py),
+        DeferredAction::MambaHostEvict {
+            node_idx,
+            host_value,
+        } => ("MambaHostEvict", node_idx, PyTensor(host_value).into_py(py)).into_py(py),
         DeferredAction::FullWriteBackOnEvict { node_idx, value } => (
             "FullWriteBackOnEvict",
             node_idx,
@@ -211,7 +220,10 @@ pub struct RustMatchResult {
     device_indices: PyTensor,
     last_device_node_idx: usize,
     last_host_node_idx: usize,
+    best_match_node_idx: usize,
     host_only_length: usize,
+    swa_host_hit_length: usize,
+    mamba_host_hit_length: usize,
     mamba_branching_seqlen: Option<usize>,
     mamba_value: Option<PyTensor>,
 }
@@ -222,7 +234,10 @@ impl RustMatchResult {
             device_indices: PyTensor(r.device_indices),
             last_device_node_idx: r.last_device_node_idx,
             last_host_node_idx: r.last_host_node_idx,
+            best_match_node_idx: r.best_match_node_idx,
             host_only_length: r.host_only_length,
+            swa_host_hit_length: r.swa_host_hit_length,
+            mamba_host_hit_length: r.mamba_host_hit_length,
             mamba_branching_seqlen: r.mamba_branching_seqlen,
             mamba_value: r.mamba_value.map(PyTensor),
         }
@@ -247,8 +262,23 @@ impl RustMatchResult {
     }
 
     #[getter]
+    fn best_match_node_idx(&self) -> usize {
+        self.best_match_node_idx
+    }
+
+    #[getter]
     fn host_only_length(&self) -> usize {
         self.host_only_length
+    }
+
+    #[getter]
+    fn swa_host_hit_length(&self) -> usize {
+        self.swa_host_hit_length
+    }
+
+    #[getter]
+    fn mamba_host_hit_length(&self) -> usize {
+        self.mamba_host_hit_length
     }
 
     #[getter]
@@ -296,6 +326,48 @@ impl RustPrepareLoadBackResult {
     #[getter]
     fn ancestor_node_idx(&self) -> usize {
         self.ancestor_node_idx
+    }
+}
+
+#[pyclass]
+pub struct RustPrepareAuxLoadBackResult {
+    swa_chain: Vec<usize>,
+    swa_host_indices: PyTensor,
+    mamba_chain: Vec<usize>,
+    mamba_host_indices: PyTensor,
+}
+
+impl RustPrepareAuxLoadBackResult {
+    fn from_prepare_aux_load_back_result(r: PrepareAuxLoadBackResult) -> Self {
+        Self {
+            swa_chain: r.swa_chain,
+            swa_host_indices: PyTensor(r.swa_host_indices),
+            mamba_chain: r.mamba_chain,
+            mamba_host_indices: PyTensor(r.mamba_host_indices),
+        }
+    }
+}
+
+#[pymethods]
+impl RustPrepareAuxLoadBackResult {
+    #[getter]
+    fn swa_chain(&self) -> Vec<usize> {
+        self.swa_chain.clone()
+    }
+
+    #[getter]
+    fn swa_host_indices(&self) -> PyTensor {
+        PyTensor(self.swa_host_indices.0.shallow_clone())
+    }
+
+    #[getter]
+    fn mamba_chain(&self) -> Vec<usize> {
+        self.mamba_chain.clone()
+    }
+
+    #[getter]
+    fn mamba_host_indices(&self) -> PyTensor {
+        PyTensor(self.mamba_host_indices.0.shallow_clone())
     }
 }
 
@@ -410,6 +482,10 @@ impl RustPageRadixCacheWrapper {
         self.inner.mamba_total_size()
     }
 
+    fn sanity_check(&self) -> PyResult<()> {
+        Ok(self.inner.sanity_check()?)
+    }
+
     /// Run prefix match of `key` on the tree.
     #[pyo3(signature = (key, extra_key = None))]
     fn match_prefix(
@@ -429,6 +505,24 @@ impl RustPageRadixCacheWrapper {
         Ok(RustPrepareLoadBackResult::from_prepare_load_back_result(
             self.inner.prepare_load_back(node_idx)?,
         ))
+    }
+
+    fn prepare_aux_load_back(&mut self, node_idx: usize) -> RustPrepareAuxLoadBackResult {
+        RustPrepareAuxLoadBackResult::from_prepare_aux_load_back_result(
+            self.inner.prepare_aux_load_back(node_idx),
+        )
+    }
+
+    fn get_full_device_value(&self, node_idx: usize) -> Option<PyTensor> {
+        self.inner.get_full_device_value(node_idx).map(PyTensor)
+    }
+
+    fn get_swa_device_value(&self, node_idx: usize) -> Option<PyTensor> {
+        self.inner.get_swa_device_value(node_idx).map(PyTensor)
+    }
+
+    fn get_mamba_device_value(&self, node_idx: usize) -> Option<PyTensor> {
+        self.inner.get_mamba_device_value(node_idx).map(PyTensor)
     }
 
     /// Returns `prefix_len` — number of tokens already cached before this insert.
@@ -508,6 +602,15 @@ impl RustPageRadixCacheWrapper {
         let r = self.inner.inc_lock_ref(node_idx);
         (r.delta, r.swa_uuid_for_lock)
     }
+
+    fn inc_backup_lock_ref(&mut self, node_idx: usize) {
+        self.inner.inc_backup_lock_ref(node_idx);
+    }
+
+    fn dec_backup_lock_ref(&mut self, node_idx: usize) {
+        self.inner.dec_backup_lock_ref(node_idx);
+    }
+
     /// Decrement lock_ref on `node_idx` per each configured
     /// component's policy. Pair exactly with `inc_lock_ref` —
     /// underflow panics on the per-slot mutator. Returns the
@@ -555,6 +658,16 @@ impl RustPageRadixCacheWrapper {
         RustEvictResult::from_evict_result(py, r)
     }
 
+    fn evict_host_swa(&mut self, py: Python<'_>, num_tokens: usize) -> RustEvictResult {
+        let r = self.inner.evict_host_swa(num_tokens);
+        RustEvictResult::from_evict_result(py, r)
+    }
+
+    fn evict_host_mamba(&mut self, py: Python<'_>, num_tokens: usize) -> RustEvictResult {
+        let r = self.inner.evict_host_mamba(num_tokens);
+        RustEvictResult::from_evict_result(py, r)
+    }
+
     /// Write per-node SWA values back into the tree.
     fn apply_swa_writes(
         &mut self,
@@ -573,6 +686,42 @@ impl RustPageRadixCacheWrapper {
     ) -> PyResult<()> {
         let values: Vec<tch::Tensor> = host_values.into_iter().map(|v| v.0).collect();
         Ok(self.inner.set_host_full_values(node_indices, values)?)
+    }
+
+    fn set_host_swa_values(
+        &mut self,
+        node_indices: Vec<usize>,
+        host_values: Vec<PyTensor>,
+    ) -> PyResult<Vec<PyTensor>> {
+        let values: Vec<tch::Tensor> = host_values.into_iter().map(|v| v.0).collect();
+        Ok(self
+            .inner
+            .set_host_swa_values(node_indices, values)?
+            .into_iter()
+            .map(PyTensor)
+            .collect())
+    }
+
+    fn has_host_swa_value(&self, node_idx: usize) -> bool {
+        self.inner.has_host_swa_value(node_idx)
+    }
+
+    fn set_host_mamba_values(
+        &mut self,
+        node_indices: Vec<usize>,
+        host_values: Vec<PyTensor>,
+    ) -> PyResult<Vec<PyTensor>> {
+        let values: Vec<tch::Tensor> = host_values.into_iter().map(|v| v.0).collect();
+        Ok(self
+            .inner
+            .set_host_mamba_values(node_indices, values)?
+            .into_iter()
+            .map(PyTensor)
+            .collect())
+    }
+
+    fn has_host_mamba_value(&self, node_idx: usize) -> bool {
+        self.inner.has_host_mamba_value(node_idx)
     }
 
     /// Restore device FULL values after an orchestrator-side write-back failure.
@@ -596,7 +745,7 @@ impl RustPageRadixCacheWrapper {
         self.inner
             .set_host_full_values(node_indices.clone(), values)?;
         for idx in node_indices {
-            let _ = self.inner.inc_lock_ref(idx);
+            self.inner.inc_backup_lock_ref(idx);
         }
         Ok(())
     }
@@ -615,6 +764,49 @@ impl RustPageRadixCacheWrapper {
             ancestor_node_idx,
             device_values.map(|v| v.0),
         )?)
+    }
+
+    #[pyo3(signature = (swa_chain, mamba_chain, swa_device_values=None, mamba_device_values=None))]
+    fn postprocess_aux_load_back(
+        &mut self,
+        swa_chain: Vec<usize>,
+        mamba_chain: Vec<usize>,
+        swa_device_values: Option<PyTensor>,
+        mamba_device_values: Option<PyTensor>,
+    ) -> PyResult<()> {
+        Ok(self.inner.postprocess_aux_load_back(
+            swa_chain,
+            swa_device_values.map(|v| v.0),
+            mamba_chain,
+            mamba_device_values.map(|v| v.0),
+        )?)
+    }
+
+    fn release_aux_host_locks(&mut self, swa_chain: Vec<usize>, mamba_chain: Vec<usize>) {
+        self.inner.release_aux_host_locks(swa_chain, mamba_chain);
+    }
+
+    fn collect_full_device_values_between(
+        &self,
+        node_idx: usize,
+        stop_node_idx: usize,
+    ) -> PyResult<PyTensor> {
+        Ok(PyTensor(self.inner.collect_full_device_values_between(
+            node_idx,
+            stop_node_idx,
+        )?))
+    }
+
+    fn demote_aux_device_values(
+        &mut self,
+        py: Python<'_>,
+        node_idx: usize,
+        full_value_cookie: PyTensor,
+    ) -> RustEvictResult {
+        let r = self
+            .inner
+            .demote_aux_device_values(node_idx, full_value_cookie.0);
+        RustEvictResult::from_evict_result(py, r)
     }
 
     /// Release host source locks and the loaded device handoff lock after H2D ack.
@@ -769,6 +961,10 @@ impl RustBigramRadixCacheWrapper {
         self.inner.mamba_total_size()
     }
 
+    fn sanity_check(&self) -> PyResult<()> {
+        Ok(self.inner.sanity_check()?)
+    }
+
     /// Run prefix match of `key` on the bigram-keyed tree.
     /// `last_device_node_idx` is in atom (= bigram-pair) units.
     #[pyo3(signature = (key, extra_key = None))]
@@ -912,6 +1108,17 @@ impl RustBigramRadixCacheWrapper {
             ancestor_node_idx,
             device_values.map(|v| v.0),
         )?)
+    }
+
+    fn collect_full_device_values_between(
+        &self,
+        node_idx: usize,
+        stop_node_idx: usize,
+    ) -> PyResult<PyTensor> {
+        Ok(PyTensor(self.inner.collect_full_device_values_between(
+            node_idx,
+            stop_node_idx,
+        )?))
     }
 
     /// Release host source locks and the loaded device handoff lock after H2D ack.

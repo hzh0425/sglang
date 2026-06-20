@@ -59,8 +59,9 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "extra_buffer",
                 "--mamba-track-interval",
                 str(MAMBA_TRACK_INTERVAL),
+                "--radix-cache-backend",
+                "rust_unified",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -118,8 +119,9 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--max-running-requests",
                 "4",
                 "--weight-loader-prefetch-checkpoints",
+                "--radix-cache-backend",
+                "rust_unified",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

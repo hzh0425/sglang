@@ -85,10 +85,11 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
                 "20000",
                 "--max-running-requests",
                 str(cls.max_running_requests),
+                "--radix-cache-backend",
+                "rust_unified",
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)

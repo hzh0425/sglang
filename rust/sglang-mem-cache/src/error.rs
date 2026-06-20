@@ -144,12 +144,23 @@ pub enum RadixCacheRuntimeError {
         "postprocess_load_back: device_values length ({got}) != chain token count ({expected})"
     )]
     PostprocessLoadBackLengthMismatch { got: usize, expected: usize },
+    #[error("collect_full_device_values_between: node {node_idx} missing FULL device value")]
+    CollectFullDeviceValuesMissingValue { node_idx: usize },
+    #[error(
+        "collect_full_device_values_between: stop node {stop_node_idx} is not an ancestor of node {node_idx}"
+    )]
+    CollectFullDeviceValuesStopNotAncestor {
+        node_idx: usize,
+        stop_node_idx: usize,
+    },
     #[error("node {node_idx} already has a {slot} value")]
     DuplicateValueSet { node_idx: usize, slot: &'static str },
     #[error("cannot set a {slot} value on the root node")]
     ValueSetOnRoot { slot: &'static str },
     #[error("un-evict: device-absent node {node_idx} has a non-zero lock_ref")]
     UnevictLockedNode { node_idx: usize },
+    #[error("sanity_check failed: {message}")]
+    SanityCheckFailed { message: String },
 }
 
 /// Error type for child key construction at insert/match time — i.e. the input

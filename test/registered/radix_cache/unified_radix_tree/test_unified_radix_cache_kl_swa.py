@@ -42,8 +42,9 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
                 "--mem-fraction-static",
                 "0.7",
                 "--disable-piecewise-cuda-graph",
+                "--radix-cache-backend",
+                "rust_unified",
             ],
-            env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 

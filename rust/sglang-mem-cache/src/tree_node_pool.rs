@@ -7,8 +7,8 @@ use tch::Tensor;
 use crate::component_type::{ComponentType, NUM_COMPONENT_TYPES};
 use crate::error::{ChildKeyError, RadixCacheInitError};
 use crate::tree_node_lru::{
-    ComponentPoolState, EvictResult, FullLRUSlot, HostFullLRUSlot, LRUData, LRUSlot, MambaLRUSlot,
-    SwaLRUSlot, evict_full_value,
+    ComponentPoolState, EvictResult, FullLRUSlot, HostFullLRUSlot, HostMambaLRUSlot,
+    HostSwaLRUSlot, LRUData, LRUSlot, MambaLRUSlot, SwaLRUSlot, evict_full_value,
 };
 
 // TODO(Jialin): [Optimization][Major] TreeNode.children could be replaced by a more compact representation
@@ -562,6 +562,8 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         // Initialize LRU slots.
         FullLRUSlot::init::<K>(&mut pool);
         HostFullLRUSlot::init::<K>(&mut pool);
+        HostSwaLRUSlot::init::<K>(&mut pool);
+        HostMambaLRUSlot::init::<K>(&mut pool);
         SwaLRUSlot::init::<K>(&mut pool);
         MambaLRUSlot::init::<K>(&mut pool);
         pool
@@ -696,16 +698,22 @@ impl<K: ChildKeyType> TreeNodePool<K> {
     /// Combined "find child + match key" — returns a `MatchChildResult` that
     /// callers can `match` exhaustively. Replaces the manual
     /// `parent.get_child` + `child.match_key` + `child.key().len()` dance.
-    /// `&self` (read-only) so callers can re-acquire the pool mutably for
-    /// `split_node` in the `PartialMatch` arm.
     #[inline]
-    pub fn match_child(&self, parent_idx: NodeIdx, query_key: &[K::Atom]) -> MatchChildResult {
+    pub fn match_child(&mut self, parent_idx: NodeIdx, query_key: &[K::Atom]) -> MatchChildResult {
         let Ok(child_key) = K::make_child_key(query_key, self.page_size) else {
             return MatchChildResult::NotFound;
         };
         let Some(child_idx) = self.get(parent_idx).get_child(child_key) else {
             return MatchChildResult::NotFound;
         };
+        if self.nodes.get(child_idx).is_none_or(Option::is_none) {
+            self.get_mut(parent_idx).remove_child(child_key);
+            return MatchChildResult::NotFound;
+        }
+        if self.get(child_idx).parent() != Some(parent_idx) {
+            self.get_mut(parent_idx).remove_child(child_key);
+            return MatchChildResult::NotFound;
+        }
         let child = self.get(child_idx);
         let prefix_len = child.match_key(query_key, self.page_size);
         if prefix_len < child.key().len() {
@@ -936,6 +944,77 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         Ok(())
     }
 
+    /// Delete a leaf whose component values have already been removed from all
+    /// device and host tiers. This is used by host eviction after S3 -> S0:
+    /// the host values are returned to Python as deferred actions first, then
+    /// the now-empty structural leaf is detached without touching any LRU slot.
+    pub fn delete_empty_leaf(&mut self, idx: NodeIdx) -> Result<(), ChildKeyError> {
+        let parent_idx = {
+            let node = self.get(idx);
+            #[allow(
+                clippy::panic,
+                reason = "callers must not pass root to delete_empty_leaf"
+            )]
+            let parent_idx = node.parent().unwrap_or_else(|| {
+                panic!("delete_empty_leaf: cannot delete root node (idx {idx})")
+            });
+            assert!(
+                node.is_leaf(),
+                "delete_empty_leaf: node at idx {idx} has {} children, expected 0",
+                node.num_children(),
+            );
+            assert!(
+                !node.is_locked(),
+                "delete_empty_leaf: node at idx {idx} has device locks {:?}",
+                node.components
+                    .iter()
+                    .map(|c| c.lock_ref)
+                    .collect::<Vec<_>>(),
+            );
+            assert!(
+                node.host_components.iter().all(|c| c.lock_ref == 0),
+                "delete_empty_leaf: node at idx {idx} has host locks {:?}",
+                node.host_components
+                    .iter()
+                    .map(|c| c.lock_ref)
+                    .collect::<Vec<_>>(),
+            );
+            assert!(
+                node.components.iter().all(|c| c.value.is_none()),
+                "delete_empty_leaf: node at idx {idx} still has a device value",
+            );
+            assert!(
+                node.host_components.iter().all(|c| c.value.is_none()),
+                "delete_empty_leaf: node at idx {idx} still has a host value",
+            );
+            parent_idx
+        };
+
+        self.unlink_from_all_lru_lists(idx);
+
+        #[allow(clippy::expect_used, reason = "validated as Some above")]
+        let node = self.nodes[idx].take().expect("validated above");
+        let child_key = node.child_key(self.page_size)?;
+        self.get_mut(parent_idx).remove_child(child_key);
+        self.evicted_indices.push(idx);
+        Ok(())
+    }
+
+    fn unlink_from_lru_list<S: LRUSlot>(&mut self, idx: NodeIdx) {
+        if S::data(self.get(idx)).in_list {
+            S::remove(self, idx);
+        }
+    }
+
+    fn unlink_from_all_lru_lists(&mut self, idx: NodeIdx) {
+        self.unlink_from_lru_list::<FullLRUSlot>(idx);
+        self.unlink_from_lru_list::<HostFullLRUSlot>(idx);
+        self.unlink_from_lru_list::<SwaLRUSlot>(idx);
+        self.unlink_from_lru_list::<HostSwaLRUSlot>(idx);
+        self.unlink_from_lru_list::<MambaLRUSlot>(idx);
+        self.unlink_from_lru_list::<HostMambaLRUSlot>(idx);
+    }
+
     /// Get a reference to a node.
     ///
     /// Panics if trying to access an evicted node.
@@ -956,6 +1035,17 @@ impl<K: ChildKeyType> TreeNodePool<K> {
         self.nodes[idx]
             .as_mut()
             .unwrap_or_else(|| panic!("accessing evicted node at idx {idx} (pool size {len})"))
+    }
+
+    pub(crate) fn contains_node(&self, idx: NodeIdx) -> bool {
+        self.nodes.get(idx).is_some_and(Option::is_some)
+    }
+
+    pub(crate) fn live_node_indices(&self) -> impl Iterator<Item = NodeIdx> + '_ {
+        self.nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, node)| node.as_ref().map(|_| idx))
     }
 
     /// The validated page size for this pool.
@@ -982,6 +1072,114 @@ impl<K: ChildKeyType> TreeNodePool<K> {
     /// did before sentinels existed.
     pub fn active_node_count(&self) -> usize {
         self.nodes.len() - self.evicted_indices.len() - self.sentinel_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn match_child_prunes_stale_child_edge() {
+        let page_size = PageSize::new(1).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 8, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let child = pool
+            .insert_leaf(root, TreeNode::new_child(vec![1], root, None))
+            .expect("insert child");
+
+        pool.nodes[child] = None;
+        pool.evicted_indices.push(child);
+
+        assert!(matches!(
+            pool.match_child(root, &[1]),
+            MatchChildResult::NotFound
+        ));
+        let child_key =
+            <Vec<i64> as ChildKeyType>::make_child_key(&[1], page_size).expect("child key");
+        assert!(pool.get(root).get_child(child_key).is_none());
+    }
+
+    #[test]
+    fn match_child_prunes_parent_mismatch_edge() {
+        let page_size = PageSize::new(1).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 8, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let child = pool
+            .insert_leaf(root, TreeNode::new_child(vec![1], root, None))
+            .expect("insert child");
+        let stale_parent = pool
+            .insert_leaf(root, TreeNode::new_child(vec![2], root, None))
+            .expect("insert sibling");
+
+        pool.get_mut(child).parent = Some(stale_parent);
+        pool.nodes[stale_parent] = None;
+        pool.evicted_indices.push(stale_parent);
+
+        assert!(matches!(
+            pool.match_child(root, &[1]),
+            MatchChildResult::NotFound
+        ));
+        let child_key =
+            <Vec<i64> as ChildKeyType>::make_child_key(&[1], page_size).expect("child key");
+        assert!(pool.get(root).get_child(child_key).is_none());
+        assert!(pool.nodes[child].is_some());
+    }
+
+    #[test]
+    fn delete_empty_leaf_unlinks_stale_lru_entry() {
+        let page_size = PageSize::new(1).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 8, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let older = pool
+            .insert_leaf(root, TreeNode::new_child(vec![1], root, None))
+            .expect("insert older child");
+        let newer = pool
+            .insert_leaf(root, TreeNode::new_child(vec![2], root, None))
+            .expect("insert newer child");
+
+        FullLRUSlot::bump_mru(&mut pool, older);
+        FullLRUSlot::bump_mru(&mut pool, newer);
+
+        pool.delete_empty_leaf(older).expect("delete empty leaf");
+        assert!(pool.nodes[older].is_none());
+
+        FullLRUSlot::bump_mru_walk(&mut pool, newer);
+        assert_ne!(FullLRUSlot::data(pool.get(newer)).next, older);
+    }
+
+    #[test]
+    fn lru_bump_repairs_evicted_neighbor() {
+        let page_size = PageSize::new(1).expect("valid page size");
+        let mut pool = TreeNodePool::<Vec<i64>>::new(page_size, 8, false, false);
+        let root = pool.alloc(TreeNode::new_root());
+        let older = pool
+            .insert_leaf(root, TreeNode::new_child(vec![1], root, None))
+            .expect("insert older child");
+        let newer = pool
+            .insert_leaf(root, TreeNode::new_child(vec![2], root, None))
+            .expect("insert newer child");
+
+        FullLRUSlot::set_value(
+            &mut pool,
+            older,
+            Tensor::zeros([1], (tch::Kind::Int64, tch::Device::Cpu)),
+        )
+        .expect("set older value");
+        FullLRUSlot::set_value(
+            &mut pool,
+            newer,
+            Tensor::zeros([1], (tch::Kind::Int64, tch::Device::Cpu)),
+        )
+        .expect("set newer value");
+        FullLRUSlot::bump_mru(&mut pool, older);
+        FullLRUSlot::bump_mru(&mut pool, newer);
+
+        pool.nodes[older] = None;
+        pool.evicted_indices.push(older);
+
+        FullLRUSlot::bump_mru_walk(&mut pool, newer);
+        assert_ne!(FullLRUSlot::data(pool.get(newer)).next, older);
     }
 }
 

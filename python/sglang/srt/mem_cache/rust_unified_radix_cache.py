@@ -37,6 +37,7 @@ without corrupting cache state.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
@@ -155,12 +156,15 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         if params.enable_metrics:
             self.init_metrics_collector()
+        self._enable_metrics_flag = params.enable_metrics
         if self.token_to_kv_pool_allocator is not None:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
+        self._debug_trace = os.environ.get("SGLANG_RUST_URT_DEBUG", "") == "1"
         device_str = self._device_to_rust_str(self.device)
         self.cache_controller: Any = None
+        self.sidecar_pool_specs: list[Any] = []
         # Pick the concrete wrapper class at construction. The two share an
         # identical Python surface (constructor signature + every method
         # signature), so no per-method dispatch is needed downstream — the
@@ -198,6 +202,40 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # (empty tensors aren't typically mutated, so this is safe by
         # convention).
         self._empty_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._empty_host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
+
+    def _debug_key(self, token_ids: list[int] | tuple[int, ...]) -> str:
+        if not getattr(self, "_debug_trace", False):
+            return ""
+        head = list(token_ids[:4])
+        tail = list(token_ids[-4:]) if len(token_ids) >= 4 else list(token_ids)
+        return f"len={len(token_ids)} head={head} tail={tail}"
+
+    def _debug_allocator_state(self, label: str) -> None:
+        if not getattr(self, "_debug_trace", False):
+            return
+        allocator = self.token_to_kv_pool_allocator
+        full_available = None
+        swa_available = None
+        if allocator is not None:
+            if hasattr(allocator, "full_available_size"):
+                full_available = allocator.full_available_size()
+            elif hasattr(allocator, "available_size"):
+                full_available = allocator.available_size()
+            if hasattr(allocator, "swa_available_size"):
+                swa_available = allocator.swa_available_size()
+        logger.info(
+            "rust_urt_debug sizes %s full_avail=%s full_evict=%s full_prot=%s "
+            "swa_avail=%s swa_evict=%s swa_prot=%s active_nodes=%s",
+            label,
+            full_available,
+            self.full_evictable_size(),
+            self.full_protected_size(),
+            swa_available,
+            self.swa_evictable_size(),
+            self.swa_protected_size(),
+            self._rust_radix.active_tree_node_count(),
+        )
 
     def _reject_unsupported(self, params: CacheInitParams) -> None:
         if params.eviction_policy.lower() != "lru":
@@ -220,16 +258,6 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
     # HiCache (host tier) restrictions — OSS has no equivalent gate.
     def _reject_unsupported_hicache(self, server_args: Any) -> None:
-        # No Mamba host tier yet.
-        if self.mamba_cache_chunk_size is not None:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache HiCache: Mamba host tier is not supported yet"
-            )
-        # No SWA host tier yet.
-        if self.sliding_window_size is not None:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache HiCache: SWA host tier is not supported yet"
-            )
         # Device <-> host only (no L3 storage backend yet).
         if server_args.hicache_storage_backend is not None:
             raise RadixCacheInfraPyError(
@@ -279,6 +307,126 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
     # ----- HiCache (host tier) -----
 
+    @staticmethod
+    def _py_component_type():
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentType as PyComponentType,
+        )
+
+        return PyComponentType
+
+    @staticmethod
+    def _pool_name():
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return PoolName
+
+    def _as_host_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Normalize H2D source indices before queuing cache-controller ops."""
+        if indices is None or len(indices) == 0:
+            return self._empty_host_indices
+        return indices.to(device="cpu", dtype=torch.int64)
+
+    def _build_aux_backup_transfers(self, node_idx: int) -> dict[Any, list[Any]]:
+        """Build per-component host backup transfers for a Rust node."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+        py_ct = self._py_component_type()
+        comp_xfers: dict[Any, list[Any]] = {}
+        if self.supports_swa():
+            swa_value = self._rust_radix.get_swa_device_value(node_idx)
+            if swa_value is not None:
+                comp_xfers[py_ct.SWA] = [
+                    PoolTransfer(name=PoolName.SWA, device_indices=swa_value.to(torch.int64))
+                ]
+        if self.supports_mamba():
+            mamba_value = self._rust_radix.get_mamba_device_value(node_idx)
+            if mamba_value is not None:
+                comp_xfers[py_ct.MAMBA] = [
+                    PoolTransfer(name=PoolName.MAMBA, device_indices=mamba_value)
+                ]
+        return comp_xfers
+
+    def _build_sidecar_transfers(
+        self,
+        phase: str,
+        kv_xfer: Any,
+        comp_xfers: dict[Any, list[Any]],
+    ) -> list[Any]:
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            CacheTransferPhase,
+        )
+
+        transfers = []
+        for spec in self.sidecar_pool_specs:
+            if spec.indices_from_pool == PoolName.KV:
+                source = kv_xfer
+            else:
+                source_component = {
+                    PoolName.SWA: self._py_component_type().SWA,
+                    PoolName.MAMBA: self._py_component_type().MAMBA,
+                }.get(spec.indices_from_pool)
+                if source_component is None:
+                    raise RadixCacheRuntimePyError(
+                        f"Unsupported sidecar source pool {spec.indices_from_pool}"
+                    )
+                matching = comp_xfers.get(source_component, ())
+                if not matching:
+                    continue
+                source = matching[0]
+
+            indices = (
+                source.device_indices
+                if phase == CacheTransferPhase.BACKUP_HOST
+                else source.host_indices
+            )
+            if indices is None or len(indices) == 0:
+                continue
+            transfers.append(
+                PoolTransfer(
+                    name=spec.pool_name,
+                    keys=source.keys,
+                    hit_policy=spec.hit_policy,
+                    indices_from_pool=spec.indices_from_pool,
+                )
+            )
+        return transfers
+
+    def _commit_aux_host_values(self, node_idx: int, comp_xfers: dict[Any, list[Any]]) -> None:
+        py_ct = self._py_component_type()
+        pool_name = self._pool_name()
+        if py_ct.SWA in comp_xfers:
+            xfer = comp_xfers[py_ct.SWA][0]
+            if xfer.host_indices is not None:
+                replaced = self._rust_radix.set_host_swa_values(
+                    [node_idx], [xfer.host_indices]
+                )
+                for old_host_value in replaced:
+                    self.host_pool_group.get_pool(pool_name.SWA).free(old_host_value)
+        if py_ct.MAMBA in comp_xfers:
+            xfer = comp_xfers[py_ct.MAMBA][0]
+            if xfer.host_indices is not None:
+                replaced = self._rust_radix.set_host_mamba_values(
+                    [node_idx], [xfer.host_indices]
+                )
+                for old_host_value in replaced:
+                    self.host_pool_group.get_pool(pool_name.MAMBA).free(old_host_value)
+
+    def _free_evict_result(self, result: Any) -> None:
+        full_idx = int(ComponentType.Full)
+        swa_idx = int(ComponentType.Swa)
+        mamba_idx = int(ComponentType.Mamba)
+        if self.token_to_kv_pool_allocator is not None:
+            for freed in result.freed[full_idx]:
+                self.token_to_kv_pool_allocator.free(freed)
+            for freed in result.freed[swa_idx]:
+                self.token_to_kv_pool_allocator.free_swa(freed)
+        if self.supports_mamba():
+            for freed in result.freed[mamba_idx]:
+                self.req_to_token_pool.mamba_allocator.free(freed)
+        self._process_evict_actions(result.deferred_actions)
+
     def _write_backup(
         self,
         node_indices: list[int],
@@ -289,16 +437,44 @@ class RustUnifiedRadixCache(BasePrefixCache):
     ) -> list[int]:
         """Kick off the backup against `cache_controller` and reflect the
         successful backups in the tree."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            CacheTransferPhase,
+        )
+
+        if self.supports_mamba():
+            # Mamba extra-buffer checkpoints are produced on the forward stream
+            # and can be donated to the radix tree immediately afterward. The
+            # HiCache write stream must not race that producer when backing the
+            # checkpoint up to host, or later host load-back restores stale SSM
+            # state while FULL KV is otherwise correct.
+            torch.cuda.synchronize()
+
         backed_nodes: list[int] = []
         host_values: list[torch.Tensor] = []
+        aux_by_node: list[dict[Any, list[Any]]] = []
         for node_idx, device_value in zip(node_indices, device_values):
+            kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+            comp_xfers = self._build_aux_backup_transfers(node_idx)
+            extra_pools = [x for xfers in comp_xfers.values() for x in xfers]
+            extra_pools.extend(
+                self._build_sidecar_transfers(
+                    CacheTransferPhase.BACKUP_HOST,
+                    kv_xfer,
+                    comp_xfers,
+                )
+            )
             host_indices = self.cache_controller.write(
-                device_indices=device_value, node_id=node_idx
+                device_indices=device_value,
+                node_id=node_idx,
+                extra_pools=extra_pools or None,
             )
             if host_indices is None:
                 self.evict_host(len(device_value))
                 host_indices = self.cache_controller.write(
-                    device_indices=device_value, node_id=node_idx
+                    device_indices=device_value,
+                    node_id=node_idx,
+                    extra_pools=extra_pools or None,
                 )
             if host_indices is None:
                 # Stop if any node failed to back up — preserves host-value
@@ -306,6 +482,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 break
             backed_nodes.append(node_idx)
             host_values.append(host_indices)
+            aux_by_node.append(comp_xfers)
         if not backed_nodes:
             return []
         if lock_device:
@@ -317,14 +494,30 @@ class RustUnifiedRadixCache(BasePrefixCache):
         if track_write_through:
             for node_idx in backed_nodes:
                 self.ongoing_write_through[node_idx] = node_idx
+        for node_idx, comp_xfers in zip(backed_nodes, aux_by_node):
+            self._commit_aux_host_values(node_idx, comp_xfers)
         return backed_nodes
 
-    def evict_host(self, num_tokens: int) -> None:
+    def evict_host(self, num_tokens: int, component_type: Any = None) -> int:
         """Best effort to free up at least `num_tokens` host-tier KV in LRU order."""
         if self.cache_controller is None or num_tokens <= 0:
-            return
-        result = self._rust_radix.evict_host(num_tokens)
+            return 0
+        py_ct = self._py_component_type()
+        if component_type is None or component_type == py_ct.FULL:
+            result = self._rust_radix.evict_host(num_tokens)
+            idx = int(ComponentType.Full)
+        elif component_type == py_ct.SWA:
+            result = self._rust_radix.evict_host_swa(num_tokens)
+            idx = int(ComponentType.Swa)
+        elif component_type == py_ct.MAMBA:
+            result = self._rust_radix.evict_host_mamba(num_tokens)
+            idx = int(ComponentType.Mamba)
+        else:
+            raise RadixCacheRuntimePyError(
+                f"RustUnifiedRadixCache: unsupported host eviction component {component_type}"
+            )
         self._process_evict_actions(result.deferred_actions)
+        return result.evicted[idx]
 
     def _process_evict_actions(self, deferred_actions: list[tuple]) -> int:
         """Process evict actions generated by the Rust radix tree."""
@@ -339,6 +532,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
                     node_idx,
                     len(device_value),
                 )
+                aux_result = self._rust_radix.demote_aux_device_values(
+                    node_idx, device_value
+                )
+                self._free_evict_result(aux_result)
                 if self.token_to_kv_pool_allocator is not None:
                     self.token_to_kv_pool_allocator.free(device_value)
             elif tag == "FullWriteBackOnEvict":
@@ -356,6 +553,10 @@ class RustUnifiedRadixCache(BasePrefixCache):
                         node_idx,
                         len(device_value),
                     )
+                    aux_result = self._rust_radix.demote_aux_device_values(
+                        node_idx, device_value
+                    )
+                    self._free_evict_result(aux_result)
                     if self.token_to_kv_pool_allocator is not None:
                         self.token_to_kv_pool_allocator.free(device_value)
                 else:
@@ -365,6 +566,12 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 # Free host value.
                 _, _node_idx, host_value = action
                 self.token_to_kv_pool_host.free(host_value)
+            elif tag == "SwaHostEvict":
+                _, _node_idx, host_value = action
+                self.host_pool_group.get_pool(self._pool_name().SWA).free(host_value)
+            elif tag == "MambaHostEvict":
+                _, _node_idx, host_value = action
+                self.host_pool_group.get_pool(self._pool_name().MAMBA).free(host_value)
             else:
                 raise RadixCacheRuntimePyError(
                     f"_process_evict_actions: unsupported evict action {tag!r}"
@@ -386,7 +593,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 if ack_node_id == node_idx:
                     matched = True
                 if ack_node_id in self.ongoing_write_through:
-                    self.dec_lock_ref(ack_node_id)
+                    self._rust_radix.dec_backup_lock_ref(ack_node_id)
                     self.ongoing_write_through.pop(ack_node_id, None)
             if matched:
                 return
@@ -394,13 +601,17 @@ class RustUnifiedRadixCache(BasePrefixCache):
     # ----- BasePrefixCache contract: lifecycle -----
 
     def reset(self) -> None:
-        # Mirrors `RadixCache.reset` — clears tree state only. The allocator
-        # is NOT cleared here; callers that need to release in-tree slots back
-        # to the allocator must call `token_to_kv_pool_allocator.clear()`
-        # separately. In practice, `reset()` runs at startup or warmup when
-        # the allocator is already empty.
+        # Mirrors UnifiedRadixCache.reset(): clear runtime tree state and the
+        # L2 host allocator bookkeeping together. Keeping old host allocations
+        # after dropping Rust's host LRU would make later write-through backups
+        # unable to reclaim host memory.
         self._rust_radix.reset()
         self.root_node = self._rust_radix.default_root_idx()
+        self.ongoing_write_through.clear()
+        self.ongoing_load_back.clear()
+        if self.cache_controller is not None:
+            self.cache_controller.reset()
+            self.cache_controller.mem_pool_host.clear()
 
     def supports_fast_match_prefix(self) -> bool:
         return True
@@ -422,8 +633,21 @@ class RustUnifiedRadixCache(BasePrefixCache):
             # keys / no-match cases, where lock-ref ops are documented no-ops).
             return self._empty_match_result()
 
-        token_ids = params.key.token_ids
+        token_ids = params.key.raw_token_ids()
         rust_result = self._rust_radix.match_prefix(token_ids, params.key.extra_key)
+        if getattr(self, "_debug_trace", False):
+            logger.info(
+                "rust_urt_debug match key=%s device=%s host=%s swa_host=%s mamba_host=%s "
+                "last_device=%s last_host=%s best=%s",
+                self._debug_key(token_ids),
+                len(rust_result.device_indices),
+                rust_result.host_only_length,
+                rust_result.swa_host_hit_length,
+                rust_result.mamba_host_hit_length,
+                rust_result.last_device_node_idx,
+                rust_result.last_host_node_idx,
+                rust_result.best_match_node_idx,
+            )
 
         # Mamba CoW: copy the SSM state of matched node to callers so
         # they could directly manipulate it freely.
@@ -432,17 +656,14 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 params.req, rust_result.last_device_node_idx, rust_result.mamba_value
             )
 
-        best_match_node = (
-            rust_result.last_host_node_idx
-            if rust_result.host_only_length > 0
-            else rust_result.last_device_node_idx
-        )
         return MatchResult(
             device_indices=rust_result.device_indices,
             last_device_node=rust_result.last_device_node_idx,
             last_host_node=rust_result.last_host_node_idx,
-            best_match_node=best_match_node,
+            best_match_node=rust_result.best_match_node_idx,
             host_hit_length=rust_result.host_only_length,
+            swa_host_hit_length=rust_result.swa_host_hit_length,
+            mamba_host_hit_length=rust_result.mamba_host_hit_length,
             mamba_branching_seqlen=rust_result.mamba_branching_seqlen,
         )
 
@@ -454,13 +675,19 @@ class RustUnifiedRadixCache(BasePrefixCache):
             return None, None
         if not self.enable_mamba_extra_buffer:
             return req.mamba_pool_idx.unsqueeze(-1).clone(), None
-        # extra_buffer mode: include the ping-pong index of the
-        # returned value so the mamba pool can release the right slot later
-        track_buffer_to_keep = self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-            req.mamba_next_track_idx
-        )
+        # extra_buffer mode: keep the buffer slot that contains the most
+        # recent tracked state. This must match MambaComponent and
+        # MambaRadixCache; lazy mode keeps the active state at next_track_idx.
+        track_buffer_to_keep = self.req_to_token_pool.get_mamba_ping_pong_keep_idx(req)
         mamba_value = (
             req.mamba_ping_pong_track_buffer[track_buffer_to_keep].unsqueeze(-1).clone()
+        )
+        assert mamba_value.item() != -1, (
+            f"Cached mamba slot is -1: keep_idx={track_buffer_to_keep}, "
+            f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
+            f"next_track_idx={req.mamba_next_track_idx}, "
+            f"last_track_seqlen={req.mamba_last_track_seqlen}, "
+            f"rid={req.rid}"
         )
         return mamba_value, track_buffer_to_keep
 
@@ -476,29 +703,48 @@ class RustUnifiedRadixCache(BasePrefixCache):
         `MambaPool` so callers don't reimplement it.
         """
         mamba_pool = self.req_to_token_pool.mamba_pool
-        dst = mamba_pool.alloc(1)
+        mamba_allocator = self.req_to_token_pool.mamba_allocator
+        dst = mamba_allocator.alloc(1)
         if dst is None:
             if protect_node_idx is not None:
                 self.inc_lock_ref(protect_node_idx)
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            dst = mamba_pool.alloc(1)
-            if protect_node_idx is not None:
-                self.dec_lock_ref(protect_node_idx)
+            try:
+                self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                dst = mamba_allocator.alloc(1)
+            finally:
+                if protect_node_idx is not None:
+                    self.dec_lock_ref(protect_node_idx)
             assert dst is not None, "Can not alloc mamba cache"
         mamba_pool.copy_from(mamba_value, dst)
+        return dst
+
+    def _alloc_mamba_slot_for_cow(
+        self, protect_node_idx: Optional[int] = None
+    ) -> torch.Tensor:
+        mamba_allocator = self.req_to_token_pool.mamba_allocator
+        dst = mamba_allocator.alloc(1)
+        if dst is None:
+            if protect_node_idx is not None:
+                self.inc_lock_ref(protect_node_idx)
+            try:
+                self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                dst = mamba_allocator.alloc(1)
+            finally:
+                if protect_node_idx is not None:
+                    self.dec_lock_ref(protect_node_idx)
+            assert dst is not None, "Can not alloc mamba cache"
         return dst
 
     def _copy_on_write_mamba(
         self, req: "Req", last_node_idx: int, src_index: torch.Tensor
     ) -> None:
-        """Copy the matched node's Mamba SSM state into req-local space."""
+        """Defer copying the matched Mamba SSM state into req-local space."""
         if req.mamba_pool_idx is None:
-            forked = self._mamba_fork_from(src_index, protect_node_idx=last_node_idx)
-            req.mamba_pool_idx = forked[0]
-        else:
-            self.req_to_token_pool.mamba_pool.copy_from(
-                src_index, req.mamba_pool_idx.unsqueeze(0)
-            )
+            req.mamba_pool_idx = self._alloc_mamba_slot_for_cow(
+                protect_node_idx=last_node_idx
+            )[0]
+        req.mamba_cow_src_index = src_index
+        req.mamba_needs_clear = False
 
     def _empty_match_result(self) -> MatchResult:
         # Disabled-cache sentinel. Reuses the cached `_empty_indices` to
@@ -530,7 +776,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         key = params.key
         value = params.value
         if value is None:
-            value = torch.tensor(key.token_ids, dtype=torch.int64, device=self.device)
+            value = torch.tensor(key.raw_token_ids(), dtype=torch.int64, device=self.device)
 
         # Normalize the key's `is_bigram` to match `self.is_eagle` at the
         # orchestrator boundary, mirroring OSS `RadixCache.insert` /
@@ -574,6 +820,18 @@ class RustUnifiedRadixCache(BasePrefixCache):
             params.swa_evicted_seqlen,
             params.mamba_value,
         )
+        if getattr(self, "_debug_trace", False):
+            logger.info(
+                "rust_urt_debug insert key=%s atom=%s prefix=%s prev=%s swa_evict=%s "
+                "actions=%s mamba_exists=%s",
+                self._debug_key(token_ids),
+                atom_count,
+                rust_result.prefix_len,
+                params.prev_prefix_len,
+                params.swa_evicted_seqlen,
+                [action[0] for action in rust_result.deferred_actions],
+                rust_result.mamba_value_exists,
+            )
         self._process_insert_actions(rust_result.deferred_actions)
         return InsertResult(
             prefix_len=rust_result.prefix_len,
@@ -585,6 +843,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         if not deferred_actions or self.token_to_kv_pool_allocator is None:
             return
 
+        self._debug_allocator_state("insert_actions:start")
         swa_node_indices: list[int] = []
         swa_values: list[torch.Tensor] = []
         write_through_nodes: list[int] = []
@@ -594,9 +853,11 @@ class RustUnifiedRadixCache(BasePrefixCache):
             if tag == "FullDupFreed":
                 _, freed_indices = action
                 self.token_to_kv_pool_allocator.free(freed_indices)
+                self._debug_allocator_state(f"insert_actions:after:{tag}:{len(freed_indices)}")
             elif tag == "SwaRecover":
                 _, node_idx, freed_full, source_value = action
                 self.token_to_kv_pool_allocator.free(freed_full)
+                self._debug_allocator_state(f"insert_actions:after:{tag}:free:{len(freed_full)}")
                 swa_node_indices.append(node_idx)
                 swa_values.append(
                     self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -620,15 +881,23 @@ class RustUnifiedRadixCache(BasePrefixCache):
                     f"_process_insert_actions: unsupported insert action {tag!r}"
                 )
 
-        if write_through_nodes:
-            # Back up FULL values from device to host (write-through).
-            self._write_backup(write_through_nodes, write_through_values)
         if swa_node_indices:
             # Single batched apply_swa_writes call — stamps SWA values on
             # all affected nodes, splices into SWA's LRU, credits
             # evictable_size. Mirrors OSS's per-action insert_mru pattern
             # collapsed into one call.
             self._rust_radix.apply_swa_writes(swa_node_indices, swa_values)
+            self._debug_allocator_state(
+                f"insert_actions:after:apply_swa_writes:{len(swa_node_indices)}"
+            )
+        if write_through_nodes:
+            # Back up FULL values from device to host (write-through). This must
+            # run after SWA stamps/recovers so auxiliary host transfers and
+            # sidecars derived from SWA see the freshly populated device values.
+            self._write_backup(write_through_nodes, write_through_values)
+            self._debug_allocator_state(
+                f"insert_actions:after:write_backup:{len(write_through_nodes)}"
+            )
 
     def evict(self, params: EvictParams) -> EvictResult:
         if params.mamba_num != 0 and not self.supports_mamba():
@@ -644,6 +913,8 @@ class RustUnifiedRadixCache(BasePrefixCache):
         mamba_budget = max(0, params.mamba_num) if self.supports_mamba() else 0
         if self.disable or (full_budget == 0 and swa_budget == 0 and mamba_budget == 0):
             return EvictResult(num_tokens_evicted=0)
+
+        self._poll_hicache_events_for_eviction()
 
         # Single Rust call: the dispatcher iterates configured components
         # forward (FULL → SWA → Mamba) with the per-component budget.
@@ -666,6 +937,14 @@ class RustUnifiedRadixCache(BasePrefixCache):
         while any(requested):
             attempts += 1
             result = self._rust_radix.evict(requested)
+            if getattr(self, "_debug_trace", False):
+                logger.info(
+                    "rust_urt_debug evict requested=%s evicted=%s freed=%s actions=%s",
+                    requested,
+                    list(result.evicted),
+                    [len(bin) for bin in result.freed],
+                    [action[0] for action in result.deferred_actions],
+                )
 
             # When a component isn't configured, the Rust dispatcher
             # doesn't iterate it, so its `evicted[ct] == 0` and
@@ -683,7 +962,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                     self.token_to_kv_pool_allocator.free_swa(freed)
             if self.supports_mamba():
                 for freed in result.freed[mamba_idx]:
-                    self.req_to_token_pool.mamba_pool.free(freed)
+                    self.req_to_token_pool.mamba_allocator.free(freed)
 
             rolled_back_tokens = self._process_evict_actions(result.deferred_actions)
             if rolled_back_tokens:
@@ -707,6 +986,16 @@ class RustUnifiedRadixCache(BasePrefixCache):
             full_available = self.token_to_kv_pool_allocator.available_size()
             if full_available >= target_full_available:
                 break
+            if self._drain_hicache_events_for_eviction():
+                full_available = self.token_to_kv_pool_allocator.available_size()
+                if full_available >= target_full_available:
+                    break
+                requested = [
+                    target_full_available - full_available,
+                    0,
+                    0,
+                ]
+                continue
             if batch_evicted[full_idx] == 0 or attempts >= 8:
                 break
             requested = [
@@ -805,25 +1094,46 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # Total Mamba slots (evictable + protected); separate from `total_size()` because Mamba's unit is slots, not tokens.
         return self._rust_radix.mamba_total_size() if self.supports_mamba() else 0
 
+    def _poll_hicache_events_for_eviction(self) -> None:
+        """Release ready HiCache locks before an allocator-pressure eviction."""
+        if self.cache_controller is None:
+            return
+        self.writing_check()
+        self.loading_check()
+
+    def _drain_hicache_events_for_eviction(self) -> bool:
+        """Wait for in-flight HiCache copies only when eviction cannot make
+        allocator-visible progress. This keeps the normal path asynchronous,
+        but avoids treating tokens locked by completed/near-completed copies as
+        immediately evictable under allocation pressure."""
+        if self.cache_controller is None:
+            return False
+        before = (
+            len(self.ongoing_write_through),
+            len(self.ongoing_load_back),
+        )
+        self.writing_check()
+        self.loading_check()
+        if before != (len(self.ongoing_write_through), len(self.ongoing_load_back)):
+            return True
+
+        waited = False
+        if self.ongoing_write_through and self.cache_controller.ack_write_queue:
+            self.writing_check(write_back=True)
+            waited = True
+        if self.ongoing_load_back and self.cache_controller.ack_load_queue:
+            self.loading_check(wait=True)
+            waited = True
+        after = (
+            len(self.ongoing_write_through),
+            len(self.ongoing_load_back),
+        )
+        return waited and before != after
+
     # ----- BasePrefixCache contract: idle invariant check -----
 
     def sanity_check(self) -> None:
-        # Called by `scheduler_runtime_checker_mixin._check_tree_cache`
-        # on idle ticks for hybrid-SWA / hybrid-SSM caches (gated by our
-        # `supports_swa()` returning True). Currently a no-op stub
-        # added during SWA bring-up to keep the scheduler's hot-path
-        # call from raising AttributeError.
-        #
-        # TODO: implement a real check. Add a Rust-side
-        # `sanity_check_aggregates()` walker that rebuilds the LRU
-        # lists from the tree and asserts heap-ordered consistency
-        # (mirrors `swa_radix_cache.py::sanity_check`). The Rust side
-        # already debug_asserts at every mutation site, but a
-        # Python-callable orchestrator-level check gives the scheduler
-        # a cheap idle-tick invariant that catches drift between the
-        # tree and the LRU bookkeeping (e.g. evictable_size /
-        # protected_size aggregate skew).
-        return None
+        self._rust_radix.sanity_check()
 
     # ----- BasePrefixCache contract: SWA capability flag -----
 
@@ -895,7 +1205,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         # Mamba extra_buffer mode: truncate the cache range to Mamba chunk aligned.
         if self.enable_mamba_extra_buffer:
-            cache_len = req.mamba_last_track_seqlen or 0
+            cache_len = min(req.mamba_last_track_seqlen or 0, len(token_ids))
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
@@ -914,6 +1224,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
 
         mamba_exist = False
         if is_insert:
+            self._debug_allocator_state("cache_finished:before_insert")
             insert_result = self.insert(
                 InsertParams(
                     key=radix_key,
@@ -924,6 +1235,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
                 )
             )
             mamba_exist = insert_result.mamba_exist
+            self._debug_allocator_state("cache_finished:after_insert")
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : atom_len]
@@ -935,6 +1247,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # this includes the trailing boundary token of the last cached
         # pair as well as any unaligned bigram positions.
         self.token_to_kv_pool_allocator.free(kv_indices[atom_len:])
+        self._debug_allocator_state("cache_finished:after_free_tail")
 
         # Mamba slot release.
         #
@@ -985,6 +1298,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
             if cache_len is None:
                 req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
                 return
+            cache_len = min(cache_len, len(token_ids))
             token_ids = token_ids[:cache_len]
 
         radix_key = RadixKey(
@@ -993,15 +1307,26 @@ class RustUnifiedRadixCache(BasePrefixCache):
         atom_len = len(radix_key)
         values = kv_indices[:atom_len].to(dtype=torch.int64, copy=True)
 
-        # Fork into a tree-owned slot so decode mutations don't alias the cached state.
+        # Mamba: hand the tracked state to the radix cache. In extra_buffer
+        # mode this must donate the ping-pong slot and replace it with a fresh
+        # request-owned slot, matching MambaComponent. Copying the tracked slot
+        # here can race the forward stream that produced it.
         mamba_value_forked = None
         if self.supports_mamba() and req.mamba_pool_idx is not None:
-            mamba_value_src, _ = self._extract_mamba_value(req)
-            assert mamba_value_src is not None, (
-                "mamba_value_src must be present when supports_mamba() and "
-                "req.mamba_pool_idx is not None"
-            )
-            mamba_value_forked = self._mamba_fork_from(mamba_value_src)
+            if self.enable_mamba_extra_buffer:
+                new_slot = self._alloc_mamba_slot_for_cow()
+                mamba_value_forked = (
+                    self.req_to_token_pool.donate_mamba_ping_pong_slot(
+                        req, new_slot
+                    )
+                )
+            else:
+                mamba_value_src, _ = self._extract_mamba_value(req)
+                assert mamba_value_src is not None, (
+                    "mamba_value_src must be present when supports_mamba() and "
+                    "req.mamba_pool_idx is not None"
+                )
+                mamba_value_forked = self._mamba_fork_from(mamba_value_src)
 
         insert_result = self.insert(
             InsertParams(
@@ -1017,7 +1342,7 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # Mamba: release the forked slot when the cache didn't consume
         # it (target already had a Mamba value).
         if mamba_value_forked is not None and insert_result.mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+            self.req_to_token_pool.mamba_allocator.free(mamba_value_forked)
 
         # Re-match: the tree may have de-duplicated against an existing branch
         # during insert, so the canonical tree-owned indices for this prefix
@@ -1097,29 +1422,18 @@ class RustUnifiedRadixCache(BasePrefixCache):
         storage/prefetch).
         """
         self.kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
-        from sglang.srt.mem_cache.memory_pool_host import (
-            MHATokenToKVPoolHost,
-            MLATokenToKVPoolHost,
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _select_strategy,
+        )
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            ComponentType as PyComponentType,
         )
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
-            host_cls: Any = MHATokenToKVPoolHost
-        elif isinstance(self.kv_cache, MLATokenToKVPool):
-            host_cls = MLATokenToKVPoolHost
-        else:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache HiCache: kv_cache "
-                f"{type(self.kv_cache).__name__} is not supported yet (only MHA / MLA)"
-            )
-        self.token_to_kv_pool_host = host_cls(
-            self.kv_cache,
-            server_args.hicache_ratio,
-            server_args.hicache_size,
-            self.page_size,
-            server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
-        )
+        components = {PyComponentType.FULL}
+        if self.supports_swa():
+            components.add(PyComponentType.SWA)
+        if self.supports_mamba():
+            components.add(PyComponentType.MAMBA)
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -1129,21 +1443,39 @@ class RustUnifiedRadixCache(BasePrefixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.load_cache_event = threading.Event()
 
-        from sglang.srt.managers.cache_controller import HiCacheController
-
-        self.cache_controller = HiCacheController(
-            self.token_to_kv_pool_allocator,
-            self.token_to_kv_pool_host,
-            self.page_size,
-            self.tp_group,
+        strategy = _select_strategy(self.kv_cache, components)
+        result = strategy.build(
+            cache=self,
+            kvcache=self.kv_cache,
+            params=params,
+            server_args=server_args,
             load_cache_event=self.load_cache_event,
             attn_cp_group=self.attn_cp_group,
             attn_tp_group=self.attn_tp_group,
-            pp_group=params.pp_cache_group,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
             storage_backend=None,
+            storage_backend_extra_config=None,
+            prefetch_threshold=256,
+            model_name=server_args.served_model_name,
+            enable_storage_metrics=False,
         )
+
+        self.host_pool_group = result.host_pool_group
+        self.cache_controller = result.cache_controller
+        self.sidecar_pool_specs = list(result.sidecars)
+        self.token_to_kv_pool_host = result.component_host_pools[PyComponentType.FULL]
+        self.full_kv_pool_host = self.token_to_kv_pool_host
+        if PyComponentType.SWA in result.component_host_pools:
+            self.swa_kv_pool_host = result.component_host_pools[PyComponentType.SWA]
+        if PyComponentType.MAMBA in result.component_host_pools:
+            self.mamba_pool_host = result.component_host_pools[PyComponentType.MAMBA]
+
+        self.kv_cache.register_layer_transfer_counter(
+            self.cache_controller.layer_done_counter
+        )
+        if result.register_req_to_token_counter:
+            self.req_to_token_pool.register_layer_transfer_counter(
+                self.cache_controller.layer_done_counter
+            )
 
         # Nodes with an in-flight write-through; the host stamp is deferred to
         # the controller ack (`writing_check`). Keyed by Rust NodeIdx.
@@ -1159,10 +1491,24 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
         self.load_back_threshold = 10
 
-    def writing_check(self) -> None:
+    def writing_check(self, write_back: bool = False) -> None:
         """Release the device lock on nodes whose host copy has completed."""
         if not self.ongoing_write_through:
             return
+        if write_back:
+            while self.ongoing_write_through:
+                if not self.cache_controller.ack_write_queue:
+                    raise RadixCacheRuntimePyError(
+                        "RustUnifiedRadixCache: pending write-through lock has no ack"
+                    )
+                ack = self.cache_controller.ack_write_queue.pop(0)
+                ack.finish_event.synchronize()
+                for node_id in ack.node_ids:
+                    if node_id in self.ongoing_write_through:
+                        self._rust_radix.dec_backup_lock_ref(node_id)
+                        self.ongoing_write_through.pop(node_id, None)
+            return
+
         finish_count = 0
         if self.pp_rank == 0:
             for ack in self.cache_controller.ack_write_queue:
@@ -1174,9 +1520,13 @@ class RustUnifiedRadixCache(BasePrefixCache):
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
             for node_id in ack.node_ids:
-                self.dec_lock_ref(node_id)
-                self.ongoing_write_through.pop(node_id, None)
+                if node_id in self.ongoing_write_through:
+                    self._rust_radix.dec_backup_lock_ref(node_id)
+                    self.ongoing_write_through.pop(node_id, None)
             finish_count -= 1
+
+    def flush_write_through_acks(self) -> None:
+        self.writing_check()
 
     def _hicache_min_ready(self, finish_count: int) -> int:
         # All ranks must drain the same number of acks to keep the queue in
@@ -1205,6 +1555,9 @@ class RustUnifiedRadixCache(BasePrefixCache):
         """Compute host-only chain to loadback (starting from node closer to root)."""
         return self._rust_radix.prepare_load_back(node_idx)
 
+    def prepare_aux_load_back(self, node_idx: int) -> Any:
+        return self._rust_radix.prepare_aux_load_back(node_idx)
+
     def postprocess_load_back(
         self,
         chain: list[int],
@@ -1219,59 +1572,200 @@ class RustUnifiedRadixCache(BasePrefixCache):
         """Release locks held until the H2D load-back ack."""
         self._rust_radix.finish_load_back(chain, loaded_node_idx)
 
+    def release_aux_host_locks(
+        self, swa_chain: list[int], mamba_chain: list[int]
+    ) -> None:
+        self._rust_radix.release_aux_host_locks(swa_chain, mamba_chain)
+
     def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, int]:
         """If needed, restore host-backed prefix to device, up to `best_match_node`."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+        from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+            CacheTransferPhase,
+        )
+
+        if self.ongoing_write_through:
+            # Host values are published to the radix tree as soon as the D2H
+            # write is queued. Do not use those host slots as H2D sources until
+            # the write stream has actually finished, otherwise a valid Full
+            # hit can restore stale auxiliary state.
+            self.writing_check(write_back=True)
+
         node_idx = params.best_match_node
         mem_quota = params.mem_quota
+        req = params.req
         plan = self.prepare_load_back(node_idx)
-        if not plan.chain:
-            # Already device-present: nothing to restore and no locks taken, so
-            # skip postprocess (its unconditional ancestor-unlock would underflow).
-            return self._empty_indices, node_idx
-        host_indices = plan.host_indices
+        old_device_node = (
+            req.last_node
+            if req is not None and req.last_node is not None
+            else plan.ancestor_node_idx
+        )
+        aux_plan = self.prepare_aux_load_back(node_idx)
+        host_indices = self._as_host_indices(plan.host_indices)
+        py_ct = self._py_component_type()
+        comp_xfers: dict[Any, list[Any]] = {}
+        swa_host_indices = self._as_host_indices(aux_plan.swa_host_indices)
+        if len(swa_host_indices) > 0:
+            comp_xfers[py_ct.SWA] = [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=swa_host_indices,
+                    nodes_to_load=list(aux_plan.swa_chain),
+                )
+            ]
+        mamba_host_indices = self._as_host_indices(aux_plan.mamba_host_indices)
+        if len(mamba_host_indices) > 0:
+            mamba_xfers = [
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    host_indices=mamba_host_indices,
+                    nodes_to_load=list(aux_plan.mamba_chain),
+                )
+            ]
+            if req is not None:
+                if req.mamba_pool_idx is None:
+                    dst = self.req_to_token_pool.mamba_allocator.alloc(1)
+                    if dst is None:
+                        self.evict(EvictParams(num_tokens=0, mamba_num=1))
+                        dst = self.req_to_token_pool.mamba_allocator.alloc(1)
+                    if dst is None:
+                        self.postprocess_load_back(
+                            plan.chain, plan.ancestor_node_idx, None
+                        )
+                        self.release_aux_host_locks(
+                            list(aux_plan.swa_chain), list(aux_plan.mamba_chain)
+                        )
+                        return self._empty_indices, plan.ancestor_node_idx
+                    req.mamba_pool_idx = dst[0]
+                req.mamba_cow_src_index = None
+                req.mamba_needs_clear = False
+                mamba_xfers.append(
+                    PoolTransfer(
+                        name=PoolName.MAMBA,
+                        host_indices=mamba_host_indices,
+                        device_indices=req.mamba_pool_idx.unsqueeze(0),
+                    )
+                )
+            comp_xfers[py_ct.MAMBA] = mamba_xfers
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+        extra_pools = [x for xfers in comp_xfers.values() for x in xfers]
+        extra_pools.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.LOAD_BACK,
+                kv_xfer,
+                comp_xfers,
+            )
+        )
         logger.info(
-            "init_load_back: node=%s chain=%s host_tokens=%s mem_quota=%s",
+            "init_load_back: node=%s chain=%s host_tokens=%s swa_host=%s mamba_host=%s mem_quota=%s",
             node_idx,
             len(plan.chain),
             len(host_indices),
+            len(swa_host_indices),
+            len(mamba_host_indices),
             mem_quota,
         )
         # Skip tiny loads / those over mem_quota.
-        if len(host_indices) < self.load_back_threshold or (
+        if (len(host_indices) < self.load_back_threshold and not extra_pools) or (
             mem_quota is not None and len(host_indices) > mem_quota
         ):
             self.postprocess_load_back(plan.chain, plan.ancestor_node_idx, None)
+            self.release_aux_host_locks(
+                list(aux_plan.swa_chain), list(aux_plan.mamba_chain)
+            )
             return self._empty_indices, plan.ancestor_node_idx
         # Loadback with retry
         device_indices = self.cache_controller.load(
-            host_indices=host_indices, node_id=node_idx
+            host_indices=host_indices,
+            node_id=node_idx,
+            extra_pools=extra_pools or None,
         )
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
-                host_indices=host_indices, node_id=node_idx
+                host_indices=host_indices,
+                node_id=node_idx,
+                extra_pools=extra_pools or None,
             )
         if device_indices is None:
             self.postprocess_load_back(plan.chain, plan.ancestor_node_idx, None)
+            self.release_aux_host_locks(
+                list(aux_plan.swa_chain), list(aux_plan.mamba_chain)
+            )
             return self._empty_indices, plan.ancestor_node_idx
+        swa_device_values = None
+        if py_ct.SWA in comp_xfers:
+            swa_device_values = comp_xfers[py_ct.SWA][0].device_indices
+        mamba_device_values = None
+        if py_ct.MAMBA in comp_xfers:
+            mamba_device_values = comp_xfers[py_ct.MAMBA][0].device_indices
         self.postprocess_load_back(plan.chain, plan.ancestor_node_idx, device_indices)
+        self._rust_radix.postprocess_aux_load_back(
+            list(aux_plan.swa_chain),
+            list(aux_plan.mamba_chain),
+            swa_device_values,
+            mamba_device_values,
+        )
+        if (
+            swa_device_values is not None
+            and self.token_to_kv_pool_allocator is not None
+            and hasattr(self.token_to_kv_pool_allocator, "set_full_to_swa_mapping")
+        ):
+            mapping = getattr(
+                self.token_to_kv_pool_allocator, "full_to_swa_index_mapping", None
+            )
+            mapping_device = mapping.device if mapping is not None else self.device
+            offset = 0
+            for node in aux_plan.swa_chain:
+                full_value = self._rust_radix.get_full_device_value(node)
+                if full_value is None:
+                    raise RadixCacheRuntimePyError(
+                        "RustUnifiedRadixCache: SWA loadback node has no FULL anchor "
+                        f"(node={node})"
+                    )
+                n_tokens = len(full_value)
+                swa_chunk = swa_device_values[offset : offset + n_tokens]
+                self.token_to_kv_pool_allocator.set_full_to_swa_mapping(
+                    full_value.to(device=mapping_device, dtype=torch.int64),
+                    swa_chunk.to(device=mapping_device, dtype=torch.int64),
+                )
+                offset += n_tokens
+            if offset != len(swa_device_values):
+                raise RadixCacheRuntimePyError(
+                    "RustUnifiedRadixCache: SWA loadback mapping length mismatch "
+                    f"(mapped={offset}, total={len(swa_device_values)})"
+                )
+        prefix_delta = self._rust_radix.collect_full_device_values_between(
+            node_idx, old_device_node
+        )
+        handoff_locked = bool(plan.chain)
         logger.info(
-            "load_back: queued node=%s chain=%s tokens=%s",
+            "load_back: queued node=%s chain=%s tokens=%s swa=%s mamba=%s",
             node_idx,
             len(plan.chain),
             len(device_indices),
+            0 if swa_device_values is None else len(swa_device_values),
+            0 if mamba_device_values is None else len(mamba_device_values),
         )
         # Save the ongoing loadback for lock ref reverts.
-        self.ongoing_load_back[node_idx] = (list(plan.chain), node_idx)
-        return device_indices, node_idx
+        self.ongoing_load_back[node_idx] = (
+            list(plan.chain),
+            node_idx,
+            list(aux_plan.swa_chain),
+            list(aux_plan.mamba_chain),
+            handoff_locked,
+        )
+        return prefix_delta, node_idx
 
-    def loading_check(self) -> None:
+    def loading_check(self, wait: bool = False) -> None:
         """Release the device lock handed off to each loaded prefix once its
         host->device copy has completed."""
         if not self.ongoing_load_back:
             return
         finish_count = 0
-        if self.pp_rank == 0:
+        if wait:
+            finish_count = len(self.cache_controller.ack_load_queue)
+        elif self.pp_rank == 0:
             for ack in self.cache_controller.ack_load_queue:
                 if not ack.finish_event.query():
                     break
@@ -1283,14 +1777,23 @@ class RustUnifiedRadixCache(BasePrefixCache):
             for node_id in ack.node_ids:
                 entry = self.ongoing_load_back.pop(node_id, None)
                 if entry is not None:
-                    chain, end_node = entry
-                    self.finish_load_back(chain, end_node)
+                    chain, end_node, swa_chain, mamba_chain, handoff_locked = entry
+                    self.release_aux_host_locks(swa_chain, mamba_chain)
+                    if handoff_locked:
+                        self.finish_load_back(chain, end_node)
             finish_count -= 1
 
     def ready_to_load_host_cache(self) -> int:
         """Kick off the queued host->device loads; return the consumer index the
         scheduler tracks (-1 when the load queue is empty)."""
-        return self.cache_controller.start_loading()
+        consumer_index = self.cache_controller.start_loading()
+        if consumer_index != -1 and self.supports_mamba():
+            # Mamba COW is collected/executed before the layer-wise pool wait in
+            # the forward path. Keep Rust's published device Mamba state from
+            # becoming a COW source until the H2D load stream has materialized
+            # it.
+            self.loading_check(wait=True)
+        return consumer_index
 
     def check_hicache_events(self):
         """Revert locks for already finished loadback and backup."""
@@ -1317,14 +1820,6 @@ def install_rust_radix_cache() -> None:
 
     def factory(ctx):
         _load_native_symbols()
-        if ctx.is_hybrid_swa:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache: hybrid SWA models not supported"
-            )
-        if ctx.is_hybrid_ssm:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache: hybrid SSM / Mamba models not supported"
-            )
         if ctx.server_args.enable_lmcache:
             raise RadixCacheInfraPyError(
                 "RustUnifiedRadixCache: LMCache is not supported"

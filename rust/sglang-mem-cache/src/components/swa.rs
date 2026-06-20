@@ -22,7 +22,7 @@ use crate::component_type::ComponentType;
 use crate::deferred_action::DeferredAction;
 use crate::error::{RadixCacheInitError, RadixCacheRuntimeError};
 use crate::tree_node_lru::{
-    EvictRequest, EvictResult, FullLRUSlot, LRUSlot, SwaLRUSlot, evict_non_full,
+    EvictRequest, EvictResult, FullLRUSlot, HostSwaLRUSlot, LRUSlot, SwaLRUSlot, evict_non_full,
 };
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, NodeSplit, TreeNode, TreeNodePool};
 
@@ -53,8 +53,14 @@ impl SwaComponent {
 }
 
 impl<K: ChildKeyType> Component<K> for SwaComponent {
-    fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>> {
-        Some(Box::new(SwaMatchValidator::new(self.sliding_window_size)))
+    fn create_match_validator(
+        &self,
+        match_device_only: bool,
+    ) -> Option<Box<dyn MatchValidator<K>>> {
+        Some(Box::new(SwaMatchValidator::new(
+            self.sliding_window_size,
+            match_device_only,
+        )))
     }
 
     /// SWA lock-walk acquire. Walk leaf → up bumping SWA's `lock_ref`
@@ -125,8 +131,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
     }
 
     /// SWA lock-walk release. Inverse of `inc_lock_ref` — walk
-    /// leaf → up decrementing SWA's `lock_ref` (via
-    /// `SwaLRUSlot::dec_lock_ref` — also asserts no underflow).
+    /// leaf → up decrementing nodes that still have an SWA `lock_ref`.
     /// Stops AFTER decrementing the node whose `swa_uuid_for_lock`
     /// matches the request's `swa_uuid_for_lock` (matches OSS
     /// `swa_radix_cache.py`'s `dec_lock_ref` `dec_lock_swa = False` shape:
@@ -135,6 +140,12 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
     /// **Does NOT clear the node's uuid** — the uuid persists across
     /// acquire / release cycles for concurrent-acquire safety. See
     /// the uuid-reuse comment on `inc_lock_ref` for the trace.
+    ///
+    /// Nodes with zero SWA `lock_ref` are skipped rather than treated as an
+    /// underflow. This mirrors Python Unified's SWA release path: split and
+    /// host/sidecar paths can leave structural or tombstone ancestors on the
+    /// release path that were not part of this request's SWA window. The uuid
+    /// boundary is honored only after a node is actually decremented.
     ///
     /// When `swa_uuid_for_lock` is `None` (the inc walk didn't fill
     /// the window because `sliding_window_size > total_path_len` —
@@ -162,6 +173,10 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         let mut current = node_idx;
         while let Some(parent) = pool.get(current).parent() {
             let this_uuid = pool.get(current).swa_uuid_for_lock();
+            if SwaLRUSlot::lock_ref(pool.get(current)) == 0 {
+                current = parent;
+                continue;
+            }
             // Decrement via slot mutator (asserts no underflow). On
             // the 1→0 transition for SWA-populated nodes, returns the
             // positive delta (key.len() shifted from protected back to
@@ -241,6 +256,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         prev_prefix_len: usize,
         value_slice: &Tensor,
         swa_evicted_seqlen: usize,
+        full_had_value_at_entry: bool,
         deferred: &mut Vec<DeferredAction>,
     ) -> Result<usize, RadixCacheRuntimeError> {
         // `prev_prefix_len` is the caller-protected prefix in absolute
@@ -276,20 +292,34 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
             // Branch 1: entire node is within SWA window — full recover.
             // Replace FULL's value with the incoming slice; the old FULL
             // value is freed by Python via the SwaRecover action.
-            #[allow(
-                clippy::expect_used,
-                reason = "tombstone invariant: FULL value retained"
-            )]
-            let old_full = FullLRUSlot::value(pool.get(child_idx))
-                .expect("tombstone node must have FULL value")
-                .shallow_clone();
-            let new_full = value_slice.copy();
-            FullLRUSlot::replace_value(pool, child_idx, new_full.shallow_clone());
-            deferred.push(DeferredAction::SwaRecover {
-                node_idx: child_idx,
-                freed_full: old_full,
-                source_value: new_full,
-            });
+            if full_had_value_at_entry {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "tombstone invariant: FULL value retained"
+                )]
+                let old_full = FullLRUSlot::value(pool.get(child_idx))
+                    .expect("tombstone node must have FULL value")
+                    .shallow_clone();
+                let new_full = value_slice.copy();
+                FullLRUSlot::replace_value(pool, child_idx, new_full.shallow_clone());
+                deferred.push(DeferredAction::SwaRecover {
+                    node_idx: child_idx,
+                    freed_full: old_full,
+                    source_value: new_full,
+                });
+            } else {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "FULL component restored the device value before SWA"
+                )]
+                let source_value = FullLRUSlot::value(pool.get(child_idx))
+                    .expect("unevicted node must have FULL value")
+                    .shallow_clone();
+                deferred.push(DeferredAction::SwaStamp {
+                    node_idx: child_idx,
+                    source_value,
+                });
+            }
             Ok(0)
         } else if swa_evicted_seqlen < total_prefix_len + node_key_len {
             // Branch 2: node straddles the boundary — split at start_idx,
@@ -301,24 +331,38 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
                 split_len: start_idx,
             };
             let _new_parent = pool.split_node(components, split);
-            // After split: child_idx is now the suffix (in-window portion).
-            // Its FULL value has been narrowed to value[start_idx:] by split_node.
-            #[allow(
-                clippy::expect_used,
-                reason = "split_node narrows but preserves FULL value"
-            )]
-            let old_full = FullLRUSlot::value(pool.get(child_idx))
-                .expect("split suffix must have FULL value")
-                .shallow_clone();
-            let new_full = value_slice
-                .narrow(0, start_idx as i64, (node_key_len - start_idx) as i64)
-                .copy();
-            FullLRUSlot::replace_value(pool, child_idx, new_full.shallow_clone());
-            deferred.push(DeferredAction::SwaRecover {
-                node_idx: child_idx,
-                freed_full: old_full,
-                source_value: new_full,
-            });
+            if full_had_value_at_entry {
+                // After split: child_idx is now the suffix (in-window portion).
+                // Its FULL value has been narrowed to value[start_idx:] by split_node.
+                #[allow(
+                    clippy::expect_used,
+                    reason = "split_node narrows but preserves FULL value"
+                )]
+                let old_full = FullLRUSlot::value(pool.get(child_idx))
+                    .expect("split suffix must have FULL value")
+                    .shallow_clone();
+                let new_full = value_slice
+                    .narrow(0, start_idx as i64, (node_key_len - start_idx) as i64)
+                    .copy();
+                FullLRUSlot::replace_value(pool, child_idx, new_full.shallow_clone());
+                deferred.push(DeferredAction::SwaRecover {
+                    node_idx: child_idx,
+                    freed_full: old_full,
+                    source_value: new_full,
+                });
+            } else {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "split_node preserves the FULL value restored by FULL"
+                )]
+                let source_value = FullLRUSlot::value(pool.get(child_idx))
+                    .expect("split suffix must have FULL value")
+                    .shallow_clone();
+                deferred.push(DeferredAction::SwaStamp {
+                    node_idx: child_idx,
+                    source_value,
+                });
+            }
             Ok(start_idx)
         } else {
             // Branch 3: entire node is outside SWA window — no recovery.
@@ -502,7 +546,19 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         pool.get_mut(new_parent_idx)
             .set_swa_uuid_for_lock(transferred_uuid);
 
-        // 3. Slice SWA value across the boundary if present. Tombstones
+        // 3. Slice host SWA backup across the boundary if present. Host-only
+        // (S3) values must be re-hung in HostSWA LRU; device+host backup
+        // (S2) values must stay off the host LRU because only host-only aux
+        // values are host-evictable.
+        redistribute_host_swa_on_split(
+            pool,
+            new_parent_idx,
+            child_idx,
+            split_len,
+            SwaLRUSlot::has_value(pool.get(child_idx)),
+        );
+
+        // 4. Slice SWA value across the boundary if present. Tombstones
         // (no SWA value) leave both halves tombstoned — and bump_mru_split
         // is correctly SKIPPED in that case to preserve the
         // `in_list ⟺ value.is_some()` invariant that apply_swa_writes
@@ -518,7 +574,7 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         SwaLRUSlot::replace_value(pool, new_parent_idx, parent_part);
         SwaLRUSlot::replace_value(pool, child_idx, child_part);
 
-        // 4. Both halves now have SWA value; ensure both are in SWA's LRU.
+        // 5. Both halves now have SWA value; ensure both are in SWA's LRU.
         // Original child was already in SWA's LRU (had SWA value
         // pre-split); new parent is being added for the first time.
         // bump_mru_split handles both via bump_mru's in-list /
@@ -526,6 +582,47 @@ impl<K: ChildKeyType> Component<K> for SwaComponent {
         // (child more recent than parent — matches FULL's policy in
         // pool.split_node).
         SwaLRUSlot::bump_mru_split(pool, new_parent_idx, child_idx);
+    }
+}
+
+fn redistribute_host_swa_on_split<K: ChildKeyType>(
+    pool: &mut TreeNodePool<K>,
+    new_parent_idx: NodeIdx,
+    child_idx: NodeIdx,
+    split_len: usize,
+    device_swa_will_exist: bool,
+) {
+    let Some(host_swa) = HostSwaLRUSlot::value(pool.get(child_idx)) else {
+        return;
+    };
+    let host_swa = host_swa.shallow_clone();
+    let host_lock_ref = HostSwaLRUSlot::lock_ref(pool.get(child_idx));
+    let host_was_in_lru = HostSwaLRUSlot::data(pool.get(child_idx)).in_list;
+    let old_host_len = HostSwaLRUSlot::value_len(pool.get(child_idx));
+
+    if host_was_in_lru {
+        HostSwaLRUSlot::remove(pool, child_idx);
+        HostSwaLRUSlot::pool_state_mut(pool).unlocked_size -= old_host_len;
+    }
+
+    let total_len = host_swa.size()[0];
+    let split_len_i64 = split_len as i64;
+    debug_assert!(
+        split_len_i64 <= total_len,
+        "HostSWA split_len ({split_len_i64}) exceeds host value len ({total_len})",
+    );
+    let parent_part = host_swa.narrow(0, 0, split_len_i64);
+    let child_part = host_swa.narrow(0, split_len_i64, total_len - split_len_i64);
+
+    HostSwaLRUSlot::set_lock_ref(pool.get_mut(new_parent_idx), host_lock_ref);
+    HostSwaLRUSlot::replace_value(pool, new_parent_idx, parent_part);
+    HostSwaLRUSlot::replace_value(pool, child_idx, child_part);
+
+    if !device_swa_will_exist && host_lock_ref == 0 {
+        HostSwaLRUSlot::bump_mru_split(pool, new_parent_idx, child_idx);
+        let parent_len = HostSwaLRUSlot::value_len(pool.get(new_parent_idx));
+        let child_len = HostSwaLRUSlot::value_len(pool.get(child_idx));
+        HostSwaLRUSlot::pool_state_mut(pool).unlocked_size += parent_len + child_len;
     }
 }
 
@@ -550,21 +647,23 @@ pub struct SwaMatchValidator {
     sliding_window_size: usize,
     seen_tombstone: bool,
     current_match_len: usize,
+    match_device_only: bool,
 }
 
 impl SwaMatchValidator {
-    pub fn new(sliding_window_size: usize) -> Self {
+    pub fn new(sliding_window_size: usize, match_device_only: bool) -> Self {
         Self {
             sliding_window_size,
             seen_tombstone: false,
             current_match_len: 0,
+            match_device_only,
         }
     }
 }
 
 impl<K: ChildKeyType> MatchValidator<K> for SwaMatchValidator {
     fn validate(&mut self, n: &TreeNode<K>) -> bool {
-        if !SwaLRUSlot::has_value(n) {
+        if !SwaLRUSlot::has_value(n) && (self.match_device_only || !HostSwaLRUSlot::has_value(n)) {
             self.seen_tombstone = true;
             self.current_match_len = 0;
             return false;

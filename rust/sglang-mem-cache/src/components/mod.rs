@@ -111,7 +111,8 @@ pub trait Component<K: ChildKeyType>: Send {
     /// returns `None` because every node is a valid FULL boundary.
     /// Generalize this "skip unnecessary work" pattern to other
     /// per-component APIs as they grow.
-    fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>>;
+    fn create_match_validator(&self, match_device_only: bool)
+    -> Option<Box<dyn MatchValidator<K>>>;
 
     /// Per-component inc-lock walk. Walks from `node_idx` up the tree
     /// per the component's policy (FULL: to root excl.; SWA: until
@@ -230,6 +231,7 @@ pub trait Component<K: ChildKeyType>: Send {
         _prev_prefix_len: usize,
         _value_slice: &Tensor,
         _swa_evicted_seqlen: usize,
+        _full_had_value_at_entry: bool,
         _deferred: &mut Vec<DeferredAction>,
     ) -> Result<usize, RadixCacheRuntimeError> {
         Ok(node_key_len)

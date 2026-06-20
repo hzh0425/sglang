@@ -28,7 +28,10 @@ impl FullComponent {
 }
 
 impl<K: ChildKeyType> Component<K> for FullComponent {
-    fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>> {
+    fn create_match_validator(
+        &self,
+        _match_device_only: bool,
+    ) -> Option<Box<dyn MatchValidator<K>>> {
         // FULL has no boundary-gating logic — return `None` instead
         // of a wrapper that always says `true`. The orchestrator skips
         // the per-node `validate()` call (and the allocation) for any
@@ -139,6 +142,7 @@ impl<K: ChildKeyType> Component<K> for FullComponent {
         _prev_prefix_len: usize,
         value_slice: &Tensor,
         _swa_evicted_seqlen: usize,
+        _full_had_value_at_entry: bool,
         _deferred: &mut Vec<DeferredAction>,
     ) -> Result<usize, RadixCacheRuntimeError> {
         if FullLRUSlot::has_value(pool.get(child_idx)) {
@@ -153,9 +157,10 @@ impl<K: ChildKeyType> Component<K> for FullComponent {
         }
         // TODO(Jialin): fold set_value + bump_mru + unlocked_size credit into a
         // shared set_value(idx, value, update_lru) helper.
+        let value_len = value_slice.size()[0] as usize;
         FullLRUSlot::set_value(pool, child_idx, value_slice.shallow_clone())?;
         FullLRUSlot::bump_mru(pool, child_idx);
-        FullLRUSlot::pool_state_mut(pool).unlocked_size += node_key_len;
+        FullLRUSlot::pool_state_mut(pool).unlocked_size += value_len;
         Ok(0)
     }
 }

@@ -7,6 +7,7 @@ import time
 import unittest
 from array import array
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -336,6 +337,340 @@ def build_fixture(cfg: CacheConfig, *, enable_kv_cache_events: bool = False):
     return tree, allocator, req_to_token_pool
 
 
+class TestRustUnifiedRadixCacheLimit(CustomTestCase):
+    def test_match_prefix_respects_radix_key_limit(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1, device="cpu")
+        )
+        device = torch.device("cpu")
+        req_to_token_pool = ReqToTokenPool(
+            size=4,
+            max_context_len=32,
+            device=device,
+            enable_memory_saver=False,
+        )
+        kv_pool = MHATokenToKVPool(
+            size=64,
+            page_size=1,
+            dtype=torch.bfloat16,
+            head_num=2,
+            head_dim=64,
+            layer_num=2,
+            device=device,
+            enable_memory_saver=False,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=64,
+            dtype=torch.bfloat16,
+            device=device,
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        tree = RustUnifiedRadixCache(
+            CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+                eviction_policy="lru",
+            )
+        )
+
+        seq = array("q", [1, 2, 3, 4])
+        value = allocator.alloc(len(seq))
+        tree.insert(InsertParams(key=RadixKey(seq), value=value))
+
+        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq, limit=3)))
+
+        self.assertEqual(len(match.device_indices), 3)
+
+    def test_extract_mamba_value_uses_keep_slot(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        class FakePool:
+            def get_mamba_ping_pong_keep_idx(self, req):
+                return req.mamba_next_track_idx
+
+        class FakeReq:
+            mamba_pool_idx = torch.tensor(9, dtype=torch.int64)
+            mamba_next_track_idx = 0
+            mamba_last_track_seqlen = 64
+            mamba_ping_pong_track_buffer = torch.tensor([11, 22], dtype=torch.int64)
+            rid = "fake"
+
+        tree = RustUnifiedRadixCache.__new__(RustUnifiedRadixCache)
+        tree.mamba_cache_chunk_size = 64
+        tree.enable_mamba_extra_buffer = True
+        tree.req_to_token_pool = FakePool()
+
+        value, keep_idx = tree._extract_mamba_value(FakeReq())
+        self.assertEqual(keep_idx, 0)
+        self.assertEqual(value.item(), 11)
+
+    def test_cache_unfinished_req_donates_extra_buffer_mamba_slot(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        class FakeMambaAllocator:
+            def __init__(self):
+                self.freed = []
+
+            def free(self, value):
+                self.freed.append(value.clone())
+
+        class FakeReqToTokenPool:
+            def __init__(self):
+                self.req_to_token = torch.arange(64, dtype=torch.int64).unsqueeze(0)
+                self.mamba_allocator = FakeMambaAllocator()
+                self.donated = []
+
+            def get_mamba_ping_pong_keep_idx(self, req):
+                return 1 - req.mamba_next_track_idx
+
+            def donate_mamba_ping_pong_slot(self, req, new_slot):
+                keep_idx = self.get_mamba_ping_pong_keep_idx(req)
+                old_slot = req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
+                req.mamba_ping_pong_track_buffer[keep_idx] = new_slot[0]
+                self.donated.append((old_slot.clone(), new_slot.clone(), keep_idx))
+                return old_slot
+
+            def write(self, *_args, **_kwargs):
+                pass
+
+        class FakeReq:
+            req_pool_idx = 0
+            extra_key = None
+            cache_protected_len = 0
+            priority = 0
+            swa_evicted_seqlen = 0
+            last_node = 1
+            swa_uuid_for_lock = None
+            mamba_pool_idx = torch.tensor(9, dtype=torch.int64)
+            mamba_last_track_seqlen = 4
+            mamba_next_track_idx = 0
+            mamba_ping_pong_track_buffer = torch.tensor([11, 22], dtype=torch.int64)
+
+            def get_fill_ids(self):
+                return [1, 2, 3, 4, 5, 6]
+
+        tree = RustUnifiedRadixCache.__new__(RustUnifiedRadixCache)
+        tree.disable = False
+        tree.page_size = 1
+        tree.is_eagle = False
+        tree.enable_mamba_extra_buffer = True
+        tree.mamba_cache_chunk_size = 64
+        tree.req_to_token_pool = FakeReqToTokenPool()
+        tree._alloc_mamba_slot_for_cow = lambda: torch.tensor([33], dtype=torch.int64)
+        inserted = {}
+
+        def fake_insert(params):
+            inserted["mamba_value"] = params.mamba_value.clone()
+            return SimpleNamespace(mamba_exist=False)
+
+        tree.insert = fake_insert
+        tree.match_prefix = lambda _params: SimpleNamespace(
+            device_indices=torch.arange(4, dtype=torch.int64),
+            last_device_node=2,
+        )
+        tree.dec_lock_ref = lambda *_args, **_kwargs: None
+        tree.inc_lock_ref = lambda *_args, **_kwargs: SimpleNamespace(
+            swa_uuid_for_lock=None
+        )
+
+        req = FakeReq()
+        tree.cache_unfinished_req(req)
+
+        self.assertEqual(inserted["mamba_value"].item(), 22)
+        self.assertEqual(req.mamba_ping_pong_track_buffer.tolist(), [11, 33])
+        self.assertEqual(tree.req_to_token_pool.donated[0][2], 1)
+        self.assertEqual(len(tree.req_to_token_pool.mamba_allocator.freed), 0)
+
+    def test_rust_insert_actions_stamp_swa_before_write_through_backup(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        events = []
+
+        class FakeAllocator:
+            def translate_loc_from_full_to_swa(self, value):
+                events.append(("translate", value.tolist()))
+                return value + 1000
+
+            def free(self, _value):
+                pass
+
+        class FakeRustRadix:
+            def apply_swa_writes(self, node_indices, swa_values):
+                events.append(
+                    (
+                        "apply_swa",
+                        list(node_indices),
+                        [value.tolist() for value in swa_values],
+                    )
+                )
+
+        tree = RustUnifiedRadixCache.__new__(RustUnifiedRadixCache)
+        tree.token_to_kv_pool_allocator = FakeAllocator()
+        tree._rust_radix = FakeRustRadix()
+
+        def fake_write_backup(node_indices, device_values):
+            events.append(
+                (
+                    "write_backup",
+                    list(node_indices),
+                    [value.tolist() for value in device_values],
+                )
+            )
+
+        tree._write_backup = fake_write_backup
+        tree._process_insert_actions(
+            [
+                ("SwaStamp", 7, torch.tensor([1, 2], dtype=torch.int64)),
+                (
+                    "FullWriteThroughBackup",
+                    7,
+                    torch.tensor([11, 12], dtype=torch.int64),
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            [event[0] for event in events],
+            ["translate", "apply_swa", "write_backup"],
+        )
+
+    def test_rust_loadback_empty_host_indices_are_cpu(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        tree = RustUnifiedRadixCache.__new__(RustUnifiedRadixCache)
+        tree._empty_host_indices = torch.empty((0,), dtype=torch.int64, device="cpu")
+
+        if torch.cuda.is_available():
+            empty = torch.empty((0,), dtype=torch.int64, device="cuda")
+        else:
+            empty = torch.empty((0,), dtype=torch.int64, device="cpu")
+
+        normalized = tree._as_host_indices(empty)
+
+        self.assertEqual(normalized.device.type, "cpu")
+        self.assertEqual(normalized.dtype, torch.int64)
+        self.assertEqual(normalized.numel(), 0)
+
+    def test_rust_flush_write_through_acks_releases_backup_lock(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        class FakeEvent:
+            def query(self):
+                return True
+
+            def synchronize(self):
+                pass
+
+        class FakeAck:
+            finish_event = FakeEvent()
+            node_ids = [7]
+
+        class FakeController:
+            ack_write_queue = [FakeAck()]
+
+        class FakeRustRadix:
+            def __init__(self):
+                self.released = []
+
+            def dec_backup_lock_ref(self, node_id):
+                self.released.append(node_id)
+
+        tree = RustUnifiedRadixCache.__new__(RustUnifiedRadixCache)
+        tree.ongoing_write_through = {7: 7}
+        tree.cache_controller = FakeController()
+        tree._rust_radix = FakeRustRadix()
+        tree.pp_rank = 0
+        tree.tp_world_size = 1
+        tree.attn_cp_group = None
+        tree.attn_tp_group = None
+
+        tree.flush_write_through_acks()
+
+        self.assertEqual(tree._rust_radix.released, [7])
+        self.assertEqual(tree.ongoing_write_through, {})
+        self.assertEqual(tree.cache_controller.ack_write_queue, [])
+
+    def test_rust_eviction_drain_waits_for_load_ack(self):
+        try:
+            from sglang.srt.mem_cache.rust_unified_radix_cache import (
+                RustUnifiedRadixCache,
+            )
+        except ModuleNotFoundError as exc:
+            self.skipTest(str(exc))
+
+        class FakeEvent:
+            def __init__(self):
+                self.ready = False
+
+            def query(self):
+                return self.ready
+
+            def synchronize(self):
+                self.ready = True
+
+        class FakeAck:
+            def __init__(self):
+                self.finish_event = FakeEvent()
+                self.node_ids = [9]
+
+        class FakeController:
+            def __init__(self):
+                self.ack_write_queue = []
+                self.ack_load_queue = [FakeAck()]
+
+        tree = RustUnifiedRadixCache.__new__(RustUnifiedRadixCache)
+        tree.ongoing_write_through = {}
+        tree.ongoing_load_back = {9: ([1, 2], 9, [3], [4], True)}
+        tree.cache_controller = FakeController()
+        tree.pp_rank = 0
+        tree.tp_world_size = 1
+        tree.attn_cp_group = None
+        tree.attn_tp_group = None
+        tree.release_aux_host_locks = mock.Mock()
+        tree.finish_load_back = mock.Mock()
+
+        self.assertTrue(tree._drain_hicache_events_for_eviction())
+
+        self.assertEqual(tree.ongoing_load_back, {})
+        tree.release_aux_host_locks.assert_called_once_with([3], [4])
+        tree.finish_load_back.assert_called_once_with([1, 2], 9)
+
+
 class TestRustFullHiCacheUnit(CustomTestCase):
     """Focused Rust Full-only L2 transition tests."""
 
@@ -383,7 +718,7 @@ class TestRustFullHiCacheUnit(CustomTestCase):
         if lock_device:
             tree.set_host_full_values_and_lock_device(nodes, values)
             for node_idx in nodes:
-                tree.dec_lock_ref(node_idx, None)
+                tree.dec_backup_lock_ref(node_idx)
         elif nodes:
             tree.set_host_full_values(nodes, values)
         return nodes
@@ -479,6 +814,63 @@ class TestRustFullHiCacheUnit(CustomTestCase):
             leaf_node,
             "host eviction must skip an ancestor with a host-backed descendant",
         )
+
+    def test_rust_full_hicache_host_evict_restarts_for_parent(self):
+        tree = self._wrapper()
+        base = self._insert(tree, [1, 2], [10, 11])
+        self._backup_from_actions(tree, base.deferred_actions)
+        leaf_insert = self._insert(tree, [1, 2, 3, 4], [10, 11, 12, 13])
+        self._backup_from_actions(tree, leaf_insert.deferred_actions, host_start=120)
+
+        evict_host = tree.evict_host(4)
+        full_host_actions = [
+            action
+            for action in evict_host.deferred_actions
+            if action[0] == "FullHostEvict"
+        ]
+        self.assertEqual(len(full_host_actions), 2)
+        self.assertEqual(evict_host.evicted[int(ComponentType.FULL)], 4)
+
+        match = self._match(tree, [1, 2, 3, 4])
+        self.assertTrue(torch.equal(match.device_indices, torch.tensor([10, 11, 12, 13])))
+        self.assertEqual(match.host_only_length, 0)
+
+    def test_rust_full_hicache_host_evict_deletes_host_only_chain(self):
+        tree = self._wrapper()
+        base = self._insert(tree, [1, 2], [10, 11])
+        self._backup_from_actions(tree, base.deferred_actions)
+        leaf_insert = self._insert(tree, [1, 2, 3, 4], [10, 11, 12, 13])
+        self._backup_from_actions(tree, leaf_insert.deferred_actions, host_start=120)
+
+        evict_device = tree.evict([4, 0, 0])
+        self.assertEqual(
+            len(
+                [
+                    action
+                    for action in evict_device.deferred_actions
+                    if action[0] == "FullDeviceEvictOnBackedUp"
+                ]
+            ),
+            2,
+        )
+
+        evict_host = tree.evict_host(4)
+        self.assertEqual(
+            len(
+                [
+                    action
+                    for action in evict_host.deferred_actions
+                    if action[0] == "FullHostEvict"
+                ]
+            ),
+            2,
+        )
+
+        match = self._match(tree, [1, 2, 3, 4])
+        self.assertEqual(match.device_indices.numel(), 0)
+        self.assertEqual(match.host_only_length, 0)
+        self.assertEqual(match.last_device_node_idx, tree.default_root_idx())
+        self.assertEqual(match.last_host_node_idx, tree.default_root_idx())
 
     def test_rust_full_hicache_load_back_failure_releases_host_lock(self):
         tree = self._wrapper()
@@ -3281,7 +3673,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(result.host_hit_length, 0)
         self.assertEqual(result.swa_host_hit_length, len(leaf.key))
 
-    def test_mamba_branching_seqlen_disabled_under_hicache(self):
+    def test_mamba_branching_seqlen_skipped_under_hicache(self):
         if not self.cfg.has_mamba or self.cfg.has_swa or self.cfg.page_size != 1:
             self.skipTest("requires page_size=1 Full+Mamba")
         tree, allocator, req_to_token_pool = build_fixture(self.cfg)

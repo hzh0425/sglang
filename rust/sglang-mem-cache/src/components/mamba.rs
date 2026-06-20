@@ -3,7 +3,9 @@
 use super::{Component, IncLockRefResult, MatchValidator};
 use crate::component_type::ComponentType;
 use crate::error::RadixCacheInitError;
-use crate::tree_node_lru::{EvictRequest, EvictResult, LRUSlot, MambaLRUSlot, evict_non_full};
+use crate::tree_node_lru::{
+    EvictRequest, EvictResult, HostMambaLRUSlot, LRUSlot, MambaLRUSlot, evict_non_full,
+};
 use crate::tree_node_pool::{ChildKeyType, NodeIdx, TreeNode, TreeNodePool};
 
 /// Per-component shell that hosts Mamba-specific radix-tree logic.
@@ -15,11 +17,13 @@ pub struct MambaComponent {
 }
 
 /// Per-walk Mamba validator: approve iff the node has a Mamba value.
-pub struct MambaMatchValidator;
+pub struct MambaMatchValidator {
+    match_device_only: bool,
+}
 
 impl<K: ChildKeyType> MatchValidator<K> for MambaMatchValidator {
     fn validate(&mut self, n: &TreeNode<K>) -> bool {
-        MambaLRUSlot::has_value(n)
+        MambaLRUSlot::has_value(n) || (!self.match_device_only && HostMambaLRUSlot::has_value(n))
     }
 }
 
@@ -41,8 +45,11 @@ impl MambaComponent {
 }
 
 impl<K: ChildKeyType> Component<K> for MambaComponent {
-    fn create_match_validator(&self) -> Option<Box<dyn MatchValidator<K>>> {
-        Some(Box::new(MambaMatchValidator))
+    fn create_match_validator(
+        &self,
+        match_device_only: bool,
+    ) -> Option<Box<dyn MatchValidator<K>>> {
+        Some(Box::new(MambaMatchValidator { match_device_only }))
     }
 
     /// Single-node update: bump Mamba's `lock_ref` only if the node
