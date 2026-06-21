@@ -560,47 +560,61 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        result = self.session.try_match_prefix(params)
-        if result is not None:
-            return result
+        start_time = time.perf_counter()
+        tokens = len(params.key)
+        try:
+            result = self.session.try_match_prefix(params)
+            if result is not None:
+                return result
 
-        key = params.key
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        if self.disable or len(key) == 0:
-            return self._empty_match_result
-        key = key.page_aligned(self.page_size)
-        if len(key) == 0:
-            return self._empty_match_result
+            key = params.key
+            key, _ = key.maybe_to_bigram_view(self.is_eagle)
+            if self.disable or len(key) == 0:
+                return self._empty_match_result
+            key = key.page_aligned(self.page_size)
+            tokens = len(key)
+            if len(key) == 0:
+                return self._empty_match_result
 
-        (
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-        ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
-            params,
-            value,
-            best_match_node,
-            best_match_device_node,
-            best_match_device_value_len,
-        )
+            (
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+            ) = self._match_prefix_helper(key)
+            return self._match_post_processor(
+                params,
+                value,
+                best_match_node,
+                best_match_device_node,
+                best_match_device_value_len,
+            )
+        finally:
+            self._record_tree_perf(
+                "match_prefix", time.perf_counter() - start_time, tokens
+            )
 
     def insert(self, params: InsertParams) -> InsertResult:
-        if self.disable:
-            return InsertResult(prefix_len=0)
+        start_time = time.perf_counter()
+        tokens = len(params.key) if params.key is not None else 0
+        try:
+            if self.disable:
+                return InsertResult(prefix_len=0)
 
-        key = params.key
-        value = params.value
-        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
-        key = key.page_aligned(self.page_size)
-        if value is not None:
-            value = value[: len(key)]
-        else:
-            value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
+            key = params.key
+            value = params.value
+            key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+            key = key.page_aligned(self.page_size)
+            tokens = len(key)
+            if value is not None:
+                value = value[: len(key)]
+            else:
+                value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        result = self._insert_helper(self.root_node, key, value, params)
-        return result
+            result = self._insert_helper(self.root_node, key, value, params)
+            return result
+        finally:
+            self._record_tree_perf("insert", time.perf_counter() - start_time, tokens)
 
     def evict(self, params: EvictParams) -> EvictResult:
         if self.disable:
@@ -676,10 +690,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return DecLockRefResult()
 
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+        start_time = time.perf_counter()
+        tokens = 0
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
         kv_committed_len = req.pop_committed_kv_cache()
+        tokens = kv_committed_len
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -748,12 +765,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
             )
+        self._record_tree_perf(
+            "cache_finished_req", time.perf_counter() - start_time, tokens
+        )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
+        start_time = time.perf_counter()
+        tokens = 0
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
         token_ids = req.get_fill_ids()
+        tokens = len(token_ids)
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -852,6 +875,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+        self._record_tree_perf(
+            "cache_unfinished_req", time.perf_counter() - start_time, tokens
+        )
 
     # ---- Internal Helpers ----
 

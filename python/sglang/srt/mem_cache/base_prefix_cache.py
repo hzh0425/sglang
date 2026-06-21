@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import (
@@ -14,6 +16,8 @@ from typing import (
 )
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -213,6 +217,68 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
+
+    def _tree_perf_trace_enabled(self) -> bool:
+        return os.environ.get("SGLANG_TREE_PERF_TRACE", "") == "1"
+
+    def _record_tree_perf(
+        self, op: str, elapsed: float, tokens: int = 0, force: bool = False
+    ) -> None:
+        if not self._tree_perf_trace_enabled():
+            return
+
+        if not hasattr(self, "_tree_perf_trace_state"):
+            self._tree_perf_trace_state = {
+                "last_log": time.perf_counter(),
+                "ops": {},
+            }
+
+        state = self._tree_perf_trace_state
+        stats = state["ops"].setdefault(
+            op,
+            {
+                "calls": 0,
+                "seconds": 0.0,
+                "tokens": 0,
+                "max_seconds": 0.0,
+                "max_tokens": 0,
+            },
+        )
+        stats["calls"] += 1
+        stats["seconds"] += elapsed
+        stats["tokens"] += tokens
+        stats["max_seconds"] = max(stats["max_seconds"], elapsed)
+        stats["max_tokens"] = max(stats["max_tokens"], tokens)
+
+        now = time.perf_counter()
+        interval = float(os.environ.get("SGLANG_TREE_PERF_TRACE_INTERVAL", "30"))
+        if not force and now < state["last_log"] + interval:
+            return
+
+        state["last_log"] = now
+        for name, values in sorted(state["ops"].items()):
+            calls = values["calls"]
+            if calls == 0:
+                continue
+            total_ms = values["seconds"] * 1000
+            avg_us = values["seconds"] / calls * 1e6
+            tokens_total = values["tokens"]
+            ns_per_token = (
+                values["seconds"] / tokens_total * 1e9 if tokens_total > 0 else 0.0
+            )
+            logger.info(
+                "tree_perf cache=%s op=%s calls=%d total_ms=%.3f avg_us=%.3f "
+                "max_ms=%.3f tokens=%d max_tokens=%d ns_per_token=%.3f",
+                self.__class__.__name__,
+                name,
+                calls,
+                total_ms,
+                avg_us,
+                values["max_seconds"] * 1000,
+                tokens_total,
+                values["max_tokens"],
+                ns_per_token,
+            )
 
     def init_metrics_collector(self):
         from sglang.srt.server_args import get_global_server_args

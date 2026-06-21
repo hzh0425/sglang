@@ -619,53 +619,61 @@ class RustUnifiedRadixCache(BasePrefixCache):
     # ----- BasePrefixCache contract: lookup / insert / evict -----
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        if params.cow_mamba and not self.supports_mamba():
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache: MatchPrefixParams.cow_mamba=True requires "
-                "Mamba configuration (HybridReqToTokenPool)"
+        start_time = time.perf_counter()
+        tokens = len(params.key)
+        try:
+            if params.cow_mamba and not self.supports_mamba():
+                raise RadixCacheInfraPyError(
+                    "RustUnifiedRadixCache: MatchPrefixParams.cow_mamba=True requires "
+                    "Mamba configuration (HybridReqToTokenPool)"
+                )
+
+            if self.disable:
+                # Disabled cache: skip Rust entirely. `None` signals "nothing to
+                # lock" so inc/dec_lock_ref short-circuit. This is the only path
+                # that produces a `None` last-node — every other path passes
+                # through Rust's idx (which may be a namespace root for empty
+                # keys / no-match cases, where lock-ref ops are documented no-ops).
+                return self._empty_match_result()
+
+            token_ids = params.key.raw_token_ids()
+            tokens = len(token_ids)
+            rust_result = self._rust_radix.match_prefix(token_ids, params.key.extra_key)
+            if getattr(self, "_debug_trace", False):
+                logger.info(
+                    "rust_urt_debug match key=%s device=%s host=%s swa_host=%s mamba_host=%s "
+                    "last_device=%s last_host=%s best=%s",
+                    self._debug_key(token_ids),
+                    len(rust_result.device_indices),
+                    rust_result.host_only_length,
+                    rust_result.swa_host_hit_length,
+                    rust_result.mamba_host_hit_length,
+                    rust_result.last_device_node_idx,
+                    rust_result.last_host_node_idx,
+                    rust_result.best_match_node_idx,
+                )
+
+            # Mamba CoW: copy the SSM state of matched node to callers so
+            # they could directly manipulate it freely.
+            if params.cow_mamba and rust_result.mamba_value is not None:
+                self._copy_on_write_mamba(
+                    params.req, rust_result.last_device_node_idx, rust_result.mamba_value
+                )
+
+            return MatchResult(
+                device_indices=rust_result.device_indices,
+                last_device_node=rust_result.last_device_node_idx,
+                last_host_node=rust_result.last_host_node_idx,
+                best_match_node=rust_result.best_match_node_idx,
+                host_hit_length=rust_result.host_only_length,
+                swa_host_hit_length=rust_result.swa_host_hit_length,
+                mamba_host_hit_length=rust_result.mamba_host_hit_length,
+                mamba_branching_seqlen=rust_result.mamba_branching_seqlen,
             )
-
-        if self.disable:
-            # Disabled cache: skip Rust entirely. `None` signals "nothing to
-            # lock" so inc/dec_lock_ref short-circuit. This is the only path
-            # that produces a `None` last-node — every other path passes
-            # through Rust's idx (which may be a namespace root for empty
-            # keys / no-match cases, where lock-ref ops are documented no-ops).
-            return self._empty_match_result()
-
-        token_ids = params.key.raw_token_ids()
-        rust_result = self._rust_radix.match_prefix(token_ids, params.key.extra_key)
-        if getattr(self, "_debug_trace", False):
-            logger.info(
-                "rust_urt_debug match key=%s device=%s host=%s swa_host=%s mamba_host=%s "
-                "last_device=%s last_host=%s best=%s",
-                self._debug_key(token_ids),
-                len(rust_result.device_indices),
-                rust_result.host_only_length,
-                rust_result.swa_host_hit_length,
-                rust_result.mamba_host_hit_length,
-                rust_result.last_device_node_idx,
-                rust_result.last_host_node_idx,
-                rust_result.best_match_node_idx,
+        finally:
+            self._record_tree_perf(
+                "match_prefix", time.perf_counter() - start_time, tokens
             )
-
-        # Mamba CoW: copy the SSM state of matched node to callers so
-        # they could directly manipulate it freely.
-        if params.cow_mamba and rust_result.mamba_value is not None:
-            self._copy_on_write_mamba(
-                params.req, rust_result.last_device_node_idx, rust_result.mamba_value
-            )
-
-        return MatchResult(
-            device_indices=rust_result.device_indices,
-            last_device_node=rust_result.last_device_node_idx,
-            last_host_node=rust_result.last_host_node_idx,
-            best_match_node=rust_result.best_match_node_idx,
-            host_hit_length=rust_result.host_only_length,
-            swa_host_hit_length=rust_result.swa_host_hit_length,
-            mamba_host_hit_length=rust_result.mamba_host_hit_length,
-            mamba_branching_seqlen=rust_result.mamba_branching_seqlen,
-        )
 
     def _extract_mamba_value(
         self, req: "Req"
@@ -758,85 +766,93 @@ class RustUnifiedRadixCache(BasePrefixCache):
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
-        if params.mamba_value is not None and not self.supports_mamba():
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache: InsertParams.mamba_value requires Mamba "
-                "configuration (HybridReqToTokenPool)"
-            )
-        if params.priority != 0:
-            raise RadixCacheInfraPyError(
-                "RustUnifiedRadixCache: InsertParams.priority != 0 not supported (LRU only)"
-            )
-        # `params.chunked` only affects Python's hit_count, which LRU never
-        # reads — silently ignored.
+        start_time = time.perf_counter()
+        tokens = len(params.key) if params.key is not None else 0
+        try:
+            if params.mamba_value is not None and not self.supports_mamba():
+                raise RadixCacheInfraPyError(
+                    "RustUnifiedRadixCache: InsertParams.mamba_value requires Mamba "
+                    "configuration (HybridReqToTokenPool)"
+                )
+            if params.priority != 0:
+                raise RadixCacheInfraPyError(
+                    "RustUnifiedRadixCache: InsertParams.priority != 0 not supported (LRU only)"
+                )
+            # `params.chunked` only affects Python's hit_count, which LRU never
+            # reads — silently ignored.
 
-        if self.disable:
-            return InsertResult(prefix_len=0, mamba_exist=False)
+            if self.disable:
+                return InsertResult(prefix_len=0, mamba_exist=False)
 
-        key = params.key
-        value = params.value
-        if value is None:
-            value = torch.tensor(key.raw_token_ids(), dtype=torch.int64, device=self.device)
+            key = params.key
+            value = params.value
+            if value is None:
+                value = torch.tensor(
+                    key.raw_token_ids(), dtype=torch.int64, device=self.device
+                )
 
-        # Normalize the key's `is_bigram` to match `self.is_eagle` at the
-        # orchestrator boundary, mirroring OSS `RadixCache.insert` /
-        # `SWARadixCache.insert`. Defensive against an external caller
-        # passing `RadixKey(is_bigram=False)` to an `is_eagle=True`
-        # orchestrator (or vice versa) — without this, downstream
-        # `page_aligned(...)` + `len(aligned_key)` math would silently
-        # disagree with the Rust wrapper's bigram-pair-count and corrupt
-        # `prefix_len` accounting. Idempotent when the caller already
-        # set `is_bigram=self.is_eagle` (the `cache_*_req` path).
-        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
+            # Normalize the key's `is_bigram` to match `self.is_eagle` at the
+            # orchestrator boundary, mirroring OSS `RadixCache.insert` /
+            # `SWARadixCache.insert`. Defensive against an external caller
+            # passing `RadixKey(is_bigram=False)` to an `is_eagle=True`
+            # orchestrator (or vice versa) — without this, downstream
+            # `page_aligned(...)` + `len(aligned_key)` math would silently
+            # disagree with the Rust wrapper's bigram-pair-count and corrupt
+            # `prefix_len` accounting. Idempotent when the caller already
+            # set `is_bigram=self.is_eagle` (the `cache_*_req` path).
+            key, value = key.maybe_to_bigram_view(self.is_eagle, value)
 
-        # Orchestrator owns page-alignment in atom units. Delegate to
-        # `RadixKey.page_aligned`, which is bigram-aware via the key's
-        # (now-normalized) `is_bigram` flag.
-        # `len(aligned_key)` is the atom count (= N-1 for is_bigram=True,
-        # N otherwise); we slice `value` to that length so the cache's
-        # value-length invariant holds at the atom granularity. The trim
-        # is idempotent: callers that pre-align hit a no-op here.
-        #
-        # TODO(future PR): make the Rust wrapper / cache layer reject
-        # non-aligned keys with a typed error instead of silently
-        # trimming. Today `PageAlignedQueryKey::new` does an internal
-        # `key.len() / ps * ps` trim — a contract-violation safety net
-        # rather than an explicit invariant.
-        aligned_key = key.page_aligned(self.page_size)
-        atom_count = len(aligned_key)
-        token_ids = aligned_key.token_ids
-        # Trim value to atom_count. If the caller passed a shorter value
-        # the slice returns the original (still-too-short) tensor; the
-        # Rust cache layer catches it via `validate_insert_value` →
-        # `RadixCacheRuntimePyError::InsertValueTooShort`, so we don't
-        # duplicate the check here.
-        value = value[:atom_count] if atom_count > 0 else value
+            # Orchestrator owns page-alignment in atom units. Delegate to
+            # `RadixKey.page_aligned`, which is bigram-aware via the key's
+            # (now-normalized) `is_bigram` flag.
+            # `len(aligned_key)` is the atom count (= N-1 for is_bigram=True,
+            # N otherwise); we slice `value` to that length so the cache's
+            # value-length invariant holds at the atom granularity. The trim
+            # is idempotent: callers that pre-align hit a no-op here.
+            #
+            # TODO(future PR): make the Rust wrapper / cache layer reject
+            # non-aligned keys with a typed error instead of silently
+            # trimming. Today `PageAlignedQueryKey::new` does an internal
+            # `key.len() / ps * ps` trim — a contract-violation safety net
+            # rather than an explicit invariant.
+            aligned_key = key.page_aligned(self.page_size)
+            atom_count = len(aligned_key)
+            tokens = atom_count
+            token_ids = aligned_key.token_ids
+            # Trim value to atom_count. If the caller passed a shorter value
+            # the slice returns the original (still-too-short) tensor; the
+            # Rust cache layer catches it via `validate_insert_value` →
+            # `RadixCacheRuntimePyError::InsertValueTooShort`, so we don't
+            # duplicate the check here.
+            value = value[:atom_count] if atom_count > 0 else value
 
-        rust_result = self._rust_radix.insert(
-            token_ids,
-            value,
-            aligned_key.extra_key,
-            params.prev_prefix_len,
-            params.swa_evicted_seqlen,
-            params.mamba_value,
-        )
-        if getattr(self, "_debug_trace", False):
-            logger.info(
-                "rust_urt_debug insert key=%s atom=%s prefix=%s prev=%s swa_evict=%s "
-                "actions=%s mamba_exists=%s",
-                self._debug_key(token_ids),
-                atom_count,
-                rust_result.prefix_len,
+            rust_result = self._rust_radix.insert(
+                token_ids,
+                value,
+                aligned_key.extra_key,
                 params.prev_prefix_len,
                 params.swa_evicted_seqlen,
-                [action[0] for action in rust_result.deferred_actions],
-                rust_result.mamba_value_exists,
+                params.mamba_value,
             )
-        self._process_insert_actions(rust_result.deferred_actions)
-        return InsertResult(
-            prefix_len=rust_result.prefix_len,
-            mamba_exist=rust_result.mamba_value_exists,
-        )
+            if getattr(self, "_debug_trace", False):
+                logger.info(
+                    "rust_urt_debug insert key=%s atom=%s prefix=%s prev=%s swa_evict=%s "
+                    "actions=%s mamba_exists=%s",
+                    self._debug_key(token_ids),
+                    atom_count,
+                    rust_result.prefix_len,
+                    params.prev_prefix_len,
+                    params.swa_evicted_seqlen,
+                    [action[0] for action in rust_result.deferred_actions],
+                    rust_result.mamba_value_exists,
+                )
+            self._process_insert_actions(rust_result.deferred_actions)
+            return InsertResult(
+                prefix_len=rust_result.prefix_len,
+                mamba_exist=rust_result.mamba_value_exists,
+            )
+        finally:
+            self._record_tree_perf("insert", time.perf_counter() - start_time, tokens)
 
     def _process_insert_actions(self, deferred_actions: list[tuple]) -> None:
         """Apply the insert-path emitted actions in the orchestration layer."""
@@ -1184,10 +1200,13 @@ class RustUnifiedRadixCache(BasePrefixCache):
         path frees everything; the inserting path inserts the page-aligned
         prefix and frees only the duplicate slots that the tree already owned.
         """
+        start_time = time.perf_counter()
+        tokens = 0
         if self.disable_finished_insert:
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
+        tokens = kv_committed_len
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -1281,12 +1300,18 @@ class RustUnifiedRadixCache(BasePrefixCache):
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
         )
+        self._record_tree_perf(
+            "cache_finished_req", time.perf_counter() - start_time, tokens
+        )
 
     def cache_unfinished_req(self, req: "Req", chunked: bool = False, **kwargs) -> None:
+        start_time = time.perf_counter()
+        tokens = 0
         if self.disable:
             return
 
         token_ids = req.get_fill_ids()
+        tokens = len(token_ids)
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
@@ -1408,6 +1433,9 @@ class RustUnifiedRadixCache(BasePrefixCache):
         # progress instead of reusing a stale boundary.
         if self.supports_mamba():
             req.mamba_last_track_seqlen = None
+        self._record_tree_perf(
+            "cache_unfinished_req", time.perf_counter() - start_time, tokens
+        )
 
     # ----- HiCache: OSS-identical bodies -----
     # TODO(Jialin): introduce HiCacheMixin in OSS for consolidation.
