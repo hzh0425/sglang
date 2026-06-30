@@ -53,6 +53,7 @@ class _FakeFullComponent(TreeComponent):
 class _RecordingExternalCacheController(BaseExternalCacheController):
     def __init__(self):
         self.calls = []
+        self.node_observations = []
         self.tree_ops = []
         self.reset_count = 0
         self.shutdown_count = 0
@@ -61,6 +62,13 @@ class _RecordingExternalCacheController(BaseExternalCacheController):
         self, request: BackupRequest, tree_ops: ExternalCacheTreeOps
     ) -> BackupResult:
         self.calls.append(("write_backup", request))
+        self.node_observations.append(
+            (
+                request.node_id,
+                tree_ops.contains_node(request.node_id),
+                tree_ops.get_node_token_count(request.node_id),
+            )
+        )
         self.tree_ops.append(tree_ops)
         return BackupResult(backed_up_tokens=11)
 
@@ -68,6 +76,13 @@ class _RecordingExternalCacheController(BaseExternalCacheController):
         self, request: LoadBackRequest, tree_ops: ExternalCacheTreeOps
     ) -> LoadBackResult:
         self.calls.append(("load_back", request))
+        self.node_observations.append(
+            (
+                request.node_id,
+                tree_ops.contains_node(request.node_id),
+                tree_ops.get_node_token_count(request.node_id),
+            )
+        )
         self.tree_ops.append(tree_ops)
         return LoadBackResult(loaded=True)
 
@@ -162,10 +177,34 @@ class TestExternalCacheController(CustomTestCase):
                 ("poll", False),
             ],
         )
+        self.assertEqual(
+            controller.node_observations,
+            [
+                (tree.root_node.id, True, 0),
+                (tree.root_node.id, True, 0),
+            ],
+        )
         self.assertTrue(controller.tree_ops)
         for tree_ops in controller.tree_ops:
             self.assertIsNot(tree_ops, tree)
             self.assertNotIsInstance(tree_ops, UnifiedTreeNode)
+
+    def test_tree_ops_resolves_nodes_by_id_without_returning_nodes(self):
+        tree = _build_tree()
+        child = UnifiedTreeNode((ComponentType.FULL,))
+        child.parent = tree.root_node
+        child.component_data[ComponentType.FULL].value = [1, 2, 3]
+        tree.root_node.children[0] = child
+
+        tree_ops = tree.external_cache_tree_ops
+
+        self.assertIsInstance(tree_ops, ExternalCacheTreeOps)
+        self.assertTrue(tree_ops.contains_node(tree.root_node.id))
+        self.assertTrue(tree_ops.contains_node(child.id))
+        self.assertEqual(tree_ops.get_node_token_count(child.id), 3)
+        self.assertFalse(tree_ops.contains_node(-1))
+        with self.assertRaises(KeyError):
+            tree_ops.get_node_token_count(-1)
 
 
 if __name__ == "__main__":

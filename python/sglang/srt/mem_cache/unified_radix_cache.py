@@ -309,8 +309,33 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class _EmptyExternalCacheTreeOps:
-    pass
+class _UnifiedExternalCacheTreeOps:
+    def __init__(self, cache: "UnifiedRadixCache"):
+        self._cache = cache
+
+    def contains_node(self, node_id: int) -> bool:
+        return self._find_node(node_id) is not None
+
+    def get_node_token_count(self, node_id: int) -> int:
+        node = self._get_node(node_id)
+        data = node.component_data[BASE_COMPONENT_TYPE]
+        value = data.value if data.value is not None else data.host_value
+        return 0 if value is None else len(value)
+
+    def _get_node(self, node_id: int) -> UnifiedTreeNode:
+        node = self._find_node(node_id)
+        if node is None:
+            raise KeyError(f"Unknown unified radix node id {node_id}")
+        return node
+
+    def _find_node(self, node_id: int) -> Optional[UnifiedTreeNode]:
+        stack = [self._cache.root_node]
+        while stack:
+            node = stack.pop()
+            if node.id == node_id:
+                return node
+            stack.extend(node.children.values())
+        return None
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
@@ -381,7 +406,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.external_cache_controller: BaseExternalCacheController = (
             NoopExternalCacheController()
         )
-        self.external_cache_tree_ops: ExternalCacheTreeOps = _EmptyExternalCacheTreeOps()
+        self.external_cache_tree_ops: ExternalCacheTreeOps = (
+            _UnifiedExternalCacheTreeOps(self)
+        )
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256

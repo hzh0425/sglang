@@ -39,7 +39,11 @@ class ExternalCacheProgress:
 
 @runtime_checkable
 class ExternalCacheTreeOps(Protocol):
-    pass
+    def contains_node(self, node_id: int) -> bool:
+        ...
+
+    def get_node_token_count(self, node_id: int) -> int:
+        ...
 
 
 class BaseExternalCacheController(ABC):
