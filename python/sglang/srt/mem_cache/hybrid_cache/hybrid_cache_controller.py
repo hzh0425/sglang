@@ -565,6 +565,9 @@ class HybridCacheController(BaseHiCacheController):
         )
         return producer_id
 
+    def begin_pending_loads(self) -> int:
+        return self.start_loading()
+
     def _record_transfer_indices_on_stream(
         self,
         stream: torch.Stream,

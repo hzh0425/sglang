@@ -194,6 +194,15 @@ class TestExternalCacheController(CustomTestCase):
             self.assertIsNot(tree_ops, tree)
             self.assertNotIsInstance(tree_ops, UnifiedTreeNode)
 
+    def test_ready_to_load_uses_hybrid_controller_begin_pending_loads(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        controller.begin_pending_loads = mock.Mock(return_value=23)
+        tree.cache_controller = controller
+
+        self.assertEqual(tree.ready_to_load_host_cache(), 23)
+        controller.begin_pending_loads.assert_called_once_with()
+
     def test_tree_ops_resolves_nodes_by_id_without_returning_nodes(self):
         tree = _build_tree()
         child = UnifiedTreeNode((ComponentType.FULL,))

@@ -2621,7 +2621,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self._uses_external_cache_controller():
             return self.external_cache_controller.begin_pending_loads()
         if self.cache_controller is not None:
-            return self.cache_controller.start_loading()
+            return self.cache_controller.begin_pending_loads()
         return 0
 
     # ---- Query / Inspection APIs ----
