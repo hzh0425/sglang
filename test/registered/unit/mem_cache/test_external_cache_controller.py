@@ -1,5 +1,6 @@
 import dataclasses
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -118,6 +119,10 @@ class _RecordingExternalCacheController(BaseExternalCacheController):
 
 
 def _build_tree() -> UnifiedRadixCache:
+    return UnifiedRadixCache(params=_build_params())
+
+
+def _build_params() -> CacheInitParams:
     params = CacheInitParams(
         req_to_token_pool=ReqToTokenPool(
             size=2,
@@ -131,7 +136,7 @@ def _build_tree() -> UnifiedRadixCache:
         tree_components=(ComponentType.FULL,),
         component_registry_override={ComponentType.FULL: _FakeFullComponent},
     )
-    return UnifiedRadixCache(params=params)
+    return params
 
 
 class TestExternalCacheController(CustomTestCase):
@@ -236,56 +241,72 @@ class TestExternalCacheController(CustomTestCase):
         controller = object.__new__(HybridCacheController)
         controller.begin_pending_loads = mock.Mock(return_value=23)
         tree.cache_controller = controller
+        tree.external_cache_controller = controller
 
         self.assertEqual(tree.ready_to_load_host_cache(), 23)
         controller.begin_pending_loads.assert_called_once_with()
 
-    def test_hybrid_controller_poll_uses_private_tree_ops_bridge(self):
+    def test_hybrid_controller_poll_drains_controller_owned_paths(self):
         controller = object.__new__(HybridCacheController)
+        controller.enable_storage = True
+        controller._poll_write_acks = mock.Mock(return_value=1)
+        controller._poll_load_acks = mock.Mock(return_value=2)
+        controller._drain_storage_control_queues = mock.Mock(return_value=3)
+        tree = _build_tree()
 
-        class _TreeOps:
-            def __init__(self):
-                self.calls = []
+        progress = controller.poll(tree.external_cache_tree_ops, wait=False)
 
-            def poll_cache_events(self, controller_arg, *, wait: bool = False):
-                self.calls.append((controller_arg, wait))
-                return ExternalCacheProgress(completed_writes=2)
+        self.assertEqual(progress.completed_writes, 1)
+        self.assertEqual(progress.completed_loads, 2)
+        self.assertEqual(progress.completed_storage_ops, 3)
+        controller._poll_write_acks.assert_called_once_with(tree)
+        controller._poll_load_acks.assert_called_once_with(tree)
+        controller._drain_storage_control_queues.assert_called_once_with(tree)
 
-        tree_ops = _TreeOps()
+    def test_init_hicache_registers_hybrid_as_external_controller(self):
+        params = _build_params()
+        tree = UnifiedRadixCache(params=params)
+        controller = object.__new__(HybridCacheController)
+        controller.write_backup = mock.Mock(return_value=BackupResult(backed_up_tokens=5))
+        controller.load_back = mock.Mock(return_value=LoadBackResult(loaded=True))
+        controller.begin_pending_loads = mock.Mock(return_value=9)
 
-        progress = controller.poll(tree_ops, wait=True)
+        server_args = SimpleNamespace(
+            hicache_io_backend="",
+            hicache_mem_layout="",
+            extra_metric_labels=None,
+            hicache_storage_backend=None,
+            hicache_storage_backend_extra_config=None,
+            hicache_write_policy="write_through",
+            hicache_storage_prefetch_policy="best_effort",
+        )
 
-        self.assertEqual(progress.completed_writes, 2)
-        self.assertEqual(tree_ops.calls, [(controller, True)])
+        with mock.patch(
+            "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache",
+            side_effect=lambda cache, *args, **kwargs: setattr(
+                cache, "cache_controller", controller
+            ),
+        ):
+            tree.init_hicache(server_args, params)
+
+        self.assertIs(tree.external_cache_controller, controller)
+        self.assertIs(controller._active_cache, tree)
+        self.assertEqual(tree.write_backup(tree.root_node, write_back=True), 5)
+        self.assertTrue(tree.load_back(tree.root_node, mem_quota=1))
+        self.assertEqual(tree.ready_to_load_host_cache(), 9)
+        controller.write_backup.assert_called_once()
+        controller.load_back.assert_called_once()
 
     def test_check_hicache_events_uses_hybrid_controller_poll(self):
         tree = _build_tree()
         controller = object.__new__(HybridCacheController)
         controller.poll = mock.Mock(return_value=ExternalCacheProgress())
         tree.cache_controller = controller
+        tree.external_cache_controller = controller
 
         tree.check_hicache_events()
 
         controller.poll.assert_called_once_with(tree.external_cache_tree_ops)
-
-    def test_private_hicache_poll_drains_existing_event_paths(self):
-        tree = _build_tree()
-        controller = object.__new__(HybridCacheController)
-        tree.enable_storage = True
-
-        with (
-            mock.patch.object(tree, "writing_check") as writing_check,
-            mock.patch.object(tree, "loading_check") as loading_check,
-            mock.patch.object(
-                tree, "drain_storage_control_queues"
-            ) as drain_storage,
-        ):
-            progress = tree._poll_hicache_controller_events(controller)
-
-        self.assertEqual(progress, ExternalCacheProgress())
-        writing_check.assert_called_once_with()
-        loading_check.assert_called_once_with()
-        drain_storage.assert_called_once_with()
 
     def test_tree_ops_resolves_nodes_by_id_without_returning_nodes(self):
         tree = _build_tree()
@@ -314,16 +335,13 @@ class TestExternalCacheController(CustomTestCase):
         controller.ongoing_prefetch = {}
         tree.cache_controller = controller
 
-        self.assertIs(tree.ongoing_write_through, controller.ongoing_write_through)
-        self.assertIs(tree.ongoing_load_back, controller.ongoing_load_back)
-        self.assertIs(tree.ongoing_backup, controller.ongoing_backup)
-        self.assertIs(
-            tree.prefetch_loaded_tokens_by_reqid,
-            controller.prefetch_loaded_tokens_by_reqid,
-        )
-        self.assertIs(tree.ongoing_prefetch, controller.ongoing_prefetch)
+        self.assertFalse(hasattr(tree, "ongoing_write_through"))
+        self.assertFalse(hasattr(tree, "ongoing_load_back"))
+        self.assertFalse(hasattr(tree, "ongoing_backup"))
+        self.assertFalse(hasattr(tree, "prefetch_loaded_tokens_by_reqid"))
+        self.assertFalse(hasattr(tree, "ongoing_prefetch"))
 
-        tree._track_write_through_node(tree.root_node, None)
+        controller.track_write_through_node(tree.root_node, None)
 
         pending = controller.ongoing_write_through[tree.root_node.id]
         self.assertIs(pending.node, tree.root_node)
@@ -335,7 +353,7 @@ class TestExternalCacheController(CustomTestCase):
 
         left = UnifiedTreeNode((ComponentType.FULL,))
         right = UnifiedTreeNode((ComponentType.FULL,))
-        tree._replace_pending_write_through_node(tree.root_node, [left, right])
+        controller.replace_pending_write_through_node(tree.root_node, [left, right])
 
         updated = controller.ongoing_write_through[tree.root_node.id]
         self.assertEqual(updated.publish_nodes, [left, right])
@@ -351,15 +369,15 @@ class TestExternalCacheController(CustomTestCase):
         tree.enable_storage = True
         lock_params = object()
 
-        tree._track_write_through_node(tree.root_node, lock_params)
+        controller.track_write_through_node(tree.root_node, lock_params)
         left = UnifiedTreeNode((ComponentType.FULL,))
         right = UnifiedTreeNode((ComponentType.FULL,))
-        tree._replace_pending_write_through_node(tree.root_node, [left, right])
+        controller.replace_pending_write_through_node(tree.root_node, [left, right])
 
         with (
             mock.patch.object(tree, "_record_store_event") as record_event,
             mock.patch.object(tree, "dec_lock_ref") as dec_lock_ref,
-            mock.patch.object(tree, "write_backup_storage") as backup_storage,
+            mock.patch.object(controller, "write_backup_storage") as backup_storage,
         ):
             tree._finish_write_through_ack(tree.root_node.id)
 
@@ -453,6 +471,7 @@ class TestExternalCacheController(CustomTestCase):
         controller.terminate_prefetch = mock.Mock(return_value=(2, []))
         controller.append_host_mem_release = mock.Mock()
         tree.cache_controller = controller
+        tree.external_cache_controller = controller
         host_indices = torch.arange(4)
         lock_params = object()
         operation = mock.Mock()
@@ -470,7 +489,7 @@ class TestExternalCacheController(CustomTestCase):
             mock.patch.object(tree, "_barrier_attn_groups") as barrier,
             mock.patch.object(tree, "dec_host_lock_ref") as dec_host_lock_ref,
         ):
-            tree.release_aborted_request("req")
+            tree.release_aborted_external_cache_request("req")
 
         self.assertEqual(controller.prefetch_loaded_tokens_by_reqid, {})
         self.assertEqual(controller.ongoing_prefetch, {})

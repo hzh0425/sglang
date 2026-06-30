@@ -877,7 +877,7 @@ class SchedulerDisaggregationPrefillMixin:
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
         if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+            self.tree_cache.release_aborted_external_cache_request(req.rid)
 
     def handle_pending_bootstrap(
         self: Scheduler, req: Req, poll: KVPoll, defer_release: bool

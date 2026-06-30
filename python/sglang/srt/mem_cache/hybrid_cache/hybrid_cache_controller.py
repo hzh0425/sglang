@@ -5,11 +5,12 @@ import logging
 import os
 import threading
 import time
-from queue import Queue
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
@@ -23,9 +24,15 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.external_cache_controller import (
+    BackupRequest,
+    BackupResult,
+    BaseExternalCacheController,
     ExternalCacheProgress,
     ExternalCacheTreeOps,
+    LoadBackRequest,
+    LoadBackResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
@@ -35,6 +42,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache_components import (
+    BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
+    ComponentType,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -157,7 +170,15 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
-class HybridCacheController(BaseHiCacheController):
+class OngoingWriteThrough(NamedTuple):
+    """Tracks an in-flight D2H write-through operation."""
+
+    node: Any
+    lock_params: Any
+    publish_nodes: list[Any]
+
+
+class HybridCacheController(BaseHiCacheController, BaseExternalCacheController):
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -184,6 +205,7 @@ class HybridCacheController(BaseHiCacheController):
         self.ongoing_backup: dict[int, Any] = {}
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, Any] = {}
+        self._active_cache: Any = None
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -372,6 +394,219 @@ class HybridCacheController(BaseHiCacheController):
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
+    def shutdown(self) -> None:
+        if self.enable_storage:
+            self._stop_storage_threads()
+
+    def _cache_from_tree_ops(self, tree_ops: ExternalCacheTreeOps) -> Any:
+        cache = getattr(tree_ops, "cache", None)
+        if cache is None:
+            raise TypeError("HybridCacheController requires UnifiedRadixCache tree ops")
+        return cache
+
+    def _get_node(self, tree_ops: ExternalCacheTreeOps, node_id: int) -> Any:
+        get_node = getattr(tree_ops, "get_node", None)
+        if get_node is None:
+            raise TypeError("HybridCacheController requires node-resolving tree ops")
+        return get_node(node_id)
+
+    def write_backup(
+        self, request: BackupRequest, tree_ops: ExternalCacheTreeOps
+    ) -> BackupResult:
+        cache = self._cache_from_tree_ops(tree_ops)
+        self._active_cache = cache
+        node = self._get_node(tree_ops, request.node_id)
+
+        if not request.write_back and (
+            node.parent is not cache.root_node and not node.parent.backuped
+        ):
+            parent_result = self.write_backup(
+                BackupRequest(node_id=node.parent.id), tree_ops
+            )
+            if parent_result.backed_up_tokens <= 0:
+                return BackupResult()
+
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in cache._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            transfers = comp.build_hicache_transfers(
+                node, CacheTransferPhase.BACKUP_HOST
+            )
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+        sidecar_xfers = cache._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
+        )
+
+        kv_tokens = len(device_value)
+        host_avail = self.mem_pool_host.available_size()
+        if host_avail < kv_tokens:
+            needed = kv_tokens - host_avail
+            evicted = cache.evict_host(needed)
+            if evicted < needed:
+                return BackupResult()
+
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        host_indices = self.write(
+            device_value, node_id=node.id, extra_pools=aux_xfers or None
+        )
+        if host_indices is None:
+            return BackupResult()
+
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+        cache.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+            node,
+            CacheTransferPhase.BACKUP_HOST,
+            transfers=[kv_xfer],
+        )
+        for ct, xfers in comp_xfers.items():
+            cache.components[ct].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=xfers,
+            )
+
+        lock_params = None
+        if not request.write_back:
+            lock_params = cache.inc_lock_ref(node).to_dec_params()
+        self.track_write_through_node(node, lock_params)
+        return BackupResult(backed_up_tokens=len(host_indices))
+
+    def track_write_through_node(self, node: Any, lock_params: Any) -> None:
+        node.write_through_pending_id = node.id
+        self.ongoing_write_through[node.id] = OngoingWriteThrough(
+            node, lock_params, [node]
+        )
+
+    def replace_pending_write_through_node(
+        self, old_node: Any, new_nodes: list[Any]
+    ) -> None:
+        ack_id = old_node.write_through_pending_id
+        if ack_id is None:
+            return
+
+        pending = self.ongoing_write_through.get(ack_id)
+        if pending is None:
+            return
+
+        lock_node, lock_params, publish_nodes = pending
+        updated_nodes = []
+        replaced = False
+        for node in publish_nodes:
+            if node is old_node:
+                updated_nodes.extend(new_nodes)
+                replaced = True
+            else:
+                updated_nodes.append(node)
+
+        if not replaced:
+            return
+
+        for node in new_nodes:
+            node.write_through_pending_id = ack_id
+        self.ongoing_write_through[ack_id] = OngoingWriteThrough(
+            lock_node,
+            lock_params,
+            updated_nodes,
+        )
+
+    def load_back(
+        self, request: LoadBackRequest, tree_ops: ExternalCacheTreeOps
+    ) -> LoadBackResult:
+        cache = self._cache_from_tree_ops(tree_ops)
+        self._active_cache = cache
+        best_match_node = self._get_node(tree_ops, request.node_id)
+        req = getattr(tree_ops, "current_req", None)
+        start_time = time.perf_counter()
+        host_anchor_params = cache.inc_host_lock_ref(best_match_node).to_dec_params()
+        kv_xfer = cache.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
+            best_match_node, CacheTransferPhase.LOAD_BACK
+        )[0]
+
+        result = cache.inc_lock_ref(best_match_node)
+        ancestor_lock_params = result.to_dec_params()
+        kv_tokens = len(kv_xfer.host_indices)
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in cache._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            transfers = comp.build_hicache_transfers(
+                best_match_node, CacheTransferPhase.LOAD_BACK, req=req
+            )
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+        sidecar_xfers = cache._build_sidecar_transfers(
+            CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
+        )
+
+        if (kv_tokens < cache.load_back_threshold and not comp_xfers) or (
+            request.mem_quota is not None and kv_tokens > request.mem_quota + result.delta
+        ):
+            cache.dec_lock_ref(best_match_node, ancestor_lock_params)
+            cache.dec_host_lock_ref(best_match_node, host_anchor_params)
+            return LoadBackResult()
+
+        if cache.supports_swa():
+            avail = cache.token_to_kv_pool_allocator.full_available_size()
+        else:
+            avail = cache.token_to_kv_pool_allocator.available_size()
+        if avail < kv_tokens:
+            needed = kv_tokens - avail
+            evict_result = cache.evict(EvictParams(num_tokens=needed))
+            if evict_result.num_tokens_evicted < needed:
+                cache.dec_lock_ref(best_match_node, ancestor_lock_params)
+                cache.dec_host_lock_ref(best_match_node, host_anchor_params)
+                return LoadBackResult()
+
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        device_indices = self.load(
+            host_indices=kv_xfer.host_indices,
+            node_id=best_match_node.id,
+            extra_pools=aux_xfers or None,
+        )
+
+        cache.dec_lock_ref(best_match_node, ancestor_lock_params)
+        if device_indices is None:
+            cache.dec_host_lock_ref(best_match_node, host_anchor_params)
+            return LoadBackResult()
+
+        kv_xfer.device_indices = device_indices
+        cache.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+            best_match_node,
+            CacheTransferPhase.LOAD_BACK,
+            [kv_xfer],
+        )
+        for node in kv_xfer.nodes_to_load or ():
+            cache._record_store_event(node, medium=StorageMedium.GPU)
+        for ct, xfers in comp_xfers.items():
+            cache.components[ct].commit_hicache_transfer(
+                best_match_node,
+                CacheTransferPhase.LOAD_BACK,
+                xfers,
+            )
+
+        cache._update_evictable_leaf_sets(best_match_node)
+        self.ongoing_load_back[best_match_node.id] = (
+            best_match_node,
+            cache.inc_lock_ref(best_match_node).to_dec_params(),
+            host_anchor_params,
+        )
+
+        if cache.metrics_collector is not None:
+            cache.metrics_collector.observe_load_back_duration(
+                time.perf_counter() - start_time
+            )
+            cache.metrics_collector.increment_load_back_num_tokens(len(device_indices))
+
+        return LoadBackResult(loaded=True, device_indices=device_indices)
+
     def finish_write_through_ack(
         self,
         ack_id: int,
@@ -505,10 +740,453 @@ class HybridCacheController(BaseHiCacheController):
     def poll(
         self, tree_ops: ExternalCacheTreeOps, *, wait: bool = False
     ) -> ExternalCacheProgress:
-        poll_cache_events = getattr(tree_ops, "poll_cache_events", None)
-        if poll_cache_events is None:
+        cache = self._cache_from_tree_ops(tree_ops)
+        self._active_cache = cache
+        if wait:
+            self._poll_write_acks(cache, wait=True)
             return ExternalCacheProgress()
-        return poll_cache_events(self, wait=wait)
+
+        completed_writes = self._poll_write_acks(cache)
+        completed_loads = self._poll_load_acks(cache)
+        completed_storage_ops = 0
+        if self.enable_storage:
+            completed_storage_ops = self._drain_storage_control_queues(cache)
+        return ExternalCacheProgress(
+            completed_writes=completed_writes,
+            completed_loads=completed_loads,
+            completed_storage_ops=completed_storage_ops,
+        )
+
+    def _poll_write_acks(self, cache: Any, *, wait: bool = False) -> int:
+        if wait:
+            while self.ongoing_write_through:
+                for _, finish_event, ack_list in self.ack_write_queue:
+                    finish_event.synchronize()
+                    for ack_id in ack_list:
+                        if ack_id in self.ongoing_write_through:
+                            self.finish_write_through_ack(
+                                ack_id,
+                                publish_host_node=lambda node: cache._record_store_event(
+                                    node, medium=StorageMedium.CPU
+                                ),
+                                release_node_lock=cache.dec_lock_ref,
+                                enqueue_storage_backup=(
+                                    self.write_backup_storage
+                                    if cache.enable_storage
+                                    else None
+                                ),
+                            )
+                self.ack_write_queue.clear()
+                assert len(self.ongoing_write_through) == 0
+            return 0
+
+        finish_count = 0
+        if cache.pp_rank == 0:
+            for _, finish_event, _ in self.ack_write_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        cache._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
+
+        completed = 0
+        while finish_count > 0:
+            _, finish_event, ack_list = self.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                self.finish_write_through_ack(
+                    ack_id,
+                    publish_host_node=lambda node: cache._record_store_event(
+                        node, medium=StorageMedium.CPU
+                    ),
+                    release_node_lock=cache.dec_lock_ref,
+                    enqueue_storage_backup=(
+                        self.write_backup_storage if cache.enable_storage else None
+                    ),
+                )
+                completed += 1
+            finish_count -= 1
+        return completed
+
+    def _poll_load_acks(self, cache: Any) -> int:
+        finish_count = 0
+        if cache.pp_rank == 0:
+            for _, finish_event, _ in self.ack_load_queue:
+                if not finish_event.query():
+                    break
+                finish_count += 1
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        cache._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = finish_count_tensor.item()
+
+        completed = 0
+        while finish_count > 0:
+            _, finish_event, ack_list = self.ack_load_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                self.finish_load_back_ack(
+                    ack_id,
+                    release_node_lock=cache.dec_lock_ref,
+                    release_host_lock=cache.dec_host_lock_ref,
+                )
+                completed += 1
+            finish_count -= 1
+        return completed
+
+    def _drain_storage_control_queues(self, cache: Any) -> int:
+        extra_release_queues = getattr(self, "extra_host_mem_release_queues", {})
+        extra_pool_names = list(extra_release_queues)
+        local_qsize_list = [
+            self.prefetch_revoke_queue.qsize(),
+            self.ack_backup_queue.qsize(),
+            self.host_mem_release_queue.qsize(),
+            *[
+                extra_release_queues[pool_name].qsize()
+                for pool_name in extra_pool_names
+            ],
+        ]
+        qsizes = torch.tensor(
+            local_qsize_list,
+            dtype=torch.int,
+        )
+        cache._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        qsize_list = list(map(int, qsizes.tolist()))
+        n_revoke, n_backup, n_release = qsize_list[:3]
+        extra_counts = {
+            pool_name: qsize_list[3 + idx]
+            for idx, pool_name in enumerate(extra_pool_names)
+        }
+        return self._drain_storage_control_queues_impl(
+            cache,
+            n_revoke,
+            n_backup,
+            n_release,
+            extra_counts,
+            log_metrics=True,
+        )
+
+    def _drain_storage_control_queues_impl(
+        self,
+        cache: Any,
+        n_revoke: Optional[int],
+        n_backup: Optional[int],
+        n_release: Optional[int],
+        extra_release_counts: Optional[dict[PoolName, int]],
+        log_metrics: bool,
+    ) -> int:
+        def _drain_queue(q: Queue, limit: Optional[int]):
+            drained = 0
+            while limit is None or drained < limit:
+                try:
+                    item = q.get_nowait()
+                except Empty:
+                    break
+                drained += 1
+                yield item
+
+        drained_total = 0
+        for req_id in _drain_queue(self.prefetch_revoke_queue, n_revoke):
+            if self.revoke_prefetch(
+                req_id,
+                release_host_lock=cache.dec_host_lock_ref,
+            ):
+                drained_total += 1
+
+        for operation in _drain_queue(self.ack_backup_queue, n_backup):
+            drained_total += 1
+            entry = self.ongoing_backup.pop(operation.id, None)
+            if entry is not None:
+                node, lock_params = entry
+                cache.dec_host_lock_ref(node, lock_params)
+            if (
+                log_metrics
+                and cache.enable_storage_metrics
+                and cache.storage_metrics_collector is not None
+            ):
+                cache.storage_metrics_collector.log_backuped_tokens(
+                    operation.completed_tokens
+                )
+
+        host_indices_list = []
+        for host_indices in _drain_queue(self.host_mem_release_queue, n_release):
+            drained_total += 1
+            host_indices_list.append(host_indices)
+        if host_indices_list:
+            self.mem_pool_host.free(torch.cat(host_indices_list, dim=0))
+
+        if extra_release_counts:
+            for pool_name, limit in extra_release_counts.items():
+                release_queue = self.extra_host_mem_release_queues.get(pool_name)
+                if release_queue is None:
+                    continue
+                host_indices_list = []
+                for host_indices in _drain_queue(release_queue, limit):
+                    drained_total += 1
+                    host_indices_list.append(host_indices)
+                if host_indices_list:
+                    entry = self.mem_pool_host.entry_map.get(pool_name)
+                    if entry is not None:
+                        entry.host_pool.free(torch.cat(host_indices_list, dim=0))
+        return drained_total
+
+    def write_backup_storage(self, node: Any) -> None:
+        if not self.enable_storage or not node.backuped:
+            return
+
+        cache = self._active_cache
+        prefix_keys = None
+        if cache.hicache_storage_pass_prefix_keys:
+            prefix_keys = node.get_prefix_hash_values(node.parent)
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for comp in cache._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            transfers = comp.build_hicache_transfers(
+                node,
+                CacheTransferPhase.BACKUP_STORAGE,
+            )
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+
+        kv_xfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=node.component_data[BASE_COMPONENT_TYPE].host_value,
+            keys=node.hash_value,
+        )
+        sidecar_xfers = cache._build_sidecar_transfers(
+            CacheTransferPhase.BACKUP_STORAGE, kv_xfer, comp_xfers
+        )
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+
+        operation_id = self.write_storage(
+            node.component_data[BASE_COMPONENT_TYPE].host_value,
+            node.key.token_ids,
+            node.hash_value,
+            prefix_keys,
+            extra_pools=aux_xfers or None,
+        )
+        self.ongoing_backup[operation_id] = (
+            node,
+            cache.inc_host_lock_ref(node).to_dec_params(),
+        )
+
+    def prefetch_from_storage(
+        self,
+        req_id: str,
+        last_host_node: Any,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> None:
+        cache = self._active_cache
+        if not cache.enable_storage:
+            return
+
+        extra_key = last_host_node.key.extra_key if last_host_node.key else None
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=extra_key,
+            is_bigram=cache.is_eagle,
+        ).page_aligned(cache.page_size)
+        prefetch_length = len(prefetch_key)
+        if prefetch_length < cache.prefetch_threshold or self.prefetch_rate_limited():
+            return
+
+        anchor_lock_params = cache.inc_host_lock_ref(last_host_node).to_dec_params()
+        host_indices = self.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            cache.evict_host(prefetch_length)
+            host_indices = self.mem_pool_host.alloc(prefetch_length)
+        if host_indices is None:
+            available_size = self.mem_pool_host.available_size()
+            prefetch_length = available_size - (available_size % cache.page_size)
+            if prefetch_length >= cache.prefetch_threshold:
+                prefetch_key = prefetch_key[:prefetch_length]
+                host_indices = self.mem_pool_host.alloc(prefetch_length)
+            else:
+                cache.dec_host_lock_ref(last_host_node, anchor_lock_params)
+                return
+        if host_indices is None:
+            cache.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            return
+
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        alloc_failed = False
+        for comp in cache._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            transfers = comp.build_hicache_transfers(
+                last_host_node,
+                CacheTransferPhase.PREFETCH,
+                token_ids=prefetch_key.token_ids,
+                prefetch_tokens=len(prefetch_key),
+                last_hash=last_hash,
+            )
+            if transfers == []:
+                alloc_failed = True
+                break
+            if transfers:
+                comp_xfers[comp.component_type] = transfers
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+        sidecar_xfers = cache._build_sidecar_transfers(
+            CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
+        )
+        if alloc_failed:
+            self.append_host_mem_release(
+                host_indices=host_indices,
+                extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+            )
+            cache.dec_host_lock_ref(last_host_node, anchor_lock_params)
+            return
+
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(sidecar_xfers)
+        operation = self.prefetch(
+            req_id,
+            host_indices,
+            prefetch_key,
+            last_hash,
+            prefix_keys,
+            extra_pools=aux_xfers or None,
+        )
+        self.ongoing_prefetch[req_id] = (
+            last_host_node,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            comp_xfers,
+        )
+        self.prefetch_tokens_occupied += len(prefetch_key)
+
+    def _prefetch_timeout_check_linear_func(
+        self, cache: Any, operation: PrefetchOperation
+    ) -> bool:
+        return (
+            time.monotonic() - operation.start_time
+            > cache.prefetch_timeout_base
+            + len(operation.hash_value) * cache.prefetch_timeout_per_page
+        )
+
+    def can_terminate_prefetch(self, cache: Any, operation: PrefetchOperation) -> bool:
+        if cache.prefetch_stop_policy == "best_effort":
+            return True
+
+        if len(operation.hash_value) == 0:
+            completed = False
+        else:
+            completed = (
+                operation.completed_tokens == len(operation.hash_value) * cache.page_size
+            )
+
+        if cache.prefetch_stop_policy == "wait_complete":
+            can_terminate = completed
+        elif cache.prefetch_stop_policy == "timeout":
+            can_terminate = completed or self._prefetch_timeout_check_linear_func(
+                cache, operation
+            )
+        else:
+            return True
+        if (
+            completed
+            and getattr(operation, "pool_transfers", None)
+            and not getattr(operation, "pool_transfers_done", True)
+        ):
+            can_terminate = False
+
+        operation_terminated = operation.is_terminated()
+        states = torch.tensor(
+            [1 - int(can_terminate), int(operation_terminated)],
+            dtype=torch.int,
+        )
+        cache._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        can_terminate = states[0].item() == 0
+        operation_terminated = states[1].item() == 1
+        return can_terminate or operation_terminated
+
+    def check_prefetch_progress(self, req_id: str) -> bool:
+        if req_id not in self.ongoing_prefetch:
+            return True
+
+        cache = self._active_cache
+        (
+            last_host_node,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            comp_xfers,
+        ) = self.ongoing_prefetch[req_id]
+        if operation.host_indices is None:
+            return True
+        if not self.can_terminate_prefetch(cache, operation):
+            return False
+
+        completed_tokens, hash_value = self.terminate_prefetch(operation)
+        min_completed_tokens = completed_tokens
+        hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        if cache.tp_world_size > 1:
+            sidecar_pools = [t.name for xfers in comp_xfers.values() for t in xfers]
+            packed = torch.tensor(
+                [completed_tokens] + [hit_pages.get(p, 0) for p in sidecar_pools],
+                dtype=torch.int,
+            )
+            cache._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+            min_completed_tokens = int(packed[0].item())
+            for i, p in enumerate(sidecar_pools, start=1):
+                hit_pages[p] = int(packed[i].item())
+
+        fetched_key = prefetch_key[:min_completed_tokens]
+        insert_result = cache._insert_helper_host(
+            last_host_node,
+            fetched_key,
+            host_indices[:min_completed_tokens],
+            hash_value[: min_completed_tokens // cache.page_size],
+        )
+
+        for ct, xfers in comp_xfers.items():
+            cache.components[ct].commit_hicache_transfer(
+                last_host_node,
+                CacheTransferPhase.PREFETCH,
+                xfers,
+                insert_result=insert_result,
+                pool_storage_result=operation.pool_storage_result,
+            )
+
+        loaded_from_storage = min_completed_tokens - insert_result.prefix_len
+        occupied = self.finish_prefetch_progress(
+            req_id,
+            completed_tokens=completed_tokens,
+            min_completed_tokens=min_completed_tokens,
+            matched_tokens=insert_result.prefix_len,
+            loaded_tokens=loaded_from_storage,
+            release_host_lock=cache.dec_host_lock_ref,
+        )
+        logger.info(
+            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
+            req_id,
+            completed_tokens,
+            min_completed_tokens,
+            insert_result.prefix_len,
+            loaded_from_storage,
+            completed_tokens - min_completed_tokens,
+            occupied,
+        )
+        if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
+            cache.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
+        return True
+
+    def abort_request(self, request_id: str, tree_ops: ExternalCacheTreeOps) -> None:
+        self._active_cache = self._cache_from_tree_ops(tree_ops)
+        self.release_aborted_prefetch(
+            request_id,
+            barrier_attn_groups=self._active_cache._barrier_attn_groups,
+            release_host_lock=self._active_cache.dec_host_lock_ref,
+        )
 
     def write(
         self,

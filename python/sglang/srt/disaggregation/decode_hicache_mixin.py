@@ -125,7 +125,7 @@ class DecodeHiCachePreallocMixin:
                 req.rid, node, suffix, last_hash, prefix_keys
             )
             prefix_match.prefetch_registered = (
-                req.rid in self.tree_cache.ongoing_prefetch
+                req.rid in self.tree_cache.cache_controller.ongoing_prefetch
             )
         except Exception as e:
             logger.warning(

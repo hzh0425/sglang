@@ -3577,11 +3577,12 @@ class Scheduler(
             # destructive operations like attach/detach/flush_cache.
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
-                idle &= len(tc.ongoing_write_through) == 0
-                idle &= len(tc.ongoing_load_back) == 0
+                cc = getattr(tc, "cache_controller", None)
+                idle &= cc is None or len(cc.ongoing_write_through) == 0
+                idle &= cc is None or len(cc.ongoing_load_back) == 0
                 if tc.enable_storage:
-                    idle &= len(tc.ongoing_prefetch) == 0
-                    idle &= len(tc.ongoing_backup) == 0
+                    idle &= cc is None or len(cc.ongoing_prefetch) == 0
+                    idle &= cc is None or len(cc.ongoing_backup) == 0
 
         return idle
 

@@ -36,6 +36,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -368,7 +371,10 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
             def __init__(self):
                 self.mem_pool_host = FakeHostPool()
                 self.prefetch_tokens_occupied = 0
+                self.ongoing_prefetch = {}
                 self.prefetch_args = None
+
+            prefetch_from_storage = HybridCacheController.prefetch_from_storage
 
             def prefetch_rate_limited(self):
                 return False
@@ -585,7 +591,9 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         # Each fragment must also be persisted to L3 on ack: lock_node only
         # holds the suffix after the split.
         tree.enable_storage = True
-        with mock.patch.object(tree, "write_backup_storage") as backup_storage:
+        with mock.patch.object(
+            tree.cache_controller, "write_backup_storage"
+        ) as backup_storage:
             tree.writing_check(write_back=True)
         self.assertEqual(
             [
@@ -2376,18 +2384,20 @@ class UnifiedRadixCacheSuite:
 
     def _write_path_to_l3(self, tree, node):
         """Offload every node on root->node path from host to L3 storage."""
+        tree.cache_controller._active_cache = tree
         for n in self._path_chain(tree, node):
-            tree.write_backup_storage(n)
+            tree.cache_controller.write_backup_storage(n)
 
     def _flush_l3_backups(self, tree, timeout: float = 10.0):
         """Wait for backup threads to finish, then drain acks (release locks)."""
         deadline = time.time() + timeout
-        while tree.ongoing_backup and time.time() < deadline:
+        ongoing_backup = tree.cache_controller.ongoing_backup
+        while ongoing_backup and time.time() < deadline:
             tree.drain_storage_control_queues()
-            if tree.ongoing_backup:
+            if ongoing_backup:
                 time.sleep(0.01)
         tree.drain_storage_control_queues()
-        self.assertFalse(tree.ongoing_backup, "L3 backups did not complete in time")
+        self.assertFalse(ongoing_backup, "L3 backups did not complete in time")
 
     def _run_prefetch_to_completion(self, tree, req_id, timeout: float = 10.0):
         deadline = time.time() + timeout
@@ -2522,7 +2532,7 @@ class UnifiedRadixCacheSuite:
         def swa_packed_index():
             # Packed tensor is [completed_tokens, *sidecar_hits]; sidecar order
             # matches comp_xfers stored in ongoing_prefetch (one live entry).
-            for info in tree.ongoing_prefetch.values():
+            for info in tree.cache_controller.ongoing_prefetch.values():
                 comp_xfers = info[-1]
                 names = [t.name for xfers in comp_xfers.values() for t in xfers]
                 if PoolName.SWA in names:
@@ -3324,11 +3334,11 @@ class UnifiedRadixCacheSuite:
 
     def _release_ongoing_load_back_locks(self, tree):
         for node, lock_params, host_lock_params in list(
-            tree.ongoing_load_back.values()
+            tree.cache_controller.ongoing_load_back.values()
         ):
             tree.dec_lock_ref(node, lock_params)
             tree.dec_host_lock_ref(node, host_lock_params)
-        tree.ongoing_load_back.clear()
+        tree.cache_controller.ongoing_load_back.clear()
 
     def _finish_pending_loads(self, tree):
         producer_id = tree.ready_to_load_host_cache()
