@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.external_cache_controller import (
     BackupRequest,
     BaseExternalCacheController,
+    ExternalCacheProgress,
     ExternalCacheTreeOps,
     LoadBackRequest,
     NoopExternalCacheController,
@@ -336,6 +337,11 @@ class _UnifiedExternalCacheTreeOps:
                 return node
             stack.extend(node.children.values())
         return None
+
+    def poll_cache_events(
+        self, controller: HybridCacheController, *, wait: bool = False
+    ) -> ExternalCacheProgress:
+        return self._cache._poll_hicache_controller_events(controller, wait=wait)
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
@@ -2654,14 +2660,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self._uses_external_cache_controller():
             self.external_cache_controller.poll(self.external_cache_tree_ops)
             return
-        self.writing_check()
-        self.loading_check()
-        if self.enable_storage:
-            self.drain_storage_control_queues()
+        if self.cache_controller is not None:
+            self.cache_controller.poll(self.external_cache_tree_ops)
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    def _poll_hicache_controller_events(
+        self, controller: HybridCacheController, *, wait: bool = False
+    ) -> ExternalCacheProgress:
+        if wait:
+            self.writing_check(write_back=True)
+            return ExternalCacheProgress()
+
+        self.writing_check()
+        self.loading_check()
+        if self.enable_storage:
+            self.drain_storage_control_queues()
+        return ExternalCacheProgress()
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""

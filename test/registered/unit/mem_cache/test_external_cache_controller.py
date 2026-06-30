@@ -205,6 +205,53 @@ class TestExternalCacheController(CustomTestCase):
         self.assertEqual(tree.ready_to_load_host_cache(), 23)
         controller.begin_pending_loads.assert_called_once_with()
 
+    def test_hybrid_controller_poll_uses_private_tree_ops_bridge(self):
+        controller = object.__new__(HybridCacheController)
+
+        class _TreeOps:
+            def __init__(self):
+                self.calls = []
+
+            def poll_cache_events(self, controller_arg, *, wait: bool = False):
+                self.calls.append((controller_arg, wait))
+                return ExternalCacheProgress(completed_writes=2)
+
+        tree_ops = _TreeOps()
+
+        progress = controller.poll(tree_ops, wait=True)
+
+        self.assertEqual(progress.completed_writes, 2)
+        self.assertEqual(tree_ops.calls, [(controller, True)])
+
+    def test_check_hicache_events_uses_hybrid_controller_poll(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        controller.poll = mock.Mock(return_value=ExternalCacheProgress())
+        tree.cache_controller = controller
+
+        tree.check_hicache_events()
+
+        controller.poll.assert_called_once_with(tree.external_cache_tree_ops)
+
+    def test_private_hicache_poll_drains_existing_event_paths(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        tree.enable_storage = True
+
+        with (
+            mock.patch.object(tree, "writing_check") as writing_check,
+            mock.patch.object(tree, "loading_check") as loading_check,
+            mock.patch.object(
+                tree, "drain_storage_control_queues"
+            ) as drain_storage,
+        ):
+            progress = tree._poll_hicache_controller_events(controller)
+
+        self.assertEqual(progress, ExternalCacheProgress())
+        writing_check.assert_called_once_with()
+        loading_check.assert_called_once_with()
+        drain_storage.assert_called_once_with()
+
     def test_tree_ops_resolves_nodes_by_id_without_returning_nodes(self):
         tree = _build_tree()
         child = UnifiedTreeNode((ComponentType.FULL,))

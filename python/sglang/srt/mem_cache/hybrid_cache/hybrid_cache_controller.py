@@ -23,6 +23,10 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.external_cache_controller import (
+    ExternalCacheProgress,
+    ExternalCacheTreeOps,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -497,6 +501,14 @@ class HybridCacheController(BaseHiCacheController):
         release_host_lock(last_host_node, anchor_lock_params)
         self._decrement_prefetch_tokens_occupied(len(prefetch_key))
         return True
+
+    def poll(
+        self, tree_ops: ExternalCacheTreeOps, *, wait: bool = False
+    ) -> ExternalCacheProgress:
+        poll_cache_events = getattr(tree_ops, "poll_cache_events", None)
+        if poll_cache_events is None:
+            return ExternalCacheProgress()
+        return poll_cache_events(self, wait=wait)
 
     def write(
         self,
