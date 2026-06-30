@@ -508,8 +508,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self._ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
-        self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-        self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
+        self._prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self._ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self._ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
         if self.cache_controller is not None:
@@ -564,6 +564,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     @ongoing_load_back.setter
     def ongoing_load_back(self, value: dict[int, _OngoingLoadBack]) -> None:
         self._ongoing_load_back = value
+
+    @property
+    def prefetch_loaded_tokens_by_reqid(self) -> dict[str, int]:
+        if self.cache_controller is not None:
+            controller_state = getattr(
+                self.cache_controller, "prefetch_loaded_tokens_by_reqid", None
+            )
+            if controller_state is not None:
+                return controller_state
+        return self._prefetch_loaded_tokens_by_reqid
+
+    @prefetch_loaded_tokens_by_reqid.setter
+    def prefetch_loaded_tokens_by_reqid(self, value: dict[str, int]) -> None:
+        self._prefetch_loaded_tokens_by_reqid = value
+
+    @property
+    def ongoing_prefetch(self) -> dict[str, _OngoingPrefetch]:
+        if self.cache_controller is not None:
+            controller_state = getattr(self.cache_controller, "ongoing_prefetch", None)
+            if controller_state is not None:
+                return controller_state
+        return self._ongoing_prefetch
+
+    @ongoing_prefetch.setter
+    def ongoing_prefetch(self, value: dict[str, _OngoingPrefetch]) -> None:
+        self._ongoing_prefetch = value
 
     @property
     def ongoing_backup(
@@ -2181,18 +2207,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 pool_storage_result=operation.pool_storage_result,
             )
 
-        self.cache_controller.mem_pool_host.free(
-            host_indices[: insert_result.prefix_len]
-        )
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
-        self.dec_host_lock_ref(last_host_node, anchor_lock_params)
-        del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
-
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
-        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
+        occupied = self.cache_controller.finish_prefetch_progress(
+            req_id,
+            completed_tokens=completed_tokens,
+            min_completed_tokens=min_completed_tokens,
+            matched_tokens=insert_result.prefix_len,
+            loaded_tokens=loaded_from_storage,
+            release_host_lock=self.dec_host_lock_ref,
+        )
         logger.info(
             "HiCache prefetch success req=%s completed_local=%d completed_synced=%d matched=%d loaded=%d tail_release=%d occupied=%d",
             req_id,
@@ -2201,13 +2224,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_result.prefix_len,
             loaded_from_storage,
             completed_tokens - min_completed_tokens,
-            self.cache_controller.prefetch_tokens_occupied,
+            occupied,
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
 
     def terminate_prefetch(self, req_id: str) -> None:
+        if self.cache_controller is not None and hasattr(
+            self.cache_controller, "mark_prefetch_terminated"
+        ):
+            self.cache_controller.mark_prefetch_terminated(req_id)
+            return
+
         if req_id not in self.ongoing_prefetch:
             return
         operation = self.ongoing_prefetch[req_id].operation
@@ -2216,9 +2245,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        if self.cache_controller is not None and hasattr(
+            self.cache_controller, "pop_prefetch_loaded_tokens"
+        ):
+            return self.cache_controller.pop_prefetch_loaded_tokens(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
+        if self.cache_controller is not None and hasattr(
+            self.cache_controller, "release_aborted_prefetch"
+        ):
+            self.cache_controller.release_aborted_prefetch(
+                rid,
+                barrier_attn_groups=self._barrier_attn_groups,
+                release_host_lock=self.dec_host_lock_ref,
+            )
+            return
+
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
@@ -2267,6 +2310,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         def _drain_revoke():
             drained = 0
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
+                if hasattr(cc, "revoke_prefetch"):
+                    if cc.revoke_prefetch(
+                        req_id,
+                        release_host_lock=self.dec_host_lock_ref,
+                    ):
+                        drained += 1
+                    continue
+
                 info = self.ongoing_prefetch.pop(req_id, None)
                 if info is None:
                     continue

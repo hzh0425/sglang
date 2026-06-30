@@ -178,6 +178,8 @@ class HybridCacheController(BaseHiCacheController):
         self.ongoing_write_through: dict[int, Any] = {}
         self.ongoing_load_back: dict[int, Any] = {}
         self.ongoing_backup: dict[int, Any] = {}
+        self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        self.ongoing_prefetch: dict[str, Any] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -358,6 +360,8 @@ class HybridCacheController(BaseHiCacheController):
         self.ongoing_write_through.clear()
         self.ongoing_load_back.clear()
         self.ongoing_backup.clear()
+        self.prefetch_loaded_tokens_by_reqid.clear()
+        self.ongoing_prefetch.clear()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
             for release_queue in self.extra_host_mem_release_queues.values():
@@ -393,6 +397,106 @@ class HybridCacheController(BaseHiCacheController):
         node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
         release_node_lock(node, lock_params)
         release_host_lock(node, host_lock_params)
+
+    def _decrement_prefetch_tokens_occupied(self, num_tokens: int) -> None:
+        self.prefetch_tokens_occupied -= num_tokens
+        if self.prefetch_tokens_occupied < 0:
+            self.prefetch_tokens_occupied = 0
+
+    def finish_prefetch_progress(
+        self,
+        req_id: str,
+        *,
+        completed_tokens: int,
+        min_completed_tokens: int,
+        matched_tokens: int,
+        loaded_tokens: int,
+        release_host_lock: Callable[[Any, Any], None],
+    ) -> int:
+        (
+            last_host_node,
+            prefetch_key,
+            host_indices,
+            _operation,
+            anchor_lock_params,
+            _comp_xfers,
+        ) = self.ongoing_prefetch.pop(req_id)
+        self.mem_pool_host.free(host_indices[:matched_tokens])
+        self.append_host_mem_release(
+            host_indices[min_completed_tokens:completed_tokens]
+        )
+        release_host_lock(last_host_node, anchor_lock_params)
+        self._decrement_prefetch_tokens_occupied(len(prefetch_key))
+        self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_tokens
+        return self.prefetch_tokens_occupied
+
+    def mark_prefetch_terminated(self, req_id: str) -> None:
+        info = self.ongoing_prefetch.get(req_id)
+        if info is None:
+            return
+        operation = info.operation if hasattr(info, "operation") else info[3]
+        if operation.host_indices is None:
+            return
+        operation.mark_terminate()
+
+    def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    def release_aborted_prefetch(
+        self,
+        req_id: str,
+        *,
+        barrier_attn_groups: Callable[[], None],
+        release_host_lock: Callable[[Any, Any], None],
+    ) -> None:
+        self.prefetch_loaded_tokens_by_reqid.pop(req_id, None)
+        if req_id not in self.ongoing_prefetch:
+            return
+
+        (
+            last_host_node,
+            prefetch_key,
+            host_indices,
+            operation,
+            anchor_lock_params,
+            comp_xfers,
+        ) = self.ongoing_prefetch[req_id]
+        if operation.host_indices is None:
+            return
+
+        completed_tokens, _ = self.terminate_prefetch(operation)
+        barrier_attn_groups()
+        release_host_lock(last_host_node, anchor_lock_params)
+        del self.ongoing_prefetch[req_id]
+        self.append_host_mem_release(
+            host_indices=host_indices[:completed_tokens],
+            extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
+        )
+        self._decrement_prefetch_tokens_occupied(len(prefetch_key))
+
+    def revoke_prefetch(
+        self,
+        req_id: str,
+        *,
+        release_host_lock: Callable[[Any, Any], None],
+    ) -> bool:
+        info = self.ongoing_prefetch.pop(req_id, None)
+        if info is None:
+            return False
+        (
+            last_host_node,
+            prefetch_key,
+            _host_indices,
+            _operation,
+            anchor_lock_params,
+            comp_xfers,
+        ) = info
+        self.append_host_mem_release(
+            extra_pools=[x for xfers in comp_xfers.values() for x in xfers]
+        )
+        release_host_lock(last_host_node, anchor_lock_params)
+        self._decrement_prefetch_tokens_occupied(len(prefetch_key))
+        return True
 
     def write(
         self,

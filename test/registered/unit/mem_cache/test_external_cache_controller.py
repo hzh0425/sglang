@@ -2,6 +2,8 @@ import dataclasses
 import unittest
 from unittest import mock
 
+import torch
+
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -226,11 +228,18 @@ class TestExternalCacheController(CustomTestCase):
         controller.ongoing_write_through = {}
         controller.ongoing_load_back = {}
         controller.ongoing_backup = {}
+        controller.prefetch_loaded_tokens_by_reqid = {}
+        controller.ongoing_prefetch = {}
         tree.cache_controller = controller
 
         self.assertIs(tree.ongoing_write_through, controller.ongoing_write_through)
         self.assertIs(tree.ongoing_load_back, controller.ongoing_load_back)
         self.assertIs(tree.ongoing_backup, controller.ongoing_backup)
+        self.assertIs(
+            tree.prefetch_loaded_tokens_by_reqid,
+            controller.prefetch_loaded_tokens_by_reqid,
+        )
+        self.assertIs(tree.ongoing_prefetch, controller.ongoing_prefetch)
 
         tree._track_write_through_node(tree.root_node, None)
 
@@ -313,6 +322,101 @@ class TestExternalCacheController(CustomTestCase):
         self.assertEqual(controller.ongoing_load_back, {})
         dec_lock_ref.assert_called_once_with(tree.root_node, lock_params)
         dec_host_lock_ref.assert_called_once_with(tree.root_node, host_lock_params)
+
+    def test_prefetch_progress_accounting_runs_in_hybrid_controller(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        controller.prefetch_loaded_tokens_by_reqid = {}
+        controller.ongoing_prefetch = {}
+        controller.prefetch_tokens_occupied = 4
+        controller.mem_pool_host = mock.Mock()
+        controller.append_host_mem_release = mock.Mock()
+        host_indices = torch.arange(4)
+        lock_params = object()
+        operation = mock.Mock()
+        controller.ongoing_prefetch["req"] = (
+            tree.root_node,
+            [1, 2, 3, 4],
+            host_indices,
+            operation,
+            lock_params,
+            {},
+        )
+
+        release_host_lock = mock.Mock()
+        occupied = controller.finish_prefetch_progress(
+            "req",
+            completed_tokens=3,
+            min_completed_tokens=2,
+            matched_tokens=1,
+            loaded_tokens=1,
+            release_host_lock=release_host_lock,
+        )
+
+        self.assertEqual(occupied, 0)
+        self.assertEqual(controller.ongoing_prefetch, {})
+        self.assertEqual(controller.prefetch_loaded_tokens_by_reqid, {"req": 1})
+        freed = controller.mem_pool_host.free.call_args.args[0]
+        self.assertTrue(torch.equal(freed, host_indices[:1]))
+        released = controller.append_host_mem_release.call_args.args[0]
+        self.assertTrue(torch.equal(released, host_indices[2:3]))
+        release_host_lock.assert_called_once_with(tree.root_node, lock_params)
+
+    def test_prefetch_wrappers_delegate_abort_and_loaded_accounting(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        controller.prefetch_loaded_tokens_by_reqid = {"req": 7}
+        controller.ongoing_prefetch = {}
+        controller.prefetch_tokens_occupied = 4
+        controller.terminate_prefetch = mock.Mock(return_value=(2, []))
+        controller.append_host_mem_release = mock.Mock()
+        tree.cache_controller = controller
+        host_indices = torch.arange(4)
+        lock_params = object()
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        controller.ongoing_prefetch["req"] = (
+            tree.root_node,
+            [1, 2, 3, 4],
+            host_indices,
+            operation,
+            lock_params,
+            {},
+        )
+
+        with (
+            mock.patch.object(tree, "_barrier_attn_groups") as barrier,
+            mock.patch.object(tree, "dec_host_lock_ref") as dec_host_lock_ref,
+        ):
+            tree.release_aborted_request("req")
+
+        self.assertEqual(controller.prefetch_loaded_tokens_by_reqid, {})
+        self.assertEqual(controller.ongoing_prefetch, {})
+        self.assertEqual(controller.prefetch_tokens_occupied, 0)
+        barrier.assert_called_once_with()
+        dec_host_lock_ref.assert_called_once_with(tree.root_node, lock_params)
+        released = controller.append_host_mem_release.call_args.kwargs["host_indices"]
+        self.assertTrue(torch.equal(released, host_indices[:2]))
+        self.assertEqual(
+            controller.append_host_mem_release.call_args.kwargs["extra_pools"],
+            [],
+        )
+
+        operation = mock.Mock()
+        operation.host_indices = host_indices
+        controller.ongoing_prefetch["req"] = (
+            tree.root_node,
+            [1],
+            host_indices,
+            operation,
+            lock_params,
+            {},
+        )
+        tree.terminate_prefetch("req")
+        operation.mark_terminate.assert_called_once_with()
+
+        controller.prefetch_loaded_tokens_by_reqid["req"] = 5
+        self.assertEqual(tree.pop_prefetch_loaded_tokens("req"), 5)
 
 
 if __name__ == "__main__":
