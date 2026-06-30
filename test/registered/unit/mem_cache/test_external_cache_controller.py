@@ -196,6 +196,41 @@ class TestExternalCacheController(CustomTestCase):
             self.assertIsNot(tree_ops, tree)
             self.assertNotIsInstance(tree_ops, UnifiedTreeNode)
 
+    def test_generic_external_cache_facade_names_keep_legacy_aliases(self):
+        tree = _build_tree()
+
+        with mock.patch.object(tree, "prefetch_from_storage") as prefetch:
+            tree.prefetch_external_cache(
+                "req", tree.root_node, [1, 2], "last_hash", ["prefix_hash"]
+            )
+            prefetch.assert_called_once_with(
+                "req", tree.root_node, [1, 2], "last_hash", ["prefix_hash"]
+            )
+
+        with mock.patch.object(
+            tree, "check_prefetch_progress", return_value=False
+        ) as check_progress:
+            self.assertFalse(tree.check_external_cache_prefetch_progress("req"))
+            check_progress.assert_called_once_with("req")
+
+        with mock.patch.object(tree, "terminate_prefetch") as terminate:
+            tree.terminate_external_cache_prefetch("req")
+            terminate.assert_called_once_with("req")
+
+        with mock.patch.object(
+            tree, "pop_prefetch_loaded_tokens", return_value=3
+        ) as pop_loaded:
+            self.assertEqual(tree.pop_external_cache_loaded_tokens("req"), 3)
+            pop_loaded.assert_called_once_with("req")
+
+        with mock.patch.object(tree, "release_aborted_request") as release:
+            tree.release_aborted_external_cache_request("req")
+            release.assert_called_once_with("req")
+
+        with mock.patch.object(tree, "check_hicache_events") as check_events:
+            tree.check_external_cache_events()
+            check_events.assert_called_once_with()
+
     def test_ready_to_load_uses_hybrid_controller_begin_pending_loads(self):
         tree = _build_tree()
         controller = object.__new__(HybridCacheController)

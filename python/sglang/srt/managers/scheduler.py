@@ -2269,7 +2269,7 @@ class Scheduler(
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                self.tree_cache.prefetch_from_storage(
+                self.tree_cache.prefetch_external_cache(
                     req.rid,
                     last_host_node,
                     new_input_tokens,
@@ -2354,9 +2354,13 @@ class Scheduler(
             if abort_existing_req:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(candidate_req.rid)
+                    self.tree_cache.release_aborted_external_cache_request(
+                        candidate_req.rid
+                    )
                 elif self.enable_hierarchical_cache:
-                    self.tree_cache.terminate_prefetch(candidate_req.rid)
+                    self.tree_cache.terminate_external_cache_prefetch(
+                        candidate_req.rid
+                    )
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2386,7 +2390,7 @@ class Scheduler(
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
-                    self.tree_cache.release_aborted_request(req.rid)
+                    self.tree_cache.release_aborted_external_cache_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2520,7 +2524,7 @@ class Scheduler(
             )
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
-            self.tree_cache.release_aborted_request(req.rid)
+            self.tree_cache.release_aborted_external_cache_request(req.rid)
         if (
             req.req_pool_idx is not None or self.tree_cache.supports_mamba()
         ) and not req.kv_committed_freed:
@@ -2741,7 +2745,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+            self.tree_cache.check_external_cache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2855,13 +2859,15 @@ class Scheduler(
                     break
 
             if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                prefetch_done = (
+                    self.tree_cache.check_external_cache_prefetch_progress(req.rid)
+                )
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
+                req.storage_hit_length = (
+                    self.tree_cache.pop_external_cache_loaded_tokens(req.rid)
                 )
 
             req.init_next_round_input(self.tree_cache)
@@ -3841,7 +3847,7 @@ class Scheduler(
             req = self.waiting_queue.pop(i)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
-                self.tree_cache.release_aborted_request(req.rid)
+                self.tree_cache.release_aborted_external_cache_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

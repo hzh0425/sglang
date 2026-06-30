@@ -308,6 +308,33 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
+    def prefetch_external_cache(
+        self,
+        req_id: str,
+        last_host_node: Any,
+        new_input_tokens: list[int],
+        last_hash: Optional[str] = None,
+        prefix_keys: Optional[list[str]] = None,
+    ) -> Any:
+        return self.prefetch_from_storage(
+            req_id, last_host_node, new_input_tokens, last_hash, prefix_keys
+        )
+
+    def check_external_cache_prefetch_progress(self, req_id: str) -> bool:
+        return self.check_prefetch_progress(req_id)
+
+    def terminate_external_cache_prefetch(self, req_id: str) -> None:
+        return self.terminate_prefetch(req_id)
+
+    def pop_external_cache_loaded_tokens(self, req_id: str) -> int:
+        return self.pop_prefetch_loaded_tokens(req_id)
+
+    def release_aborted_external_cache_request(self, rid: str) -> None:
+        return self.release_aborted_request(rid)
+
+    def check_external_cache_events(self) -> Any:
+        return self.check_hicache_events()
+
     def flush_write_through_acks(self) -> None:
         """Release lock_ref on radix-tree nodes whose write-through has completed.
 

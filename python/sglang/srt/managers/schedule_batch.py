@@ -2128,7 +2128,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # - device_portion = len(prefix_indices) - host_hit_length
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
+                    # storage_hit_length is set by scheduler.pop_external_cache_loaded_tokens()
                     host_total = req.host_hit_length
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)

@@ -121,7 +121,7 @@ class DecodeHiCachePreallocMixin:
                 if self.tree_cache.hicache_storage_pass_prefix_keys
                 else None
             )
-            self.tree_cache.prefetch_from_storage(
+            self.tree_cache.prefetch_external_cache(
                 req.rid, node, suffix, last_hash, prefix_keys
             )
             prefix_match.prefetch_registered = (
@@ -173,7 +173,9 @@ class DecodeHiCacheTransferMixin:
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
         ):
-            self.tree_cache.release_aborted_request(decode_req.req.rid)
+            self.tree_cache.release_aborted_external_cache_request(
+                decode_req.req.rid
+            )
         if decode_req.hicache_restored_node is not None:
             self.tree_cache.dec_lock_ref(decode_req.hicache_restored_node)
             decode_req.hicache_restored_node = None
@@ -190,9 +192,11 @@ class DecodeHiCacheTransferMixin:
 
         # Wait for L3 -> L2 prefetch to drain (skip when no L3 hit).
         if pm.l3_storage_hit_length > 0:
-            if not self.tree_cache.check_prefetch_progress(dr.req.rid):
+            if not self.tree_cache.check_external_cache_prefetch_progress(
+                dr.req.rid
+            ):
                 return False
-            self.tree_cache.pop_prefetch_loaded_tokens(dr.req.rid)
+            self.tree_cache.pop_external_cache_loaded_tokens(dr.req.rid)
 
         # Re-match: req.last_node / prefix_indices updated to current device state.
         rematch = match_prefix_for_req(
