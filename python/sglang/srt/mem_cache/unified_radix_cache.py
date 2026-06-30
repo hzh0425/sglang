@@ -510,7 +510,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
-        self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self._ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -550,6 +550,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, value: dict[int, _OngoingWriteThrough]
     ) -> None:
         self._ongoing_write_through = value
+
+    @property
+    def ongoing_backup(
+        self,
+    ) -> dict[int, tuple[UnifiedTreeNode, DecLockRefParams]]:
+        if self.cache_controller is not None:
+            controller_state = getattr(self.cache_controller, "ongoing_backup", None)
+            if controller_state is not None:
+                return controller_state
+        return self._ongoing_backup
+
+    @ongoing_backup.setter
+    def ongoing_backup(
+        self, value: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]]
+    ) -> None:
+        self._ongoing_backup = value
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -1715,6 +1731,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
+        if self.cache_controller is not None and hasattr(
+            self.cache_controller, "finish_write_through_ack"
+        ):
+            self.cache_controller.finish_write_through_ack(
+                ack_id,
+                publish_host_node=lambda node: self._record_store_event(
+                    node, medium=StorageMedium.CPU
+                ),
+                release_node_lock=self.dec_lock_ref,
+                enqueue_storage_backup=(
+                    self.write_backup_storage if self.enable_storage else None
+                ),
+            )
+            return
+
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:

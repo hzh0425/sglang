@@ -176,6 +176,7 @@ class HybridCacheController(BaseHiCacheController):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.ongoing_write_through: dict[int, Any] = {}
+        self.ongoing_backup: dict[int, Any] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -354,11 +355,31 @@ class HybridCacheController(BaseHiCacheController):
     def reset(self):
         super().reset()
         self.ongoing_write_through.clear()
+        self.ongoing_backup.clear()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
             for release_queue in self.extra_host_mem_release_queues.values():
                 release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+
+    def finish_write_through_ack(
+        self,
+        ack_id: int,
+        *,
+        publish_host_node: Callable[[Any], None],
+        release_node_lock: Callable[[Any, Any], None],
+        enqueue_storage_backup: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        for node in publish_nodes:
+            if node.write_through_pending_id == ack_id:
+                node.write_through_pending_id = None
+            publish_host_node(node)
+        if lock_params is not None:
+            release_node_lock(lock_node, lock_params)
+        if enqueue_storage_backup is not None:
+            for node in publish_nodes:
+                enqueue_storage_backup(node)
 
     def write(
         self,
