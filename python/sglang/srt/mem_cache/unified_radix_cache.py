@@ -506,7 +506,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for ct in self.tree_components
         }
         self._ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
-        self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
+        self._ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
@@ -550,6 +550,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, value: dict[int, _OngoingWriteThrough]
     ) -> None:
         self._ongoing_write_through = value
+
+    @property
+    def ongoing_load_back(self) -> dict[int, _OngoingLoadBack]:
+        if self.cache_controller is not None:
+            controller_state = getattr(
+                self.cache_controller, "ongoing_load_back", None
+            )
+            if controller_state is not None:
+                return controller_state
+        return self._ongoing_load_back
+
+    @ongoing_load_back.setter
+    def ongoing_load_back(self, value: dict[int, _OngoingLoadBack]) -> None:
+        self._ongoing_load_back = value
 
     @property
     def ongoing_backup(
@@ -2488,6 +2502,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
+    def _finish_load_back_ack(self, ack_id: int) -> None:
+        if self.cache_controller is not None and hasattr(
+            self.cache_controller, "finish_load_back_ack"
+        ):
+            self.cache_controller.finish_load_back_ack(
+                ack_id,
+                release_node_lock=self.dec_lock_ref,
+                release_host_lock=self.dec_host_lock_ref,
+            )
+            return
+
+        node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+        self.dec_lock_ref(node, lock_params)
+        self.dec_host_lock_ref(node, host_lock_params)
+
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
@@ -2509,9 +2538,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(node, lock_params)
-                self.dec_host_lock_ref(node, host_lock_params)
+                self._finish_load_back_ack(ack_id)
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----

@@ -215,10 +215,12 @@ class TestExternalCacheController(CustomTestCase):
         tree = _build_tree()
         controller = object.__new__(HybridCacheController)
         controller.ongoing_write_through = {}
+        controller.ongoing_load_back = {}
         controller.ongoing_backup = {}
         tree.cache_controller = controller
 
         self.assertIs(tree.ongoing_write_through, controller.ongoing_write_through)
+        self.assertIs(tree.ongoing_load_back, controller.ongoing_load_back)
         self.assertIs(tree.ongoing_backup, controller.ongoing_backup)
 
         tree._track_write_through_node(tree.root_node, None)
@@ -277,6 +279,31 @@ class TestExternalCacheController(CustomTestCase):
                 mock.call(right),
             ]
         )
+
+    def test_load_back_ack_completion_runs_in_hybrid_controller(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        controller.ongoing_write_through = {}
+        controller.ongoing_load_back = {}
+        controller.ongoing_backup = {}
+        tree.cache_controller = controller
+        lock_params = object()
+        host_lock_params = object()
+        controller.ongoing_load_back[tree.root_node.id] = (
+            tree.root_node,
+            lock_params,
+            host_lock_params,
+        )
+
+        with (
+            mock.patch.object(tree, "dec_lock_ref") as dec_lock_ref,
+            mock.patch.object(tree, "dec_host_lock_ref") as dec_host_lock_ref,
+        ):
+            tree._finish_load_back_ack(tree.root_node.id)
+
+        self.assertEqual(controller.ongoing_load_back, {})
+        dec_lock_ref.assert_called_once_with(tree.root_node, lock_params)
+        dec_host_lock_ref.assert_called_once_with(tree.root_node, host_lock_params)
 
 
 if __name__ == "__main__":

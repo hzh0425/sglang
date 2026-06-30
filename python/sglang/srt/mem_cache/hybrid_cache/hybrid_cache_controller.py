@@ -176,6 +176,7 @@ class HybridCacheController(BaseHiCacheController):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
         self.ongoing_write_through: dict[int, Any] = {}
+        self.ongoing_load_back: dict[int, Any] = {}
         self.ongoing_backup: dict[int, Any] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -355,6 +356,7 @@ class HybridCacheController(BaseHiCacheController):
     def reset(self):
         super().reset()
         self.ongoing_write_through.clear()
+        self.ongoing_load_back.clear()
         self.ongoing_backup.clear()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
@@ -380,6 +382,17 @@ class HybridCacheController(BaseHiCacheController):
         if enqueue_storage_backup is not None:
             for node in publish_nodes:
                 enqueue_storage_backup(node)
+
+    def finish_load_back_ack(
+        self,
+        ack_id: int,
+        *,
+        release_node_lock: Callable[[Any, Any], None],
+        release_host_lock: Callable[[Any, Any], None],
+    ) -> None:
+        node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
+        release_node_lock(node, lock_params)
+        release_host_lock(node, host_lock_params)
 
     def write(
         self,
