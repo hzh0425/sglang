@@ -28,6 +28,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.external_cache_controller import (
+    BackupRequest,
+    BaseExternalCacheController,
+    ExternalCacheTreeOps,
+    LoadBackRequest,
+    NoopExternalCacheController,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -302,6 +309,10 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _EmptyExternalCacheTreeOps:
+    pass
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -367,6 +378,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        self.external_cache_controller: BaseExternalCacheController = (
+            NoopExternalCacheController()
+        )
+        self.external_cache_tree_ops: ExternalCacheTreeOps = _EmptyExternalCacheTreeOps()
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -474,6 +489,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
+        self.external_cache_controller.reset()
 
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
@@ -486,6 +502,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node=self.root_node,
         )
         self._record_all_cleared_event()
+
+    def _uses_external_cache_controller(self) -> bool:
+        return not isinstance(
+            self.external_cache_controller, NoopExternalCacheController
+        )
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
@@ -1539,6 +1560,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
+        if self._uses_external_cache_controller():
+            result = self.external_cache_controller.write_backup(
+                BackupRequest(node_id=node.id, write_back=write_back),
+                self.external_cache_tree_ops,
+            )
+            return result.backed_up_tokens
+
         if self.cache_controller is None:
             return 0
 
@@ -1664,6 +1692,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req=None,
     ) -> bool:
         """Load evicted KV data from host back to device (H→D)."""
+        if self._uses_external_cache_controller():
+            result = self.external_cache_controller.load_back(
+                LoadBackRequest(node_id=best_match_node.id, mem_quota=mem_quota),
+                self.external_cache_tree_ops,
+            )
+            return result.loaded
+
         if self.cache_controller is None:
             return False
 
@@ -2464,6 +2499,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        if self._uses_external_cache_controller():
+            self.external_cache_controller.poll(self.external_cache_tree_ops)
+            return
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -2479,6 +2517,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
+        if self._uses_external_cache_controller():
+            return self.external_cache_controller.begin_pending_loads()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0
