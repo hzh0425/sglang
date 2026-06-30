@@ -505,7 +505,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
-        self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        self._ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
         self.ongoing_load_back: dict[int, _OngoingLoadBack] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -534,6 +534,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return not isinstance(
             self.external_cache_controller, NoopExternalCacheController
         )
+
+    @property
+    def ongoing_write_through(self) -> dict[int, _OngoingWriteThrough]:
+        if self.cache_controller is not None:
+            controller_state = getattr(
+                self.cache_controller, "ongoing_write_through", None
+            )
+            if controller_state is not None:
+                return controller_state
+        return self._ongoing_write_through
+
+    @ongoing_write_through.setter
+    def ongoing_write_through(
+        self, value: dict[int, _OngoingWriteThrough]
+    ) -> None:
+        self._ongoing_write_through = value
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""

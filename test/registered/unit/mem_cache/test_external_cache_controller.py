@@ -13,6 +13,9 @@ from sglang.srt.mem_cache.external_cache_controller import (
     LoadBackResult,
     NoopExternalCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ComponentType,
@@ -205,6 +208,33 @@ class TestExternalCacheController(CustomTestCase):
         self.assertFalse(tree_ops.contains_node(-1))
         with self.assertRaises(KeyError):
             tree_ops.get_node_token_count(-1)
+
+    def test_write_through_state_is_owned_by_hybrid_controller(self):
+        tree = _build_tree()
+        controller = object.__new__(HybridCacheController)
+        controller.ongoing_write_through = {}
+        tree.cache_controller = controller
+
+        self.assertIs(tree.ongoing_write_through, controller.ongoing_write_through)
+
+        tree._track_write_through_node(tree.root_node, None)
+
+        pending = controller.ongoing_write_through[tree.root_node.id]
+        self.assertIs(pending.node, tree.root_node)
+        self.assertEqual(pending.publish_nodes, [tree.root_node])
+        self.assertEqual(
+            tree.root_node.write_through_pending_id,
+            tree.root_node.id,
+        )
+
+        left = UnifiedTreeNode((ComponentType.FULL,))
+        right = UnifiedTreeNode((ComponentType.FULL,))
+        tree._replace_pending_write_through_node(tree.root_node, [left, right])
+
+        updated = controller.ongoing_write_through[tree.root_node.id]
+        self.assertEqual(updated.publish_nodes, [left, right])
+        self.assertEqual(left.write_through_pending_id, tree.root_node.id)
+        self.assertEqual(right.write_through_pending_id, tree.root_node.id)
 
 
 if __name__ == "__main__":

@@ -175,6 +175,7 @@ class HybridCacheController(BaseHiCacheController):
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
+        self.ongoing_write_through: dict[int, Any] = {}
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -352,6 +353,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def reset(self):
         super().reset()
+        self.ongoing_write_through.clear()
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
             for release_queue in self.extra_host_mem_release_queues.values():
