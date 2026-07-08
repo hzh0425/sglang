@@ -7,6 +7,8 @@ import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -34,7 +36,11 @@ def walk_radix_cache_for_canary(
     req. ``swa_resident_only=True`` skips SWA-tombstoned nodes (slots evicted from the SWA
     window)."""
     cache_type = type(radix_cache)
-    if cache_type is not RadixCache and cache_type is not SWARadixCache:
+    if (
+        cache_type is not RadixCache
+        and cache_type is not SWARadixCache
+        and cache_type is not UnifiedRadixCache
+    ):
         raise NotImplementedError(
             f"walk_radix_cache_for_canary does not support {cache_type.__name__}"
         )
@@ -79,10 +85,7 @@ def _walk_radix_subtree(
     unlocked_only: bool,
     swa_resident_only: bool,
 ) -> None:
-    if isinstance(node.value, torch.Tensor):
-        node_slots = [int(s) for s in node.value.tolist()]
-    else:
-        node_slots = []
+    node_slots = _node_full_slots(node=node, radix_cache=radix_cache)
 
     if unlocked_only:
         emit_slots = not is_root and _node_is_unlocked_for_canary(
@@ -132,6 +135,9 @@ def _node_is_unlocked_for_canary(
     if type(radix_cache) is SWARadixCache:
         return node.full_lock_ref == 0
 
+    if type(radix_cache) is UnifiedRadixCache:
+        return node.component_data[ComponentType.FULL].lock_ref == 0
+
     raise NotImplementedError(
         f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"
     )
@@ -142,7 +148,22 @@ def _node_is_swa_resident_for_canary(
     node: TreeNode,
     radix_cache: BasePrefixCache,
 ) -> bool:
-    if type(radix_cache) is not SWARadixCache:
-        return True
+    if type(radix_cache) is SWARadixCache:
+        return not node.swa_tombstone
 
-    return not node.swa_tombstone
+    if type(radix_cache) is UnifiedRadixCache:
+        return node.component_data[ComponentType.SWA].value is not None
+
+    return True
+
+
+def _node_full_slots(*, node, radix_cache: BasePrefixCache) -> list[int]:
+    # UnifiedRadixCache stores per-node KV under ``component_data`` instead of
+    # ``node.value``.
+    if type(radix_cache) is UnifiedRadixCache:
+        value = node.component_data[ComponentType.FULL].value
+    else:
+        value = node.value
+    if isinstance(value, torch.Tensor):
+        return [int(s) for s in value.tolist()]
+    return []
