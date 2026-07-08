@@ -6,6 +6,8 @@ import torch
 
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
 from sglang.test.test_utils import CustomTestCase
@@ -123,6 +125,39 @@ class TestSelfUnitRadixWalker(CustomTestCase):
             swa_resident_only=True,
         )
         self.assertEqual(result.slot_indices.tolist(), [3, 4])
+
+    def test_unified_swa_walk_unlocked_only_uses_swa_lock_ref(self):
+        """Verify Unified SWA unlocked walking honors the SWA component lock."""
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.device = self.device
+        cache.page_size = 1
+        cache.disable = False
+        cache.tree_components = (ComponentType.FULL, ComponentType.SWA)
+        cache.components = {ComponentType.SWA: object()}
+
+        root = UnifiedTreeNode(cache.tree_components)
+        root.key = []
+        cache.root_node = root
+
+        child = UnifiedTreeNode(cache.tree_components)
+        child.key = [1]
+        child.parent = root
+        child.component_data[ComponentType.FULL].value = torch.tensor(
+            [1], dtype=torch.int64, device=self.device
+        )
+        child.component_data[ComponentType.FULL].lock_ref = 1
+        child.component_data[ComponentType.SWA].value = torch.tensor(
+            [2], dtype=torch.int64, device=self.device
+        )
+        root.children[child.id] = child
+
+        result = walk_radix_cache_for_canary(
+            radix_cache=cache,
+            unlocked_only=True,
+            swa_resident_only=True,
+        )
+
+        self.assertEqual(result.slot_indices.tolist(), [1])
 
 
 if __name__ == "__main__":

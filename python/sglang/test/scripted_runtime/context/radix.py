@@ -19,6 +19,8 @@ def get_all_node_lock_refs(ctx: ScriptedContext) -> Dict[int, int]:
 def _node_lock_ref(node: Any) -> int:
     if isinstance(node, SWATreeNode):
         return node.full_lock_ref + node.swa_lock_ref
+    if hasattr(node, "component_data"):
+        return sum(component.lock_ref for component in node.component_data)
     return node.lock_ref
 
 

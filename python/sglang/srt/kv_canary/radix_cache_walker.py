@@ -89,7 +89,9 @@ def _walk_radix_subtree(
 
     if unlocked_only:
         emit_slots = not is_root and _node_is_unlocked_for_canary(
-            node=node, radix_cache=radix_cache
+            node=node,
+            radix_cache=radix_cache,
+            swa_resident_only=swa_resident_only,
         )
     else:
         emit_slots = not is_root
@@ -128,6 +130,7 @@ def _node_is_unlocked_for_canary(
     *,
     node: TreeNode,
     radix_cache: BasePrefixCache,
+    swa_resident_only: bool,
 ) -> bool:
     if type(radix_cache) is RadixCache:
         return node.lock_ref == 0
@@ -136,7 +139,12 @@ def _node_is_unlocked_for_canary(
         return node.full_lock_ref == 0
 
     if type(radix_cache) is UnifiedRadixCache:
-        return node.component_data[ComponentType.FULL].lock_ref == 0
+        component_type = (
+            ComponentType.SWA
+            if swa_resident_only and radix_cache.supports_swa()
+            else ComponentType.FULL
+        )
+        return node.component_data[component_type].lock_ref == 0
 
     raise NotImplementedError(
         f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"

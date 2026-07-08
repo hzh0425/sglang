@@ -1,8 +1,11 @@
 import unittest
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
+from sglang.test.scripted_runtime.context.radix import _node_lock_ref
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
 from sglang.test.scripted_runtime.req_handle import ScriptedReqHandle
 from sglang.test.scripted_runtime.test_case import ScriptedTestCase
@@ -29,6 +32,15 @@ _ENGINE_KWARGS = base_engine_kwargs(chunked_prefill_size=_CHUNK_SIZE)
 
 def _script_noop(t: ScriptedContext):
     yield
+
+
+class TestScriptedRuntimeRadixHelpers(CustomTestCase):
+    def test_node_lock_ref_supports_unified_tree_node(self):
+        node = UnifiedTreeNode((ComponentType.FULL, ComponentType.SWA))
+        node.component_data[ComponentType.FULL].lock_ref = 2
+        node.component_data[ComponentType.SWA].lock_ref = 1
+
+        self.assertEqual(_node_lock_ref(node), 3)
 
 
 class TestScriptedRuntimeCore(ScriptedTestCase):
