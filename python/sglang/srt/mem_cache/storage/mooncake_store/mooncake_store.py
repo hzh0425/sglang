@@ -840,10 +840,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
-                )
+            ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                key_strs, ptr_list, element_size_list
+            )
 
             if is_set:
                 group_ids = (

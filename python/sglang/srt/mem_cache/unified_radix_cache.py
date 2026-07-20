@@ -29,6 +29,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.external_cache_connector import (
+    ExternalCacheConnector,
+    ExternalCacheHit,
+    ExternalStoreCompletion,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -304,6 +309,13 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _ExternalLoadMarker(NamedTuple):
+    key: RadixKey
+    anchor_node: UnifiedTreeNode
+    local_tokens: int
+    hit: ExternalCacheHit
+
+
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
@@ -371,6 +383,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
+        self.external_cache_connector: Optional[ExternalCacheConnector] = None
         self.write_through_threshold = 256
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
@@ -448,6 +461,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.work_list.append(send_work)
 
     def reset(self) -> None:
+        connector = self.external_cache_connector
+        if connector is not None:
+            self._finish_external_stores(connector.wait_for_all_stores())
+            if self.ongoing_external_store:
+                raise RuntimeError(
+                    "External cache reset left unfinished store operations: "
+                    f"{sorted(self.ongoing_external_store)}"
+                )
+            connector.reset()
         self._reset_full()
 
     def _reset_full(self) -> None:
@@ -479,6 +501,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
+        self.external_load_markers: dict[str, _ExternalLoadMarker] = {}
+        self.ongoing_external_store: dict[
+            int, tuple[UnifiedTreeNode, DecLockRefParams]
+        ] = {}
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -570,6 +596,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
+    def install_external_cache(
+        self,
+        connector: ExternalCacheConnector,
+        *,
+        sidecars: tuple[SidecarPoolSpec, ...] = (),
+    ) -> None:
+        if self.cache_controller is not None:
+            raise ValueError("External cache cannot be combined with HiCache")
+        if self.external_cache_connector is not None:
+            raise ValueError("External cache connector is already installed")
+        self.external_cache_connector = connector
+        self.sidecar_pool_specs.clear()
+        self.sidecar_pool_specs.extend(sidecars)
+        logger.info(
+            "Installed external cache connector %s with pools %s",
+            type(connector).__name__,
+            [str(spec.pool_name) for spec in sidecars],
+        )
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
         if result is not None:
@@ -589,12 +634,98 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
+        )
+        return self._match_external_cache(params, key, result)
+
+    def _sync_external_min(self, value: int) -> int:
+        state = torch.tensor(value, dtype=torch.int64, device="cpu")
+        self._all_reduce_attn_groups(state, torch.distributed.ReduceOp.MIN)
+        return int(state.item())
+
+    def _build_external_transfers(
+        self, device_indices: Optional[torch.Tensor] = None
+    ) -> list[PoolTransfer]:
+        transfers = [
+            PoolTransfer(name=PoolName.KV, device_indices=device_indices)
+        ]
+        transfers.extend(
+            PoolTransfer(
+                name=spec.pool_name,
+                device_indices=device_indices,
+                hit_policy=spec.hit_policy,
+                indices_from_pool=spec.indices_from_pool,
+            )
+            for spec in self.sidecar_pool_specs
+        )
+        return transfers
+
+    @staticmethod
+    def _snapshot_radix_key(key: RadixKey) -> RadixKey:
+        return RadixKey(
+            array("q", key.raw_token_ids()),
+            key.extra_key,
+            is_bigram=key.is_bigram,
+        )
+
+    def _match_external_cache(
+        self,
+        params: MatchPrefixParams,
+        key: RadixKey,
+        result: MatchResult,
+    ) -> MatchResult:
+        connector = self.external_cache_connector
+        req = params.req
+        if connector is None or req is None:
+            return result
+
+        local_tokens = len(result.device_indices)
+        if local_tokens >= len(key):
+            self.external_load_markers.pop(req.rid, None)
+            return result
+
+        try:
+            hit = connector.query(
+                key,
+                local_tokens,
+                self._build_external_transfers(),
+            )
+        except Exception:
+            logger.exception("External cache Bundle query failed")
+            hit = ExternalCacheHit([], 0)
+        local_pages = min(
+            hit.hit_tokens // self.page_size,
+            len(hit.page_keys),
+            (len(key) - local_tokens) // self.page_size,
+        )
+        hit_pages = self._sync_external_min(local_pages)
+        if hit_pages <= 0:
+            self.external_load_markers.pop(req.rid, None)
+            return result
+
+        hit_tokens = hit_pages * self.page_size
+        hit = ExternalCacheHit(hit.page_keys[:hit_pages], hit_tokens)
+        self.external_load_markers[req.rid] = _ExternalLoadMarker(
+            key=self._snapshot_radix_key(key),
+            anchor_node=result.last_device_node,
+            local_tokens=local_tokens,
+            hit=hit,
+        )
+        logger.info(
+            "External cache hit req=%s local_tokens=%d remote_tokens=%d",
+            req.rid,
+            local_tokens,
+            hit_tokens,
+        )
+        return result._replace(
+            last_host_node=result.last_device_node,
+            best_match_node=result.last_device_node,
+            host_hit_length=hit_tokens,
         )
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -770,6 +901,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
+
+            if self.external_cache_connector is not None and page_aligned_len > 0:
+                stored = self.match_prefix(MatchPrefixParams(key=radix_key))
+                if len(stored.device_indices) != page_aligned_len:
+                    raise RuntimeError(
+                        "External store requires a complete local Bundle: "
+                        f"expected={page_aligned_len}, actual={len(stored.device_indices)}"
+                    )
+                self._submit_external_store(
+                    radix_key,
+                    stored.last_device_node,
+                    stored.device_indices,
+                )
 
             # Free unaligned tail
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
@@ -1080,7 +1224,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
-        if self.enable_storage:
+        if self.enable_storage or self.external_cache_connector is not None:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)
@@ -2155,6 +2299,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
+        self.external_load_markers.pop(rid, None)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
@@ -2519,6 +2664,66 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    def _load_external_marker(
+        self, marker: _ExternalLoadMarker
+    ) -> tuple[torch.Tensor, UnifiedTreeNode]:
+        hit_tokens = marker.hit.hit_tokens
+        allocator = getattr(
+            self.token_to_kv_pool_allocator,
+            "full_attn_allocator",
+            self.token_to_kv_pool_allocator,
+        )
+        device_indices = None
+        try:
+            available = allocator.available_size()
+            if available < hit_tokens:
+                self.evict(EvictParams(num_tokens=hit_tokens - available))
+            device_indices = allocator.alloc(hit_tokens)
+        except Exception:
+            logger.exception("External cache Bundle allocation failed")
+        allocated = device_indices is not None
+        if self._sync_external_min(int(allocated)) == 0:
+            if device_indices is not None:
+                allocator.free(device_indices)
+            return self._empty_match_result.device_indices, marker.anchor_node
+
+        assert device_indices is not None
+        transfers = self._build_external_transfers(device_indices)
+        try:
+            connector = self.external_cache_connector
+            assert connector is not None
+            loaded = connector.load(marker.hit, transfers)
+        except Exception:
+            logger.exception("External cache Bundle load failed")
+            loaded = False
+
+        if self._sync_external_min(int(loaded)) == 0:
+            allocator.free(device_indices)
+            return self._empty_match_result.device_indices, marker.anchor_node
+
+        tail_end = marker.local_tokens + hit_tokens
+        tail_key = marker.key[marker.local_tokens:tail_end]
+        self._insert_helper(
+            marker.anchor_node,
+            tail_key,
+            device_indices,
+            InsertParams(
+                prev_prefix_len=0,
+                swa_evicted_seqlen=hit_tokens,
+                priority=marker.anchor_node.priority,
+            ),
+        )
+        committed = self.match_prefix(MatchPrefixParams(key=marker.key))
+        if len(committed.device_indices) < tail_end:
+            raise RuntimeError(
+                "External cache Bundle loaded but local tree commit was short: "
+                f"expected={tail_end}, actual={len(committed.device_indices)}"
+            )
+        return (
+            committed.device_indices[marker.local_tokens:tail_end],
+            committed.last_device_node,
+        )
+
     def init_load_back(
         self,
         params: InitLoadBackParams,
@@ -2530,6 +2735,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req = params.req
         assert req is not None
         last_best_match_device_node = req.last_node
+
+        marker = self.external_load_markers.pop(req.rid, None)
+        if marker is not None:
+            return self._load_external_marker(marker)
 
         def _collect_new_prefix_indices() -> torch.Tensor:
             prefix_chunks: list[torch.Tensor] = []
@@ -2572,8 +2781,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             last_best_match_device_node,
         )
 
+    def _submit_external_store(
+        self,
+        key: RadixKey,
+        node: UnifiedTreeNode,
+        device_indices: torch.Tensor,
+    ) -> int:
+        connector = self.external_cache_connector
+        if connector is None:
+            raise RuntimeError("External cache connector is not installed")
+
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        try:
+            operation_id = connector.store_async(
+                key,
+                self._build_external_transfers(device_indices),
+            )
+        except Exception:
+            self.dec_lock_ref(node, lock_params)
+            raise
+        self.ongoing_external_store[operation_id] = (node, lock_params)
+        return operation_id
+
+    def _finish_external_stores(
+        self, completions: list[ExternalStoreCompletion]
+    ) -> None:
+        for completion in completions:
+            pending = self.ongoing_external_store.pop(completion.operation_id, None)
+            if pending is None:
+                continue
+            node, lock_params = pending
+            self.dec_lock_ref(node, lock_params)
+            if not completion.success:
+                logger.error(
+                    "External cache store operation %d failed",
+                    completion.operation_id,
+                )
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.external_cache_connector is not None:
+            self._finish_external_stores(
+                self.external_cache_connector.poll_completed()
+            )
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         self.writing_check()
@@ -2595,6 +2845,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return self.cache_controller.start_loading()
         return 0
 
+    def shutdown(self) -> None:
+        connector = self.external_cache_connector
+        if connector is None:
+            return
+        self._finish_external_stores(connector.wait_for_all_stores())
+        connector.close()
+
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
     # TODO: simplify and consolidate in a future refactor.
@@ -2615,7 +2872,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         swa = self.components.get(ComponentType.SWA)
         unified_compress_only_hicache = (
-            self.cache_controller is not None
+            (
+                self.cache_controller is not None
+                or self.external_cache_connector is not None
+            )
             and swa is not None
             and swa._swa_kv_pool_host is None
         )

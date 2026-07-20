@@ -2861,6 +2861,7 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+        self._handle_radix_cache_backend()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -6490,6 +6491,32 @@ class ServerArgs:
         # the user input before it ever takes effect.
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+    def _handle_radix_cache_backend(self):
+        if self.radix_cache_backend != "mooncake":
+            return
+
+        incompatible_options = (
+            (self.enable_hierarchical_cache, "--enable-hierarchical-cache"),
+            (self.hicache_storage_backend is not None, "--hicache-storage-backend"),
+            (self.enable_flexkv, "--enable-flexkv"),
+            (self.enable_lmcache, "--enable-lmcache"),
+            (self.disable_radix_cache, "--disable-radix-cache"),
+            (self.enable_streaming_session, "--enable-streaming-session"),
+            (self.pp_size > 1, "--pp-size > 1"),
+            (
+                self.disaggregation_mode != "null",
+                "--disaggregation-mode other than null",
+            ),
+            (self.speculative_algorithm is not None, "speculative decoding"),
+            (self.nnodes > 1, "multi-node execution"),
+        )
+        for enabled, option in incompatible_options:
+            if enabled:
+                raise ValueError(
+                    "--radix-cache-backend=mooncake is not compatible with "
+                    f"{option}."
+                )
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:

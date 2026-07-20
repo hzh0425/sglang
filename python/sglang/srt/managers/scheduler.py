@@ -356,6 +356,9 @@ class Scheduler(
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
+        self.enable_external_radix_cache = (
+            server_args.radix_cache_backend == "mooncake"
+        )
         self.enable_decode_hicache = (
             server_args.disaggregation_decode_enable_radix_cache
             and self.enable_hierarchical_cache
@@ -2445,8 +2448,7 @@ class Scheduler(
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
+                if self.enable_hicache_storage or self.enable_external_radix_cache:
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
@@ -2477,8 +2479,7 @@ class Scheduler(
         for req in self.waiting_queue:
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
-                if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
+                if self.enable_hicache_storage or self.enable_external_radix_cache:
                     self.tree_cache.release_aborted_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
@@ -2613,7 +2614,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_external_radix_cache:
             self.tree_cache.release_aborted_request(req.rid)
         release_kv_cache(req, self.tree_cache, is_insert=False)
 
@@ -2839,7 +2840,11 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
-        if self.enable_hierarchical_cache or self.server_args.enable_flexkv:
+        if (
+            self.enable_hierarchical_cache
+            or self.server_args.enable_flexkv
+            or self.enable_external_radix_cache
+        ):
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -4026,8 +4031,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
-            if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
+            if self.enable_hicache_storage or self.enable_external_radix_cache:
                 self.tree_cache.release_aborted_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
@@ -4067,7 +4071,7 @@ class Scheduler(
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    if self.enable_hicache_storage:
+                    if self.enable_hicache_storage or self.enable_external_radix_cache:
                         self.tree_cache.release_aborted_request(req.rid)
 
                     if hasattr(req.disagg_kv_sender, "abort"):
@@ -4402,6 +4406,9 @@ class Scheduler(
         return None
 
     def handle_shutdown(self, recv_req: ShutdownReq):
+        shutdown_cache = getattr(self.tree_cache, "shutdown", None)
+        if callable(shutdown_cache):
+            shutdown_cache()
         # Break the event loop; the finally in run_scheduler_process releases resources.
         self.gracefully_exit = True
         return None

@@ -10,6 +10,7 @@ To plug in a custom backend, register it under a string name via
 
 from __future__ import annotations
 
+import importlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -50,6 +51,10 @@ RadixCacheFactory = Callable[[TreeCacheBuildContext], BasePrefixCache]
 
 _RADIX_CACHE_REGISTRY: dict[str, RadixCacheFactory] = {}
 
+_BUILTIN_RADIX_CACHE_MODULES = {
+    "mooncake": "sglang.srt.mem_cache.storage.mooncake_store",
+}
+
 
 def register_radix_cache_backend(name: str, factory: RadixCacheFactory) -> None:
     """Register a radix-cache factory under `name`.
@@ -74,6 +79,12 @@ def get_radix_cache_factory(name: str) -> Optional[RadixCacheFactory]:
 
 def registered_radix_cache_backends() -> list[str]:
     return list(_RADIX_CACHE_REGISTRY.keys())
+
+
+def _load_builtin_radix_cache_backend(name: str) -> None:
+    module = _BUILTIN_RADIX_CACHE_MODULES.get(name)
+    if module is not None and get_radix_cache_factory(name) is None:
+        importlib.import_module(module)
 
 
 def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
@@ -197,6 +208,7 @@ def create_tree_cache(ctx: TreeCacheBuildContext) -> BasePrefixCache:
     """Route to the matching factory to construct Radix Cache."""
     name = ctx.server_args.radix_cache_backend
     if name:
+        _load_builtin_radix_cache_backend(name)
         factory = get_radix_cache_factory(name)
         if factory is None:
             raise ValueError(

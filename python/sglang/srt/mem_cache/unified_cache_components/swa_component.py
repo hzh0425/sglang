@@ -124,7 +124,11 @@ class SWAComponent(TreeComponent):
         # unified_kv never caches the SWA ring (per-request, not content-stable),
         # so SWA bookkeeping must not gate the match here.
         swa_device_only_hicache = (
-            self._swa_kv_pool_host is None and self.cache.cache_controller is not None
+            self._swa_kv_pool_host is None
+            and (
+                self.cache.cache_controller is not None
+                or self.cache.external_cache_connector is not None
+            )
         )
 
         def validator(node: UnifiedTreeNode) -> bool:
