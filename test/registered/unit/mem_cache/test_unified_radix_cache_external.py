@@ -267,6 +267,7 @@ class TestUnifiedExternalLoad(CustomTestCase):
         cache, _, connector = _make_cache()
         req = SimpleNamespace(
             rid="r",
+            session=None,
             last_node=cache.root_node,
             swa_host_hit_length=0,
             mamba_host_hit_length=0,
@@ -305,6 +306,7 @@ class TestUnifiedExternalLoad(CustomTestCase):
         connector.load_ok = False
         req = SimpleNamespace(
             rid="r",
+            session=None,
             last_node=cache.root_node,
             swa_host_hit_length=0,
             mamba_host_hit_length=0,
@@ -328,7 +330,7 @@ class TestUnifiedExternalLoad(CustomTestCase):
     def test_tree_clamps_remote_hit_with_rank_minimum(self):
         cache, _, _ = _make_cache()
         cache._sync_external_min = lambda value: 1
-        req = SimpleNamespace(rid="r")
+        req = SimpleNamespace(rid="r", session=None)
 
         match = cache.match_prefix(
             MatchPrefixParams(
@@ -345,6 +347,7 @@ class TestUnifiedExternalLoad(CustomTestCase):
         cache._sync_external_min = lambda value: next(agreed)
         req = SimpleNamespace(
             rid="r",
+            session=None,
             last_node=cache.root_node,
             swa_host_hit_length=0,
             mamba_host_hit_length=0,
