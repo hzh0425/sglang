@@ -44,7 +44,11 @@ def _mooncake_factory(ctx):
         attn_cp_rank=attn_cp_rank,
         attn_cp_size=attn_cp_size,
     )
-    cache.install_external_cache(connector, sidecars=pool_stack.sidecars)
+    cache.install_external_cache(
+        connector,
+        sidecars=pool_stack.sidecars,
+        component_pools=pool_stack.component_pools,
+    )
     return cache
 
 

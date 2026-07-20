@@ -77,6 +77,14 @@ class MooncakeConnector(ExternalCacheConnector):
             model_config, server_args, self.page_size, tp_size
         )
         backend_tag = f"{namespace}_cp{attn_cp_rank}of{attn_cp_size}"
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+            getattr(server_args, "hicache_storage_backend_extra_config", None)
+        )
+        extra_config["extra_backend_tag"] = backend_tag
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -88,7 +96,7 @@ class MooncakeConnector(ExternalCacheConnector):
             enable_storage_metrics=False,
             is_page_first_layout=False,
             model_name=getattr(server_args, "model_path", None),
-            extra_config={"extra_backend_tag": backend_tag},
+            extra_config=extra_config,
         )
 
         if _storage is None:
@@ -201,10 +209,14 @@ class MooncakeConnector(ExternalCacheConnector):
         )
 
     @staticmethod
-    def _all_pages_succeeded(results: dict, expected_pages: int) -> bool:
+    def _all_transfers_succeeded(
+        results: dict, transfers: Sequence[PoolTransfer]
+    ) -> bool:
         return bool(results) and all(
-            len(pool_results) == expected_pages and all(pool_results)
-            for pool_results in results.values()
+            transfer.name in results
+            and len(results[transfer.name]) == len(transfer.keys)
+            and all(results[transfer.name])
+            for transfer in transfers
         )
 
     def load(
@@ -216,7 +228,7 @@ class MooncakeConnector(ExternalCacheConnector):
             return False
         resolved = self._resolve_transfers(hit.page_keys, transfers)
         results = self.storage.batch_get_v2(resolved)
-        return self._all_pages_succeeded(results, len(hit.page_keys))
+        return self._all_transfers_succeeded(results, resolved)
 
     def _store(self, key: RadixKey, transfers: Sequence[PoolTransfer]) -> bool:
         if self.store_skip:
@@ -224,7 +236,7 @@ class MooncakeConnector(ExternalCacheConnector):
         page_keys = self._page_keys(key)
         resolved = self._resolve_transfers(page_keys, transfers)
         results = self.storage.batch_set_v2(resolved)
-        return self._all_pages_succeeded(results, len(page_keys))
+        return self._all_transfers_succeeded(results, resolved)
 
     def store_async(
         self,

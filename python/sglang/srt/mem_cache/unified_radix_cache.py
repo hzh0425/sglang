@@ -360,6 +360,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.components.values()
         )
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
+        self.external_component_pools: dict[ComponentType, PoolName] = {}
 
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
@@ -601,6 +602,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         connector: ExternalCacheConnector,
         *,
         sidecars: tuple[SidecarPoolSpec, ...] = (),
+        component_pools: Optional[dict[ComponentType, PoolName]] = None,
     ) -> None:
         if self.cache_controller is not None:
             raise ValueError("External cache cannot be combined with HiCache")
@@ -609,9 +611,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.external_cache_connector = connector
         self.sidecar_pool_specs.clear()
         self.sidecar_pool_specs.extend(sidecars)
+        self.external_component_pools = dict(component_pools or {})
         logger.info(
-            "Installed external cache connector %s with pools %s",
+            "Installed external cache connector %s with components %s and sidecars %s",
             type(connector).__name__,
+            {
+                str(component): str(pool)
+                for component, pool in self.external_component_pools.items()
+            },
             [str(spec.pool_name) for spec in sidecars],
         )
 
@@ -649,21 +656,81 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return int(state.item())
 
     def _build_external_transfers(
-        self, device_indices: Optional[torch.Tensor] = None
+        self,
+        device_indices: Optional[torch.Tensor] = None,
+        *,
+        node: Optional[UnifiedTreeNode] = None,
+        component_indices: Optional[dict[ComponentType, torch.Tensor]] = None,
+        num_tokens: Optional[int] = None,
     ) -> list[PoolTransfer]:
-        transfers = [
-            PoolTransfer(name=PoolName.KV, device_indices=device_indices)
-        ]
+        transfers = [PoolTransfer(name=PoolName.KV, device_indices=device_indices)]
+        transfer_by_name = {PoolName.KV: transfers[0]}
+        total_tokens = (
+            num_tokens
+            if num_tokens is not None
+            else (0 if device_indices is None else len(device_indices))
+        )
+
+        for component_type, pool_name in self.external_component_pools.items():
+            if component_type != ComponentType.SWA:
+                raise AssertionError(
+                    f"Unsupported external component pool: {component_type}"
+                )
+            component = self.components[component_type]
+            window_tokens = (
+                (component.sliding_window_size + self.page_size - 1)
+                // self.page_size
+                * self.page_size
+            )
+            required_tokens = min(total_tokens, window_tokens)
+            indices = None
+            if component_indices is not None:
+                indices = component_indices.get(component_type)
+            elif node is not None:
+                indices = self._collect_external_component_indices(
+                    node, component_type, required_tokens
+                )
+            keys = ["__placeholder__"] * (required_tokens // self.page_size)
+            transfer = PoolTransfer(
+                name=pool_name,
+                device_indices=indices,
+                keys=keys,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+            transfers.append(transfer)
+            transfer_by_name[pool_name] = transfer
+
         transfers.extend(
             PoolTransfer(
                 name=spec.pool_name,
-                device_indices=device_indices,
+                device_indices=transfer_by_name[spec.indices_from_pool].device_indices,
+                keys=transfer_by_name[spec.indices_from_pool].keys,
                 hit_policy=spec.hit_policy,
                 indices_from_pool=spec.indices_from_pool,
             )
             for spec in self.sidecar_pool_specs
         )
         return transfers
+
+    def _collect_external_component_indices(
+        self,
+        node: UnifiedTreeNode,
+        component_type: ComponentType,
+        max_tokens: int,
+    ) -> torch.Tensor:
+        chunks = []
+        remaining = max_tokens
+        while node is not self.root_node and remaining > 0:
+            value = node.component_data[component_type].value
+            if value is not None:
+                chunk = value[-remaining:]
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            node = node.parent
+        if not chunks:
+            return self._empty_match_result.device_indices
+        chunks.reverse()
+        return torch.cat(chunks)
 
     @staticmethod
     def _snapshot_radix_key(key: RadixKey) -> RadixKey:
@@ -693,7 +760,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             hit = connector.query(
                 key,
                 local_tokens,
-                self._build_external_transfers(),
+                self._build_external_transfers(num_tokens=len(key) - local_tokens),
             )
         except Exception:
             logger.exception("External cache Bundle query failed")
@@ -2664,31 +2731,99 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Scheduler Entry Points ----
 
+    def _allocate_external_bundle(
+        self, num_tokens: int
+    ) -> tuple[Optional[torch.Tensor], dict[ComponentType, torch.Tensor]]:
+        allocator = self.token_to_kv_pool_allocator
+        full_allocator = getattr(allocator, "full_attn_allocator", allocator)
+        component_sizes: dict[ComponentType, int] = {}
+        if ComponentType.SWA in self.external_component_pools:
+            component = self.components[ComponentType.SWA]
+            component_sizes[ComponentType.SWA] = min(
+                num_tokens,
+                (component.sliding_window_size + self.page_size - 1)
+                // self.page_size
+                * self.page_size,
+            )
+
+        full_shortfall = max(0, num_tokens - full_allocator.available_size())
+        swa_shortfall = 0
+        if ComponentType.SWA in component_sizes:
+            swa_allocator = allocator.swa_attn_allocator
+            swa_shortfall = max(
+                0,
+                component_sizes[ComponentType.SWA] - swa_allocator.available_size(),
+            )
+        if full_shortfall or swa_shortfall:
+            self.evict(
+                EvictParams(
+                    num_tokens=full_shortfall,
+                    swa_num_tokens=swa_shortfall,
+                )
+            )
+
+        full_indices = full_allocator.alloc(num_tokens)
+        if full_indices is None:
+            return None, {}
+
+        component_indices = {}
+        if ComponentType.SWA in component_sizes:
+            swa_size = component_sizes[ComponentType.SWA]
+            swa_indices = allocator.swa_attn_allocator.alloc(swa_size)
+            if swa_indices is None:
+                full_allocator.free(full_indices)
+                return None, {}
+            allocator.set_full_to_swa_mapping(
+                full_indices,
+                torch.zeros_like(full_indices),
+            )
+            allocator.set_full_to_swa_mapping(
+                full_indices[-swa_size:],
+                swa_indices,
+            )
+            component_indices[ComponentType.SWA] = swa_indices
+        return full_indices, component_indices
+
+    def _release_external_bundle(
+        self,
+        full_indices: torch.Tensor,
+        component_indices: dict[ComponentType, torch.Tensor],
+    ) -> None:
+        allocator = self.token_to_kv_pool_allocator
+        full_allocator = getattr(allocator, "full_attn_allocator", allocator)
+        swa_indices = component_indices.get(ComponentType.SWA)
+        if swa_indices is not None:
+            allocator.set_full_to_swa_mapping(
+                full_indices,
+                torch.zeros_like(full_indices),
+            )
+            allocator.swa_attn_allocator.free(swa_indices)
+        full_allocator.free(full_indices)
+
     def _load_external_marker(
         self, marker: _ExternalLoadMarker
     ) -> tuple[torch.Tensor, UnifiedTreeNode]:
         hit_tokens = marker.hit.hit_tokens
-        allocator = getattr(
-            self.token_to_kv_pool_allocator,
-            "full_attn_allocator",
-            self.token_to_kv_pool_allocator,
-        )
         device_indices = None
+        component_indices = {}
         try:
-            available = allocator.available_size()
-            if available < hit_tokens:
-                self.evict(EvictParams(num_tokens=hit_tokens - available))
-            device_indices = allocator.alloc(hit_tokens)
+            device_indices, component_indices = self._allocate_external_bundle(
+                hit_tokens
+            )
         except Exception:
             logger.exception("External cache Bundle allocation failed")
         allocated = device_indices is not None
         if self._sync_external_min(int(allocated)) == 0:
             if device_indices is not None:
-                allocator.free(device_indices)
+                self._release_external_bundle(device_indices, component_indices)
             return self._empty_match_result.device_indices, marker.anchor_node
 
         assert device_indices is not None
-        transfers = self._build_external_transfers(device_indices)
+        transfers = self._build_external_transfers(
+            device_indices,
+            component_indices=component_indices,
+            num_tokens=hit_tokens,
+        )
         try:
             connector = self.external_cache_connector
             assert connector is not None
@@ -2698,7 +2833,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             loaded = False
 
         if self._sync_external_min(int(loaded)) == 0:
-            allocator.free(device_indices)
+            self._release_external_bundle(device_indices, component_indices)
             return self._empty_match_result.device_indices, marker.anchor_node
 
         tail_end = marker.local_tokens + hit_tokens
@@ -2709,7 +2844,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices,
             InsertParams(
                 prev_prefix_len=0,
-                swa_evicted_seqlen=hit_tokens,
+                swa_evicted_seqlen=hit_tokens
+                - len(component_indices.get(ComponentType.SWA, ())),
                 priority=marker.anchor_node.priority,
             ),
         )
@@ -2795,7 +2931,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         try:
             operation_id = connector.store_async(
                 key,
-                self._build_external_transfers(device_indices),
+                self._build_external_transfers(
+                    device_indices,
+                    node=node,
+                    num_tokens=len(device_indices),
+                ),
             )
         except Exception:
             self.dec_lock_ref(node, lock_params)

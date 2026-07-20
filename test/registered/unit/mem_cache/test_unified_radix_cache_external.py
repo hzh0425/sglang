@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.external_cache_pool import (
     ExternalPoolStack,
     LogicalDevicePool,
     PagedDevicePool,
+    build_deepseek_v4_external_pool_stack,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -151,6 +152,60 @@ class TestExternalDevicePools(CustomTestCase):
         )
         self.assertEqual(sizes, [4, 4, 4, 4])
 
+    def test_dsv4_split_layout_exposes_component_and_state_pools(self):
+        def paged_pool(layers=1):
+            return SimpleNamespace(
+                kv_buffer=[
+                    torch.zeros((8, 4), dtype=torch.uint8) for _ in range(layers)
+                ]
+            )
+
+        def state_pool():
+            return SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.zeros((16, 3), dtype=torch.float32)
+                ),
+            )
+
+        c4_state = state_pool()
+        c4_indexer_state = state_pool()
+        kvcache = SimpleNamespace(
+            _unified_kv=False,
+            swa_page_size=2,
+            swa_kv_pool=paged_pool(2),
+            c4_kv_pool=paged_pool(),
+            c128_kv_pool=paged_pool(),
+            c4_indexer_kv_pool=SimpleNamespace(
+                index_k_with_scale_buffer=paged_pool().kv_buffer
+            ),
+            start_layer=0,
+            end_layer=2,
+            layer_mapping=[
+                SimpleNamespace(compress_ratio=4),
+                SimpleNamespace(compress_ratio=128),
+            ],
+            compress_state_pools=[c4_state, state_pool()],
+            indexer_compress_state_pools=[c4_indexer_state, None],
+        )
+
+        stack = build_deepseek_v4_external_pool_stack(kvcache, page_size=2)
+
+        self.assertEqual(stack.component_pools, {ComponentType.SWA: PoolName.SWA})
+        self.assertIn(PoolName.DEEPSEEK_V4_C4_STATE, stack.pools)
+        self.assertIn(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, stack.pools)
+        state_specs = {
+            spec.pool_name: spec for spec in stack.sidecars if "state" in spec.pool_name
+        }
+        self.assertTrue(state_specs)
+        self.assertTrue(
+            all(
+                spec.indices_from_pool == PoolName.SWA
+                and spec.hit_policy == PoolHitPolicy.TRAILING_PAGES
+                for spec in state_specs.values()
+            )
+        )
+
 
 class _MooncakeStorage:
     def __init__(self):
@@ -259,6 +314,57 @@ class TestMooncakeConnectorBundle(CustomTestCase):
         self.assertEqual(completions, [ExternalStoreCompletion(operation_id, True)])
         self.assertEqual(len(storage.set_calls), 1)
         self.assertEqual(storage.clear_calls, 0)
+        connector.close()
+
+    def test_trailing_component_and_sidecar_use_the_same_tail(self):
+        connector, storage = _make_mooncake_connector()
+        connector.pool_stack.pools.update(
+            {
+                PoolName.SWA: PagedDevicePool(
+                    [torch.zeros((8, 4), dtype=torch.uint8)], slot_page_size=2
+                ),
+                PoolName.DEEPSEEK_V4_C4_STATE: PagedDevicePool(
+                    [torch.zeros((8, 4), dtype=torch.uint8)], slot_page_size=2
+                ),
+            }
+        )
+        key = RadixKey(array("q", [1, 2, 3, 4]))
+        transfers = [
+            PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([2, 3, 6, 7])),
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                device_indices=torch.tensor([2, 3, 6, 7]),
+                indices_from_pool=PoolName.KV,
+            ),
+            PoolTransfer(
+                name=PoolName.SWA,
+                device_indices=torch.tensor([10, 11]),
+                keys=["__placeholder__"],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            ),
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4_STATE,
+                device_indices=torch.tensor([10, 11]),
+                keys=["__placeholder__"],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                indices_from_pool=PoolName.SWA,
+            ),
+        ]
+
+        hit = connector.query(key, 0, transfers)
+        self.assertTrue(connector.load(hit, transfers))
+
+        loaded = {transfer.name: transfer for transfer in storage.get_calls[0]}
+        self.assertEqual(len(loaded[PoolName.DEEPSEEK_V4_C4].keys), 2)
+        self.assertEqual(len(loaded[PoolName.SWA].keys), 1)
+        self.assertEqual(
+            loaded[PoolName.DEEPSEEK_V4_C4_STATE].keys,
+            loaded[PoolName.SWA].keys,
+        )
+        self.assertEqual(
+            loaded[PoolName.DEEPSEEK_V4_C4_STATE].host_indices.tolist(),
+            [10, 11],
+        )
         connector.close()
 
 

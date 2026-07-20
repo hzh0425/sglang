@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
 
 class LogicalDevicePool:
@@ -85,17 +86,45 @@ class ExternalPoolStack:
     anchor: LogicalDevicePool
     pools: dict[PoolName, PagedDevicePool]
     sidecars: tuple[SidecarPoolSpec, ...]
+    component_pools: dict[ComponentType, PoolName] = field(default_factory=dict)
+
+
+def _state_page_views(state_pools: Sequence) -> list[torch.Tensor]:
+    views = []
+    for pool in state_pools:
+        state = pool.kv_score_buffer.kv_score
+        ring_size = pool.ring_size
+        usable_slots = state.shape[0] // ring_size * ring_size
+        views.append(
+            state.view(torch.uint8)[:usable_slots].reshape(
+                -1, ring_size * state[0].nbytes
+            )
+        )
+    return views
 
 
 def build_deepseek_v4_external_pool_stack(kvcache, page_size: int) -> ExternalPoolStack:
-    if not getattr(kvcache, "_unified_kv", False):
-        raise ValueError(
-            "Direct Mooncake currently requires DeepSeek V4 unified-kv layout"
-        )
-
     pools: dict[PoolName, PagedDevicePool] = {}
+    component_pools: dict[ComponentType, PoolName] = {}
+    is_unified_kv = getattr(kvcache, "_unified_kv", False)
 
-    c4_buffers, _ = kvcache.unified_region_buffers(4)
+    if is_unified_kv:
+        c4_buffers, _ = kvcache.unified_region_buffers(4)
+        c128_buffers, _ = kvcache.unified_region_buffers(128)
+    else:
+        if kvcache.swa_page_size != page_size:
+            raise ValueError(
+                "Direct Mooncake requires DeepSeek V4 SWA and Full to use the "
+                f"same page size, got swa={kvcache.swa_page_size}, full={page_size}"
+            )
+        pools[PoolName.SWA] = PagedDevicePool(
+            kvcache.swa_kv_pool.kv_buffer,
+            slot_page_size=page_size,
+        )
+        component_pools[ComponentType.SWA] = PoolName.SWA
+        c4_buffers = kvcache.c4_kv_pool.kv_buffer
+        c128_buffers = kvcache.c128_kv_pool.kv_buffer
+
     if c4_buffers:
         pools[PoolName.DEEPSEEK_V4_C4] = PagedDevicePool(
             c4_buffers, slot_page_size=page_size
@@ -105,22 +134,57 @@ def build_deepseek_v4_external_pool_stack(kvcache, page_size: int) -> ExternalPo
             slot_page_size=page_size,
         )
 
-    c128_buffers, _ = kvcache.unified_region_buffers(128)
     if c128_buffers:
         pools[PoolName.DEEPSEEK_V4_C128] = PagedDevicePool(
             c128_buffers, slot_page_size=page_size
         )
 
+    if not is_unified_kv:
+        c4_layers = [
+            kvcache.start_layer + local_layer
+            for local_layer, item in enumerate(
+                kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
+            )
+            if item.compress_ratio == 4
+        ]
+        c4_state_pools = [kvcache.compress_state_pools[i] for i in c4_layers]
+        c4_indexer_state_pools = [
+            kvcache.indexer_compress_state_pools[i] for i in c4_layers
+        ]
+        if c4_state_pools:
+            pools[PoolName.DEEPSEEK_V4_C4_STATE] = PagedDevicePool(
+                _state_page_views(c4_state_pools),
+                slot_page_size=page_size,
+            )
+            pools[PoolName.DEEPSEEK_V4_C4_INDEXER_STATE] = PagedDevicePool(
+                _state_page_views(c4_indexer_state_pools),
+                slot_page_size=page_size,
+            )
+
     sidecars = tuple(
         SidecarPoolSpec(
             pool_name=name,
-            indices_from_pool=PoolName.KV,
-            hit_policy=PoolHitPolicy.ALL_PAGES,
+            indices_from_pool=source,
+            hit_policy=policy,
         )
-        for name in (
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C128,
+        for name, source, policy in (
+            (PoolName.DEEPSEEK_V4_C4, PoolName.KV, PoolHitPolicy.ALL_PAGES),
+            (
+                PoolName.DEEPSEEK_V4_C4_INDEXER,
+                PoolName.KV,
+                PoolHitPolicy.ALL_PAGES,
+            ),
+            (PoolName.DEEPSEEK_V4_C128, PoolName.KV, PoolHitPolicy.ALL_PAGES),
+            (
+                PoolName.DEEPSEEK_V4_C4_STATE,
+                PoolName.SWA,
+                PoolHitPolicy.TRAILING_PAGES,
+            ),
+            (
+                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+                PoolName.SWA,
+                PoolHitPolicy.TRAILING_PAGES,
+            ),
         )
         if name in pools
     )
@@ -131,4 +195,5 @@ def build_deepseek_v4_external_pool_stack(kvcache, page_size: int) -> ExternalPo
         anchor=LogicalDevicePool(page_size),
         pools=pools,
         sidecars=sidecars,
+        component_pools=component_pools,
     )
