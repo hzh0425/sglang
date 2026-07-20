@@ -9,6 +9,8 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from typing import TYPE_CHECKING, Sequence
 
+import torch
+
 from sglang.srt.mem_cache.external_cache_connector import (
     ExternalCacheConnector,
     ExternalCacheHit,
@@ -232,7 +234,23 @@ class MooncakeConnector(ExternalCacheConnector):
         results = self.storage.batch_get_v2(resolved)
         return self._all_transfers_succeeded(results, resolved)
 
-    def _store(self, key: RadixKey, transfers: Sequence[PoolTransfer]) -> bool:
+    def _store_ready_event(self):
+        for pool in self.pool_stack.pools.values():
+            for buffer in pool.get_hybrid_pool_buffer():
+                if buffer.device.type == "cpu":
+                    continue
+                device_module = torch.get_device_module(buffer.device)
+                with device_module.device(buffer.device):
+                    event = device_module.Event()
+                    event.record()
+                return event
+        return None
+
+    def _store(
+        self, key: RadixKey, transfers: Sequence[PoolTransfer], ready_event
+    ) -> bool:
+        if ready_event is not None:
+            ready_event.synchronize()
         page_keys = self._page_keys(key)
         resolved = self._resolve_transfers(page_keys, transfers)
         results = self.storage.batch_set_v2(resolved)
@@ -255,7 +273,10 @@ class MooncakeConnector(ExternalCacheConnector):
             )
             transfer_snapshot = tuple(replace(transfer) for transfer in transfers)
             self._futures[operation_id] = self._executor.submit(
-                self._store, key_snapshot, transfer_snapshot
+                self._store,
+                key_snapshot,
+                transfer_snapshot,
+                self._store_ready_event(),
             )
         return operation_id
 

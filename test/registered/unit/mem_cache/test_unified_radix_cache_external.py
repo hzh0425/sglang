@@ -391,6 +391,13 @@ class TestMooncakeConnectorBundle(CustomTestCase):
 
 
 class TestUnifiedExternalLoad(CustomTestCase):
+    def test_component_tail_materializes_its_physical_page(self):
+        indices = torch.tensor([0, 0, 6, 7])
+
+        physical = UnifiedRadixCache._materialize_external_pages(indices, 4)
+
+        self.assertEqual(physical.tolist(), [4, 5, 6, 7])
+
     def test_match_and_load_commit_the_whole_bundle(self):
         cache, _, connector = _make_cache()
         req = SimpleNamespace(

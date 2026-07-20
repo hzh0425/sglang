@@ -730,7 +730,33 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not chunks:
             return self._empty_match_result.device_indices
         chunks.reverse()
-        return torch.cat(chunks)
+        indices = torch.cat(chunks)
+        if component_type == ComponentType.SWA:
+            indices = self._materialize_external_pages(indices, self.page_size)
+        return indices
+
+    @staticmethod
+    def _materialize_external_pages(
+        indices: torch.Tensor, page_size: int
+    ) -> torch.Tensor:
+        if len(indices) % page_size != 0:
+            raise ValueError(
+                f"External component needs page-aligned indices, got {len(indices)}"
+            )
+
+        physical_pages = []
+        offsets = torch.arange(page_size, device=indices.device)
+        for logical_page in indices.reshape(-1, page_size):
+            valid = logical_page[logical_page > 0]
+            if valid.numel() == 0:
+                raise ValueError("External component page has no physical slots")
+            page_ids = valid // page_size
+            if not torch.all(page_ids == page_ids[-1]):
+                raise ValueError(
+                    "External component page spans multiple physical pages"
+                )
+            physical_pages.append(page_ids[-1] * page_size + offsets)
+        return torch.cat(physical_pages)
 
     @staticmethod
     def _snapshot_radix_key(key: RadixKey) -> RadixKey:
