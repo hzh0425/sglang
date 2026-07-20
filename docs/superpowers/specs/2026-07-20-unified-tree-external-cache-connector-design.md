@@ -83,6 +83,12 @@ UnifiedRadixCache
 
 两种 Transport 都消费 Component 生成的 `PoolTransfer` 描述符，因此无需向直连路径伪造 Host Index，也能获得接口兼容性。
 
+### 本地 Tree 一致性是已有不变量
+
+TP/CP Rank 上的 UnifiedTree 具有相同的逻辑拓扑、Component 有效状态和本地匹配边界。直连方案直接复用该不变量，不为 Local Match 增加 Boundary Mask 或额外 Collective。
+
+新的分布式协调只覆盖可能产生差异的阶段：Remote Lookup 候选、共同候选的精确 Load 结果，以及异步 Store 完成顺序。
+
 ### Full KV 继续作为 Anchor Pool
 
 当前 HiCache Storage 路径以 Full KV 为 Prefix Anchor，其他 Pool 作为该前缀的约束。版本 1 保持这一模型：
@@ -117,7 +123,6 @@ class PoolTransfer:
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[list[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
-    required_tail_pages: int = 1
     nodes_to_load: Optional[list[Any]] = None
     indices_from_pool: Optional[PoolName] = None
 
@@ -130,7 +135,7 @@ class PoolTransferResult:
 
 直连 Connector 使用 `device_indices` 和 `keys`，绝不填充 `host_indices`。
 
-对包含 `N` 个后缀 Page 的直连 Lookup，每个 Transfer 提供与这些边界对齐的 `N` 个 Logical Key。`ALL_PAGES` 使边界 `i` 依赖 Key `[0:i]`；`TRAILING_PAGES` 使其依赖 `[max(0, i - required_tail_pages):i]`。SWA 设置 Window 宽度，Mamba 在每个边界使用一个精确 Checkpoint Key，宽度为 1。边界 0 不需要 Key。新增字段提供兼容默认值，因此现有 HiCache 调用行为不变。
+直连 Lookup 沿用现有 `keys` 与 `hit_policy` 语义。Connector 返回当前 Rank 能够完整恢复的最长候选后缀；Tree 达成 TP/CP 候选边界一致后，再为该单一精确边界重新构建 Load 描述符。
 
 对于 Load 和 Store，Transfer 还包含目标或源 `device_indices`；此时 Tree 已经选定一个精确边界。
 
@@ -207,12 +212,6 @@ class ConnectorLoadResult:
 
 
 @dataclass
-class ConnectorLookupResult:
-    pool_valid_boundaries: dict[PoolName, list[bool]]
-    pool_result: PoolTransferResult
-
-
-@dataclass
 class ConnectorCompletion:
     handle: object
     success: bool
@@ -226,8 +225,8 @@ class CacheConnector(Protocol):
         self,
         transfers: list[PoolTransfer],
         key_context: CacheKeyContext,
-    ) -> ConnectorLookupResult:
-        """返回外部各 Pool 在精确边界上的可用性。"""
+    ) -> PoolTransferResult:
+        """返回当前 Rank 能完整恢复的最长候选后缀。"""
 
     def load(
         self,
@@ -252,11 +251,9 @@ class CacheConnector(Protocol):
 
 Connector 不得接收 `Req`、`UnifiedTreeNode`、Lock 参数或分布式 Process Group。Store Handle 表示 Connector 操作，而不是 Request ID。
 
-对于覆盖绝对 Page 边界 `[start_pages, candidate_pages]` 的 Lookup，`pool_valid_boundaries[pool][i]` 表示该外部 Pool 能否提供精确边界 `start_pages + i` 所需的状态。每个 Mask 的长度必须为 `candidate_pages - start_pages + 1`。第 0 项为 True，因为已达成一致的 Base 不需要外部对象。`pool_result` 保留现有的逐 Pool 汇总，供诊断和 HiCache 兼容策略使用；分布式正确性依赖逐 Pool 的精确边界 Mask。
+`lookup()` 只负责提出候选长度，其中 `PoolTransferResult.kv_hit_pages` 已按当前 Rank 上所有必需 Pool 的 Policy 截断。Tree 将各 Rank 的候选转换为绝对边界，并通过 TP/CP `MIN` 得到共同候选。
 
-Connector 校验每个 Lookup Transfer 是否提供预期数量的对齐 Key，并按 Policy 计算每个 Pool、每个边界的 Presence Bit。Connector 不合并不同 Pool：Tree 必须能够组合本地 Full 与外部 Mamba、SWA 或 Sidecar。Key 数量不对齐或 Tail 宽度非法属于不变量错误，不得当作部分命中。
-
-Lookup 不返回后端私有的 Load Handle。TP/CP 达成一致后，Tree 只为一致的逻辑范围重新构建 Load 描述符，`load()` 仅操作这些描述符，避免其他边界上的 Rank Local Lookup 状态泄漏到共同 Load 中。
+Lookup 不返回后端私有的 Load Handle。Tree 针对共同候选重新构建全新的 Load 描述符；实际 `load()` 结果就是该精确边界的最终校验。任一 Rank 缺少 Mamba/SWA 等精确状态时，`load_ok` 一致性会让所有 Rank 一起 Abort，避免部分 Insert。
 
 ### Connector Key 作用域
 
@@ -310,7 +307,7 @@ class ExternalLoadRequest:
     req: Req
     key: RadixKey
     agreed_full_page_keys: list[str]
-    common_local_pages: int
+    local_prefix_pages: int
     full_device_pages: int
     agreed_pages: int
 
@@ -331,12 +328,6 @@ CacheTransferRequest = Union[
 
 
 class TreeComponent:
-    def local_boundary_validity(
-        self,
-        request: ExternalLookupRequest,
-    ) -> dict[PoolName, list[bool]]:
-        """返回每个请求边界上逐 Pool 的精确本地有效性。"""
-
     def build_cache_transfers(
         self,
         request: CacheTransferRequest,
@@ -360,7 +351,7 @@ class TreeComponent:
         ...
 ```
 
-Request Dataclass 中所有 `*_pages` 字段都是从 Root 开始计算的绝对前缀边界。`ExternalLookupRequest.full_page_keys` 覆盖 `[start_pages, candidate_pages)`，`ExternalLoadRequest.agreed_full_page_keys` 覆盖 `[common_local_pages, agreed_pages)`。`local_boundary_validity()` 为每个 Pool 和闭区间边界返回一个 Boolean；Full 具有单调性，而 SWA/Mamba 可以只标记稀疏的精确边界。Tree 派生索引 Sidecar Mask，并保留 Pool Identity，使本地状态与外部状态能够逐 Pool 独立组合。
+Request Dataclass 中所有 `*_pages` 字段都是从 Root 开始计算的绝对前缀边界。`ExternalLookupRequest.full_page_keys` 覆盖 `[start_pages, candidate_pages)`，`ExternalLoadRequest.agreed_full_page_keys` 覆盖 `[local_prefix_pages, agreed_pages)`。Component 在 `ExternalLoadRequest` 阶段根据现有 Local Tree 只为缺失状态构建并 Stage Transfer，不生成整段 Boundary Mask。
 
 `ExistingHiCacheTransferRequest` 是对 `build_hicache_transfers()` 和 `commit_hicache_transfer()` 现有参数的 Adapter，不改变 HiCache 语义。
 
@@ -411,17 +402,16 @@ Mamba 与 SWA 的 Staged State 在结构插入返回最终目标 Node 后、恢�
 
 ### Lookup 与 Load 结果语义
 
-Connector Lookup 需要评估共享 Root-Relative 搜索区间中的每个精确边界。原因是 Full KV 可用性具有单调性，但更长边界上的 Mamba Checkpoint 或 SWA Tail Window，并不意味着更短边界也具有对应状态。
+Connector Lookup 先提出最长候选边界，Tree 在 TP/CP 上取共同候选。随后针对该单一边界执行 Load；Load 的逐对象结果负责精确校验 Mamba Checkpoint、SWA Tail Window 和 Sidecar State。
 
 | 操作 | Policy/Pool | 结果解释 |
 |---|---|---|
 | Lookup | Full KV Anchor | 只有直到边界 `b` 的所有 Full Object 都存在时，`b` 才在外部有效。 |
 | Lookup | `ALL_PAGES` | 只有从搜索 Base 到 `b` 所需的所有 Component Object 都存在时，`b` 才有效。 |
-| Lookup | `TRAILING_PAGES` | 使用边界 `b` 声明的精确 Tail Window 或 Checkpoint Key 检查，不能从其他边界推断有效性。 |
-| Load | 所有 Pool 和 Policy | 版本 1 使用事务语义：每个 TP/CP Rank 上的所有请求对象都必须成功加载；任意失败都会中止整个外部 Load，且不发布新前缀。 |
+| Load | 所有 Pool 和 Policy | 只加载共同候选边界 `b` 所需的精确对象。版本 1 使用事务语义：每个 TP/CP Rank 上的所有请求对象都必须成功；任意失败都会中止整个外部 Load，且不发布新前缀。 |
 | Store | 所有 Pool 和 Policy | 允许后端部分失败，但操作需要上报失败；后续 Lookup 重新计算可用公共前缀。 |
 
-`ConnectorLookupResult.pool_valid_boundaries` 与本地逐 Pool Mask 组合，用于精确边界一致性。其 `PoolTransferResult` 汇总结果仍只用于 Lookup，不以标量 Hit Length 做 Reduce。`ConnectorLoadResult.successes` 只用于 Load，并且每个请求对象必须对应一个 Boolean。版本 1 在 Load 失败后不尝试部分提交更短的 Full Prefix，因为 SWA/Mamba Tail State 与此前达成一致的边界绑定。
+`PoolTransferResult` 用于提出 Rank Local 候选长度；`ConnectorLoadResult.successes` 用于共同候选的精确 Load，并且每个请求对象必须对应一个 Boolean。版本 1 在 Load 失败后不尝试继续搜索更短前缀，因为 SWA/Mamba Tail State 与选定边界绑定。
 
 TP/CP Lookup 达成一致后，Component 根据 `ExternalLoadRequest.agreed_full_page_keys` 重新构建 Load Transfer，绝不复用更长 Lookup 结果对应的 Rank Local 描述符或后端状态。
 
@@ -435,7 +425,7 @@ ongoing_external_stores: OrderedDict[int, OngoingExternalStore]
 external_store_sequence: int
 ```
 
-`PendingExternalMatch` 包含以下快照：匹配的 Logical Key、Key Context、跨 Rank 的公共精确本地边界、Rank Local Full Device Frontier、该 Rank 在一致边界上的逐 Pool 有效位，以及 TP/CP 达成一致的绝对边界。新的 Load Request 从这个不可变范围派生，不保留 Connector 私有 Lookup 状态或 Rank Local 描述符。当一致边界大于公共本地边界时，每个 Rank 都创建 Pending Entry，包括本地已经拥有该精确边界全部状态的 Rank。
+`PendingExternalMatch` 包含以下快照：匹配的 Logical Key、Key Context、一致的本地前缀边界、Full Device Frontier，以及共同 Remote 目标边界。新的 Load Request 从这个不可变范围派生，不保留 Connector 私有 Lookup 状态或 Rank Local 描述符。
 
 `OngoingExternalStore` 以 Tree Sequence Number 为 Key，保存可选的本地 Connector Handle、本地完成/成功状态、最终 Tree Node，以及保护该 Node 时返回的精确 `DecLockRefParams`。因此，即使本地提交被拒绝，也必须占据对应的 Sequence 位置。
 
@@ -446,27 +436,26 @@ Node 不增加外部 Residency Bit。后续 Lookup 始终是外部状态的权�
 ### Match 阶段
 
 1. 执行正常的 UnifiedTree 本地 Match。
-2. 要求每个 Component 在 Page-Aligned 候选范围内生成 Rank Local、逐 Pool 的精确边界有效性 Mask，并派生索引 Sidecar Mask。对所有必需 Pool Mask 做 AND，得到该 Rank 的完整 Bundle Mask。
-3. 打包该 Mask，通过 TP/CP 逐元素执行 `MIN`。最高的 True 边界即 `common_local_pages`；Root 边界 0 始终为 True。
-4. 如果 `common_local_pages` 等于候选边界，直接返回公共本地命中。所有 Rank 都已进入同一个 Local Mask Collective，因此不会产生分叉。
-5. 为 `[common_local_pages, candidate_pages]` 构建 Full 和 Component 的 `LOOKUP_EXTERNAL` 描述符，展开 Sidecar，并在每个 Rank 调用本地 Connector `lookup()`。
-6. 对每个 Pool 和边界计算 `pool_reachable = local_pool_valid OR external_pool_valid`，再对所有必需 Pool 结果做 AND，得到 Rank Local Reachable Boundary Mask。这一步负责组合 L1 Full 与外部 Mamba/SWA/Sidecar。
-7. 打包 Reachability Mask，通过 TP/CP 逐元素执行 `MIN`。选择最高的 True 精确边界作为 `agreed_pages`。这是有效边界的交集，不是标量 Hit Length 的最小值。
-8. 如果 `agreed_pages > common_local_pages`，每个 Rank 都按 `req.rid` 保存一致范围，以及该边界上逐 Pool 的本地有效性。只有本地位为 False 的 Pool 才在 Load 阶段重新构建 Component Load 描述符。
-9. 返回直到 `common_local_pages` 的 Device Index，并附带公共的 `external_hit_length = (agreed_pages - common_local_pages) * page_size`。
+2. 直接使用现有 UnifiedTree 不变量：TP/CP Rank 的 Local Tree 具有相同逻辑状态，因此得到相同的 `local_prefix_pages`。这里不生成 Boundary Mask，也不增加 Local Match Collective。
+3. 如果本地前缀已覆盖候选边界，直接返回本地命中。
+4. 为 `[local_prefix_pages, candidate_pages]` 构建 Full 和 Component 的 `LOOKUP_EXTERNAL` 描述符，展开 Sidecar，并在每个 Rank 调用本地 Connector `lookup()`。
+5. 将每个 Rank 返回的后缀长度转换为绝对候选边界，通过 TP/CP `MIN` 得到 `agreed_pages`。
+6. 如果 `agreed_pages <= local_prefix_pages`，按 Remote Miss 返回。
+7. 每个 Rank 按 `req.rid` 保存相同的本地 Base 和 Remote 目标边界。Load 阶段再为这个共同边界构建全新的精确描述符。
+8. 返回本地 Device Index，并附带公共的 `external_hit_length = (agreed_pages - local_prefix_pages) * page_size`。
 
-`MatchResult`、`Req` 和 Load 参数增加 `external_hit_length`。由于 Base 与 Target 都是跨 Rank 的精确边界，所有 Rank 上的 `external_hit_length > 0` 结果一致，可以安全驱动 `Req.needs_external_load()`。已经持有 `agreed_pages` 精确状态的 Rank 仍进入 `init_external_load()`，但不执行本地 Connector I/O。直连路径不复用 `host_hit_length`、`last_host_node` 或任何 Host-Only 语义。
+`MatchResult`、`Req` 和 Load 参数增加 `external_hit_length`。由于 Local Tree 状态一致，且 Remote 候选边界经过 TP/CP 一致性，所有 Rank 上的 `external_hit_length > 0` 结果一致，可以安全驱动 `Req.needs_external_load()`。直连路径不复用 `host_hit_length`、`last_host_node` 或任何 Host-Only 语义。
 
 ### Load 与发布阶段
 
 1. 消费 `pending_external_matches[req.rid]`。
-2. 初始化 `local_load_ok = 1`。如果该 Rank 在一致边界上已经精确持有所有必需 Pool，则不 Stage 资源，直接等待一致性阶段。否则，仅当 Full 的本地有效位为 False 时分配 Full Device Slot，并且只分配现有 Full Device Frontier 之后的部分；因此 Aux-Only Load 不包含 Full 目标 Transfer。
-3. 仅为一致精确边界上缺失的状态构建新的 `LOAD_EXTERNAL` Transfer，并由 Component Stage 相应 Device Slot，然后展开 Sidecar。
+2. 初始化 `local_load_ok = 1`。仅为现有 Full Device Frontier 之后的部分分配 Full Device Slot；因此 Full 已经本地常驻时，Aux-Only Load 不包含 Full 目标 Transfer。
+3. 每个 Component 针对 `agreed_pages` 重新判断本地状态，只为缺失部分构建新的 `LOAD_EXTERNAL` Transfer 并 Stage 相应 Device Slot，然后展开 Sidecar。
 4. 任一本地分配或构建步骤失败时，设置 `local_load_ok = 0`，保留所有已成功 Stage 的资源供 Abort 使用，跳过本地 Connector I/O，但不能提前返回。
 5. 否则，仅当该 Rank 存在缺失对象时调用 Connector `load()`。无需本地 I/O 的 Rank 保持 `local_load_ok = 1`。
 6. 校验结果数量、对象成功状态和 Staged State 是否可以挂载。任意异常或非法结果都将 `local_load_ok` 设为 0。
 7. 无论是否完成分配或调用 Connector，每个 Rank 都通过 TP/CP 对 `local_load_ok` 执行 `MIN`。
-8. 如果一致结果为 0，对每个本地 Staged Component Transfer 调用 Abort，释放所有新分配的 Full Slot，把调度器可见前缀恢复到 `common_local_pages`，且不发布任何新缓存状态。
+8. 如果一致结果为 0，对每个本地 Staged Component Transfer 调用 Abort，释放所有新分配的 Full Slot，把调度器可见前缀恢复到 `local_prefix_pages`，且不发布任何新缓存状态。
 9. 以 `EXTERNAL_STAGED` Mode 调用正常 UnifiedTree Insert 或 No-Op Insert，保证一致目标边界存在。将 `prev_prefix_len` 设置为 `min(full_device_pages, agreed_pages) * page_size`，保留对应的现有 Full Index，只为缺失后缀提供新加载的 Full Slot。
 10. 填充 `InsertResult.last_device_node`，按确定的 Component 顺序提交 Staged Component 与 Sidecar State，刷新 Evictability，然后发布一致边界。
 11. 向调度器返回新变为可用的 Full Index。其中既可以包含通过 Aux-Only SWA/Mamba Load 重新暴露的已有 Full Index，也可以包含新加载的 Full Index。
@@ -495,16 +484,29 @@ Node 不增加外部 Residency Bit。后续 Lookup 始终是外部状态的权�
 
 ### Lookup 一致性
 
-Tree 通过现有 Attention CP Group 和 Attention TP Group，对两个确定性的 Boolean Boundary Mask 逐元素执行 `MIN`：
+Local Tree 的逻辑状态一致是现有 UnifiedTree 的不变量，因此 Local Match 不新增分布式协议。Tree 只协调 Remote Query：
 
-1. 对所有 Component 的 Local Validity Mask 求交集，选择每个 Rank 都精确本地可用的最高边界。
-2. 在该 Base 以上，每个 Rank 对每个必需 Pool 分别计算本地与外部有效性的 OR，再对所有 Pool 做 AND。最后对 Rank Reachable Mask 求交集，最高的公共 True 边界成为外部目标。
+1. 每个 Rank 执行本地 Connector Lookup，提出一个最长候选边界。
+2. Tree 通过 Attention CP Group 和 Attention TP Group 对绝对候选边界执行 `MIN`，得到共同候选。
+3. 每个 Rank 保存共同候选，并在 Load 阶段为该单一边界重新构建精确描述符。
 
-这可以处理非单调的 SWA Window 与 Mamba Checkpoint：边界 100 有效并不代表边界 90 有效。因此，直连 Hybrid 路径禁止使用标量 `MIN(hit_pages)`。只有两个合并后的 Rank Mask 跨网络传输，并编码成具有相同 Root-Relative 顺序和长度的 Page-Aligned `uint8` Vector；逐 Pool 组合保留在本地。`PoolTransferResult` 只用于诊断；如果需要打包逐 Pool Metric，必须按 Pool Name 排序。
+这里允许 Lookup 只给出候选。SWA/Mamba 的非单调问题由后续精确 Load 兜底：某个 Rank 缺少共同候选边界对应的 Checkpoint 时，该 Rank 的 `load_ok` 为 0，所有 Rank 一起 Abort，不执行 Insert。
 
 ### Load 一致性
 
 每个 Rank 校验每个请求对象的 Boolean 结果以及 Staged State 是否可以挂载。没有本地缺失对象的 Rank 以 `load_ok = 1` 开始；分配或构建失败的 Rank 将其设为 0，并跳过 Connector I/O。所有 Rank 仍必须进入 TP/CP `MIN`。结果为 1 时，所有 Rank 提交完整的一致前缀；结果为 0 时，所有 Rank Abort 本地所有 Staged 目标。版本 1 不支持直连 Load 的部分发布。
+
+### Insert 发布一致性
+
+`load_ok` Collective 同时作为 Insert 的发布屏障。只有它为 1 时，所有 Rank 才进入 Insert，并满足以下条件：
+
+- 使用同一个 `agreed_pages` 和相同的 Logical Key 范围。
+- 使用相同的 `prev_prefix_len` 和相同的 Component/Sidecar 提交集合。
+- `InsertParams` 的逻辑字段一致；只有 Device Index 等物理地址允许按 Rank 不同。
+- 所有 Staged State 已完成形状、数量和挂载位置校验，Insert 后的 Component Commit 不再执行可能失败的分配或 I/O。
+- 结构 Insert、Component Commit 和 Evictability 更新在调度器线程中作为一个不可见的发布区间执行，中间状态不返回给 Scheduler。
+
+由于 Insert 前的 Local Tree 逻辑状态一致、目标边界一致、发布计划一致，正常 Insert 会在各 Rank 产生相同的逻辑 Tree 状态。任何 Insert/Commit 不变量错误都按致命错误处理，不能让部分 Rank 继续服务。
 
 ### Store 完成一致性
 
@@ -563,7 +565,7 @@ get_cache_connector_factory(name)
 
 ### Lookup 失败
 
-Connector 异常按全 False 的 External Boundary Mask 处理，但仍必须进入 TP/CP 一致性流程。Component Key 不对齐、Mask 长度非法、配置错误和 Layout 错误属于不变量失败，仍然是致命错误。
+Lookup 异常按 0 个 Remote Hit Page 处理，但仍必须进入 TP/CP 候选边界一致性流程。Component Key 不对齐、逐 Pool 结果缺失、配置错误和 Layout 错误属于不变量失败，仍然是致命错误。
 
 ### 分配失败
 
@@ -614,17 +616,18 @@ Mooncake Memory 与 SSD 等 Replica Placement 属于 Connector 专用诊断信�
 - 每个 Device Allocation 只注册一次。
 - MHA/MLA、SWA、Mamba 和 Sidecar Adapter 为每个 Logical Key 返回一组 Object-Major Span。
 - Lookup 正确遵循 `ALL_PAGES` 与 `TRAILING_PAGES`。
+- Load 针对共同候选边界重新构建精确描述符，不复用第一次 Lookup 的内部状态。
 - Load/Store 使用匹配的 Key 与 Buffer Shape。
 - 正确上报 Store 拒绝与完成。
 
 ### UnifiedTree 单元测试
 
-- 所有 Rank 均为完整本地命中时，在公共 Local Validity Collective 后跳过 Connector I/O。
+- 完整本地命中直接跳过 Connector I/O，不增加 Local Match Collective。
 - External Lookup 在不创建 Host State 的情况下上报 `external_hit_length`。
 - External Load 使用正常 Insert，并保持 Split/LRU/Size 不变量。
 - Full+Mamba、Full+SWA 和 Sidecar Load 只有在所有必需状态存在时才 Commit。
 - Aux-Only Load 恢复缺失 SWA/Mamba 后，能够暴露已经常驻的 Full Index。
-- 即使外部不存在 Full，逐 Pool Mask 也允许组合本地 Full 与外部 Mamba/SWA。
+- 即使外部不存在 Full，Load 描述符也允许组合本地 Full 与外部 Mamba/SWA。
 - `EXTERNAL_STAGED` Insert 在确定性 Component Commit 前保留辅助 Tombstone，不暴露中间 Match Result。
 - 部分 Load 释放所有未提交 Pool Slot。
 - Store 锁定精确的最终 Node，并且只解锁一次。
@@ -634,11 +637,12 @@ Mooncake Memory 与 SSD 等 Replica Placement 属于 Connector 专用诊断信�
 
 ### 分布式测试
 
-- TP Rank 具有不同且非单调的本地/外部 Boundary Mask 时，发布最高公共精确边界。
+- TP Rank 返回不同 Remote 候选长度时，取最小绝对边界，并在所有 Rank Load 该精确边界。
 - 在一致边界上已经精确本地可用的 Rank 跳过 Load I/O，但仍参与其他 Rank 所需的 Load 一致性。
-- CP Rank 使用不同 Physical Key，并对精确边界 Mask 求交集。
+- CP Rank 使用不同 Physical Key，并共同归并 Load 结果。
 - 单个 Rank 分配失败时，所有 Rank 都 Abort，且 Collective 不发生 Hang。
 - 任意 TP/CP Load 失败都会中止此前一致前缀的完整发布。
+- Load 成功后，各 Rank 使用相同逻辑 `InsertParams` 和 Component 提交集合，得到一致的逻辑 Tree 状态。
 - 不同 Rank 的 Store Completion Queue 按相同顺序排空。
 
 ### 回归测试
@@ -677,7 +681,7 @@ Mooncake Memory 与 SSD 等 Replica Placement 属于 Connector 专用诊断信�
 - 直连 Connector 路径不分配也不发布 Host Index。
 - Full、SWA、Mamba 和已注册的索引派生 Sidecar 使用同一套 Connector 操作。
 - 已加载数据只通过正常 UnifiedTree Insert 与 Component Commit Hook 进入 Tree。
-- TP/CP 精确边界有效性 Mask 与 Load 成功状态在 Tree 中 Reduce，Connector 只执行本地 I/O。
+- TP/CP Remote 候选边界与 Load 成功状态在 Tree 中 Reduce，Connector 只执行本地 I/O。
 - In-Flight Store 数据在完成前不能被 Evict 或释放。
 - 现有 HiCache 行为与测试保持不变。
 - Mooncake 直连 MHA、MLA、Hybrid State、Sidecar 和 CP Round Trip 全部通过。
