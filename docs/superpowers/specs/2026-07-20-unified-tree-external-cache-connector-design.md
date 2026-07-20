@@ -1,113 +1,113 @@
-# UnifiedTree External Cache Connector Design
+# UnifiedTree 外部缓存 Connector 设计
 
-Date: 2026-07-20
+日期：2026-07-20
 
-## Summary
+## 概述
 
-Add a direct external-cache connector to `UnifiedRadixCache` without modeling the external system as HiCache L2 host memory. The connector moves Full KV and hybrid component state directly between device pools and an external cache such as Mooncake. Existing HiCache keeps its current device/host/storage path.
+为 `UnifiedRadixCache` 增加直连外部缓存的 Connector，不把外部系统建模成 HiCache L2 Host 内存。Connector 在设备 Pool 与 Mooncake 等外部缓存之间直接传输 Full KV 和 Hybrid Component 状态。现有 HiCache 继续保留 Device/Host/Storage 路径。
 
-The two paths share the existing transfer vocabulary:
+两条路径共用现有传输抽象：
 
 - `PoolTransfer`
 - `PoolTransferResult`
 - `PoolHitPolicy`
 - `SidecarPoolSpec`
-- component prepare/commit/abort hooks
+- Component 的 prepare/commit/abort Hook
 
-`UnifiedRadixCache` owns tree mutations, component locks, operation lifetime, and TP/CP agreement. A connector performs only local-rank lookup and I/O. It does not receive process groups or tree nodes.
+`UnifiedRadixCache` 负责 Tree 变更、Component Lock、操作生命周期和 TP/CP 一致性。Connector 只执行当前 Rank 的查询与 I/O，不接收 Process Group 或 Tree Node。
 
-Version 1 supports Full KV, SWA, Mamba, and the existing index-derived sidecars. Direct connectors and HiCache are mutually exclusive. Pipeline parallelism, asynchronous direct load, independently indexed sidecars, and runtime connector attach/detach are out of scope.
+版本 1 支持 Full KV、SWA、Mamba，以及现有由其他 Pool 索引派生的 Sidecar。直连 Connector 与 HiCache 互斥。PP、异步直连 Load、独立索引 Sidecar，以及运行时挂载或卸载 Connector 均不在本版本范围内。
 
-## Goals
+## 目标
 
-1. Define one backend-neutral connector interface similar to the direct Mooncake radix-cache implementation.
-2. Support UnifiedTree hybrid state: Full KV, SWA, Mamba, and sidecar pools.
-3. Preserve the current HiCache controller, storage backend, component, and transfer contracts where possible.
-4. Put TP/CP hit agreement, completion ordering, and cache publication in the tree layer.
-5. Keep external-cache concepts out of `UnifiedTreeNode`; the local tree represents device-resident state only on the direct path.
-6. Preserve normal UnifiedTree insert, split, LRU, lock, and eviction invariants after an external load.
+1. 定义一套后端无关的 Connector 接口，能力与 Mooncake 直连 Radix Cache 实现相近。
+2. 支持 UnifiedTree Hybrid State：Full KV、SWA、Mamba 和 Sidecar Pool。
+3. 尽量兼容现有 HiCache Controller、Storage Backend、Component 和传输契约。
+4. 在 Tree 层管理 TP/CP 命中一致性、完成顺序和缓存发布。
+5. 不向 `UnifiedTreeNode` 引入外部缓存概念；直连路径中的本地 Tree 只表示设备常驻状态。
+6. 外部 Load 后仍保持 UnifiedTree 正常的 Insert、Split、LRU、Lock 和 Eviction 不变量。
 
-## Non-goals
+## 非目标
 
-- Running HiCache and a direct external connector at the same time.
-- Treating Mooncake DRAM and SSD as separate SGLang tiers.
-- Pipeline-parallel direct external caching.
-- Layer-wise or asynchronous external-to-device load overlap.
-- Sidecars without `indices_from_pool`; version 1 sidecars must use the existing index-derived model.
-- Runtime connector attach/detach.
-- A generic graph of arbitrary storage tiers.
-- Exposing Mooncake replica placement to scheduling decisions.
+- 同时运行 HiCache 和直连外部 Connector。
+- 把 Mooncake DRAM 与 SSD 建模成两个独立的 SGLang Tier。
+- 支持 PP 的直连外部缓存。
+- Layer-wise 或异步的 External-to-Device Load 重叠。
+- 不带 `indices_from_pool` 的 Sidecar；版本 1 仅支持现有索引派生模型。
+- 运行时挂载或卸载 Connector。
+- 任意 Storage Tier 组成的通用图。
+- 将 Mooncake Replica 放置暴露给调度逻辑。
 
-## Terminology
+## 术语
 
-- **Local/L1**: device pools owned by SGLang.
-- **External cache**: a system such as Mooncake that owns its internal memory/SSD placement.
-- **Anchor pool**: Full KV, represented by `PoolName.KV`. Its page-prefix length defines the logical cache prefix.
-- **Component pool**: state owned by a UnifiedTree component, such as SWA or Mamba.
-- **Sidecar pool**: additional state registered through `SidecarPoolSpec`, possibly deriving indices from an anchor pool.
-- **Logical key**: backend-independent page hash emitted by the tree/component layer.
-- **Shard identity**: TP/CP rank coordinates used by a connector to isolate physical object keys.
+- **Local/L1**：SGLang 持有的设备 Pool。
+- **外部缓存**：Mooncake 一类自行管理内部内存与 SSD 放置的系统。
+- **Anchor Pool**：Full KV，对应 `PoolName.KV`；其 Page Prefix 长度定义逻辑缓存前缀。
+- **Component Pool**：UnifiedTree Component 持有的状态，例如 SWA 或 Mamba。
+- **Sidecar Pool**：通过 `SidecarPoolSpec` 注册的附加状态，可以从 Anchor Pool 派生索引。
+- **Logical Key**：Tree/Component 层生成的、与后端无关的 Page Hash。
+- **Shard Identity**：Connector 用于隔离物理对象 Key 的 TP/CP Rank 坐标。
 
-## Architecture
+## 总体架构
 
 ```text
-Scheduler
+调度器
     |
     v
 UnifiedRadixCache
-    - radix tree and node locks
-    - normal insert/split/eviction
-    - transfer orchestration
-    - TP/CP agreement
+    - Radix Tree 与 Node Lock
+    - 正常 Insert/Split/Eviction
+    - 传输编排
+    - TP/CP 一致性
     |
     +--> TreeComponent: Full / SWA / Mamba
     |        |
-    |        +--> PoolTransfer descriptors
+    |        +--> PoolTransfer 描述符
     |
-    +--> SidecarPoolSpec expansion
+    +--> 展开 SidecarPoolSpec
     |
-    +--> existing HybridCacheController
-    |        L1 <-> host <-> storage
+    +--> 现有 HybridCacheController
+    |        L1 <-> Host <-> Storage
     |
-    `--> new CacheConnector
-             L1 <-> external cache
+    `--> 新 CacheConnector
+             L1 <-> 外部缓存
 ```
 
-The direct path does not create host pools, set `ComponentData.host_value`, maintain host LRU lists, or insert host-only nodes. Mooncake DRAM and SSD remain implementation details of Mooncake.
+直连路径不创建 Host Pool，不设置 `ComponentData.host_value`，不维护 Host LRU，也不插入仅 Host 常驻的 Node。Mooncake DRAM 与 SSD 仍是 Mooncake 内部实现细节。
 
-## Design Decisions
+## 核心设计决策
 
-### Keep the existing HiCache transport separate
+### 保持现有 HiCache Transport 独立
 
-`HybridCacheController` is not converted into a connector in version 1. It owns host allocation, D2H/H2D streams, host release queues, storage queues, and layer-ready events. A direct connector has none of those responsibilities.
+版本 1 不把 `HybridCacheController` 改造成 Connector。它继续管理 Host 分配、D2H/H2D Stream、Host Release Queue、Storage Queue 和 Layer Ready Event；直连 Connector 不承担这些职责。
 
-Both transports consume the same component-generated `PoolTransfer` descriptors. This delivers compatibility without forcing fake host indices into the direct path.
+两种 Transport 都消费 Component 生成的 `PoolTransfer` 描述符，因此无需向直连路径伪造 Host Index，也能获得接口兼容性。
 
-### Full KV remains the anchor pool
+### Full KV 继续作为 Anchor Pool
 
-The current HiCache storage path treats Full KV as the prefix anchor and extra pools as constraints on that prefix. Version 1 keeps this model:
+当前 HiCache Storage 路径以 Full KV 为 Prefix Anchor，其他 Pool 作为该前缀的约束。版本 1 保持这一模型：
 
-- The tree builds the `PoolName.KV` transfer.
-- Non-Full components add their transfers.
-- Registered sidecars are expanded from those transfers.
-- The usable prefix is the Full KV prefix accepted by all required pools.
+- Tree 构建 `PoolName.KV` Transfer。
+- 非 Full Component 添加各自的 Transfer。
+- 从这些 Transfer 展开已注册 Sidecar。
+- 可用前缀是所有必需 Pool 都接受的 Full KV 前缀。
 
-This avoids a broad rewrite of `batch_exists_v2()` semantics.
+这样可以避免大范围重写 `batch_exists_v2()` 语义。
 
-### Lookup and load are synchronous; store is asynchronous
+### Lookup 和 Load 同步，Store 异步
 
-This matches the direct Mooncake branch and the scheduler's current two-phase match/load contract:
+这与 Mooncake 直连分支及调度器现有的两阶段 Match/Load 契约一致：
 
-- `lookup()` returns before `match_prefix()` completes.
-- `load()` returns before the loaded prefix is published in the tree.
-- `store_async()` returns an operation handle.
-- `poll()` reports completed stores.
+- `lookup()` 在 `match_prefix()` 完成前同步返回。
+- `load()` 在已加载前缀发布到 Tree 前同步返回。
+- `store_async()` 返回操作 Handle。
+- `poll()` 上报已完成 Store。
 
-Asynchronous or layer-wise direct load can be added later without changing component descriptors, but it is not part of this design.
+以后可以在不改变 Component 描述符的情况下增加异步或 Layer-wise 直连 Load，但不属于本次设计。
 
-## Shared Transfer Types
+## 共享传输类型
 
-The existing structures remain the common wire format:
+现有结构继续作为通用传输格式：
 
 ```python
 @dataclass
@@ -128,15 +128,15 @@ class PoolTransferResult:
     extra_pool_hit_pages: dict[str, int]
 ```
 
-Direct connectors use `device_indices` and `keys`; they never populate `host_indices`.
+直连 Connector 使用 `device_indices` 和 `keys`，绝不填充 `host_indices`。
 
-For direct lookup over `N` suffix pages, every transfer supplies `N` logical keys aligned with those boundaries. `ALL_PAGES` makes boundary `i` depend on keys `[0:i]`. `TRAILING_PAGES` makes it depend on keys `[max(0, i - required_tail_pages):i]`: SWA sets its window width and Mamba uses one exact checkpoint key per boundary with width one. Boundary zero requires no key. Existing HiCache callers retain their current behavior because the added field has a compatible default.
+对包含 `N` 个后缀 Page 的直连 Lookup，每个 Transfer 提供与这些边界对齐的 `N` 个 Logical Key。`ALL_PAGES` 使边界 `i` 依赖 Key `[0:i]`；`TRAILING_PAGES` 使其依赖 `[max(0, i - required_tail_pages):i]`。SWA 设置 Window 宽度，Mamba 在每个边界使用一个精确 Checkpoint Key，宽度为 1。边界 0 不需要 Key。新增字段提供兼容默认值，因此现有 HiCache 调用行为不变。
 
-For load and store, a transfer additionally contains destination or source `device_indices`; the tree has already selected one exact boundary.
+对于 Load 和 Store，Transfer 还包含目标或源 `device_indices`；此时 Tree 已经选定一个精确边界。
 
-## Pool I/O Adapter
+## Pool I/O 适配器
 
-The Mooncake branch currently resolves MHA/MLA KV slot indices to raw multi-buffer pointers inside `MooncakeConnector`. Hybrid state requires the same operation for SWA, Mamba, and sidecar pools. Physical pool layout is therefore isolated behind a pool adapter.
+Mooncake 分支当前在 `MooncakeConnector` 内把 MHA/MLA KV Slot Index 解析成原始多 Buffer 指针。Hybrid State 要求 SWA、Mamba 和 Sidecar Pool 也具备同样能力，因此用 Pool Adapter 隔离物理 Pool Layout。
 
 ```python
 @dataclass(frozen=True)
@@ -148,24 +148,24 @@ class BufferSpan:
 class PoolIOAdapter(Protocol):
     @property
     def format_id(self) -> str:
-        """Stable dtype/layout/version fingerprint for physical key isolation."""
+        """用于隔离物理 Key 的稳定 dtype/layout/version 指纹。"""
 
     def registerable_buffers(self) -> list[BufferSpan]:
-        """Return complete allocations that the connector must register."""
+        """返回 Connector 必须注册的完整内存分配。"""
 
     def resolve_objects(
         self,
         indices: torch.Tensor,
         object_count: int,
     ) -> list[list[BufferSpan]]:
-        """Return one multi-buffer span list for each logical object key."""
+        """为每个逻辑对象 Key 返回一组多 Buffer Span。"""
 ```
 
-"Object" is deliberately broader than KV page: it is a KV page for Full/SWA and a checkpoint entry for Mamba. `resolve_objects()` must return exactly `object_count` entries, one for each key in the transfer.
+这里的 “Object” 有意设计得比 KV Page 更通用：对 Full/SWA，它表示一个 KV Page；对 Mamba，它表示一个 Checkpoint Entry。`resolve_objects()` 必须严格返回 `object_count` 个条目，与 Transfer 中的 Key 一一对应。
 
-Each connector maintains `dict[PoolName, PoolIOAdapter]`. Initialization fails if any transfer target has no adapter.
+每个 Connector 维护 `dict[PoolName, PoolIOAdapter]`。任一 Transfer 目标缺少 Adapter 时，初始化直接失败。
 
-For a sidecar transfer, `indices_from_pool` selects the **source indices only**. The connector still resolves those indices through the target sidecar's own adapter:
+对 Sidecar Transfer，`indices_from_pool` **只选择索引来源**。Connector 仍必须使用目标 Sidecar 自己的 Adapter 解析这些索引：
 
 ```text
 transfer.name = DEEPSEEK_V4_C4
@@ -175,16 +175,16 @@ indices  <- KV transfer.device_indices
 buffers  <- adapters[DEEPSEEK_V4_C4].resolve_objects(indices, len(keys))
 ```
 
-Using the KV adapter would access the wrong physical buffers.
+如果使用 KV Adapter，会访问错误的物理 Buffer。
 
-Initial adapters are:
+首批 Adapter 包括：
 
-- MHA/MLA Full KV adapter, extracted from Mooncake's current GPU-object metadata helper.
-- SWA pool adapter.
-- Mamba state-pool adapter.
-- Target-pool adapters supplied by the hybrid pool assembler for existing index-derived sidecars.
+- 从 Mooncake 当前 GPU Object Metadata Helper 中抽取的 MHA/MLA Full KV Adapter。
+- SWA Pool 适配器。
+- Mamba 状态 Pool 适配器。
+- Hybrid Pool Assembler 为现有索引派生 Sidecar 提供的目标 Pool Adapter。
 
-## Connector Interface
+## Connector 接口
 
 ```python
 @dataclass(frozen=True)
@@ -227,60 +227,60 @@ class CacheConnector(Protocol):
         transfers: list[PoolTransfer],
         key_context: CacheKeyContext,
     ) -> ConnectorLookupResult:
-        """Return exact-boundary availability for the external bundle."""
+        """返回外部各 Pool 在精确边界上的可用性。"""
 
     def load(
         self,
         transfers: list[PoolTransfer],
         key_context: CacheKeyContext,
     ) -> ConnectorLoadResult:
-        """Load external objects directly into device-pool destinations."""
+        """将外部对象直接加载到 Device Pool 目标位置。"""
 
     def store_async(
         self,
         transfers: list[PoolTransfer],
         key_context: CacheKeyContext,
     ) -> object | None:
-        """Queue a store and return its handle, or None when rejected."""
+        """提交 Store 并返回 Handle；被拒绝时返回 None。"""
 
     def poll(self, wait: bool = False) -> list[ConnectorCompletion]:
-        """Return completed accepted stores; wait=True waits for all local handles."""
+        """返回已完成且已受理的 Store；wait=True 等待所有本地 Handle。"""
 
     def close(self) -> None:
-        """Drain work, unregister buffers, and release backend resources."""
+        """排空任务、注销 Buffer，并释放后端资源。"""
 ```
 
-The connector must not accept `Req`, `UnifiedTreeNode`, lock parameters, or distributed process groups. Store handles are connector operation identities, not request IDs.
+Connector 不得接收 `Req`、`UnifiedTreeNode`、Lock 参数或分布式 Process Group。Store Handle 表示 Connector 操作，而不是 Request ID。
 
-For a lookup covering absolute page boundaries `[start_pages, candidate_pages]`, `pool_valid_boundaries[pool][i]` states whether that external pool can materialize its part of exact boundary `start_pages + i`. Every mask length must be `candidate_pages - start_pages + 1`, and element zero is true because the already-common base requires no external objects. `pool_result` preserves the existing per-pool summary for diagnostics and HiCache-compatible policy code; distributed correctness uses the per-pool exact-boundary masks.
+对于覆盖绝对 Page 边界 `[start_pages, candidate_pages]` 的 Lookup，`pool_valid_boundaries[pool][i]` 表示该外部 Pool 能否提供精确边界 `start_pages + i` 所需的状态。每个 Mask 的长度必须为 `candidate_pages - start_pages + 1`。第 0 项为 True，因为已达成一致的 Base 不需要外部对象。`pool_result` 保留现有的逐 Pool 汇总，供诊断和 HiCache 兼容策略使用；分布式正确性依赖逐 Pool 的精确边界 Mask。
 
-The connector validates that every lookup transfer supplies the expected aligned key count and computes one presence bit per pool and boundary from its policy. It does not combine pools: the tree must be able to satisfy Full locally while loading Mamba, SWA, or a sidecar externally. Misaligned key counts or invalid tail widths are invariant errors, not partial hits.
+Connector 校验每个 Lookup Transfer 是否提供预期数量的对齐 Key，并按 Policy 计算每个 Pool、每个边界的 Presence Bit。Connector 不合并不同 Pool：Tree 必须能够组合本地 Full 与外部 Mamba、SWA 或 Sidecar。Key 数量不对齐或 Tail 宽度非法属于不变量错误，不得当作部分命中。
 
-Lookup returns no backend-private load handle. After TP/CP agreement, the tree builds fresh load descriptors for only the agreed logical range and `load()` operates on those descriptors. This prevents rank-local lookup state for a different boundary from leaking into the common load.
+Lookup 不返回后端私有的 Load Handle。TP/CP 达成一致后，Tree 只为一致的逻辑范围重新构建 Load 描述符，`load()` 仅操作这些描述符，避免其他边界上的 Rank Local Lookup 状态泄漏到共同 Load 中。
 
-### Connector key scoping
+### Connector Key 作用域
 
-Components and the tree emit logical object hashes in `PoolTransfer.keys`. The direct path computes Full page hashes from `RadixKey` with a shared helper even when HiCache storage is disabled; it does not depend on `UnifiedTreeNode.hash_value` being populated.
+Component 和 Tree 通过 `PoolTransfer.keys` 生成 Logical Object Hash。即使关闭 HiCache Storage，直连路径也通过共享 Helper 从 `RadixKey` 计算 Full Page Hash，不依赖 `UnifiedTreeNode.hash_value` 是否填充。
 
-The tree computes `extra_key_digest` with the same stable serialization rule for LoRA/cache salts on every backend. The connector converts each logical key to a physical key equivalent to:
+Tree 使用所有后端一致的稳定序列化规则，为 LoRA/Cache Salt 计算 `extra_key_digest`。Connector 将每个 Logical Key 转换为等价的 Physical Key：
 
 ```text
 <connector namespace>/<extra_key_digest>/tp<TP_RANK>-of-<TP_SIZE>/
 cp<CP_RANK>-of-<CP_SIZE>/<pool name>/<adapter format_id>/<logical key>
 ```
 
-The connector namespace contains at least:
+Connector Namespace 至少包含：
 
-- model identity and revision
-- KV/state dtype and layout identity
-- page size
-- connector key-format version
+- Model Identity 与 Revision
+- KV/State dtype 与 Layout Identity
+- Page 大小
+- Connector Key 格式版本
 
-`CacheKeyContext` supplies the request namespace and rank coordinates that cannot be recovered from `PoolTransfer`. TP and CP coordinates are required because those ranks can own different slices for the same token page. PP is excluded from version 1.
+`CacheKeyContext` 提供无法从 `PoolTransfer` 恢复的 Request Namespace 和 Rank 坐标。TP 与 CP Rank 可能持有同一个 Token Page 的不同切片，因此这两组坐标都是必需的。版本 1 不支持 PP。
 
-## Component Interface
+## Component 接口
 
-Components use one neutral transfer facade with typed request objects. External lookup does not require a target node; it receives the existing local anchor and the logical key range explicitly.
+Component 通过带类型的 Request Object 使用统一的中立 Transfer Facade。外部 Lookup 不要求目标 Node，而是显式接收现有本地 Anchor 和 Logical Key 范围。
 
 ```python
 class CacheTransferPhase(str, Enum):
@@ -335,7 +335,7 @@ class TreeComponent:
         self,
         request: ExternalLookupRequest,
     ) -> dict[PoolName, list[bool]]:
-        """Return per-pool exact local validity for each requested boundary."""
+        """返回每个请求边界上逐 Pool 的精确本地有效性。"""
 
     def build_cache_transfers(
         self,
@@ -360,74 +360,74 @@ class TreeComponent:
         ...
 ```
 
-All `*_pages` fields in the request dataclasses are absolute prefix boundaries measured from the root. `ExternalLookupRequest.full_page_keys` covers `[start_pages, candidate_pages)`. `ExternalLoadRequest.agreed_full_page_keys` covers `[common_local_pages, agreed_pages)`. `local_boundary_validity()` returns one boolean per pool and inclusive boundary; Full is monotonic, while SWA/Mamba may mark sparse exact boundaries. The tree derives index-sidecar masks and retains pool identity so local and external state can be combined independently.
+Request Dataclass 中所有 `*_pages` 字段都是从 Root 开始计算的绝对前缀边界。`ExternalLookupRequest.full_page_keys` 覆盖 `[start_pages, candidate_pages)`，`ExternalLoadRequest.agreed_full_page_keys` 覆盖 `[common_local_pages, agreed_pages)`。`local_boundary_validity()` 为每个 Pool 和闭区间边界返回一个 Boolean；Full 具有单调性，而 SWA/Mamba 可以只标记稀疏的精确边界。Tree 派生索引 Sidecar Mask，并保留 Pool Identity，使本地状态与外部状态能够逐 Pool 独立组合。
 
-`ExistingHiCacheTransferRequest` is an adapter around the arguments already accepted by `build_hicache_transfers()` and `commit_hicache_transfer()`; it does not change HiCache semantics.
+`ExistingHiCacheTransferRequest` 是对 `build_hicache_transfers()` 和 `commit_hicache_transfer()` 现有参数的 Adapter，不改变 HiCache 语义。
 
-Compatibility works in this direction:
+兼容关系如下：
 
 ```text
-Unified tree HiCache call site
+UnifiedTree 的 HiCache 调用点
     -> build_cache_transfers(ExistingHiCacheTransferRequest)
-    -> default facade delegates to existing component build_hicache_transfers()
+    -> 默认 Facade 委托给现有 Component build_hicache_transfers()
 
-Unified tree direct call site
+UnifiedTree 的直连调用点
     -> build_cache_transfers(External*Request)
-    -> component handles the new typed request
+    -> Component 处理新的 Typed Request
 ```
 
-The same adapter rule applies to commit. Existing component implementations can migrate one at a time without changing the current HiCache path.
+Commit 同样遵循该 Adapter 规则。现有 Component 可以逐个迁移，而无需改变当前 HiCache 路径。
 
-For `ExternalLoadRequest`, allocation ownership is explicit:
+对 `ExternalLoadRequest`，内存分配所有权必须明确：
 
-- The tree owns staged Full KV destinations.
-- SWA and Mamba components own destinations they allocate in `build_cache_transfers()`.
-- Existing sidecars derive indices from an owning source pool and allocate no independent slots.
-- Every returned staged component transfer receives exactly one commit or abort call.
-- Commit attaches only the agreed state to the final node and releases unused tails.
-- Abort releases all staged component destinations and attaches nothing.
+- Tree 持有 Staged Full KV 目标。
+- SWA 和 Mamba Component 持有它们在 `build_cache_transfers()` 中分配的目标。
+- 现有 Sidecar 从所属源 Pool 派生索引，不独立分配 Slot。
+- 每个返回的 Staged Component Transfer 必须且只能收到一次 Commit 或 Abort。
+- Commit 只把已达成一致的状态挂到最终 Node，并释放未使用的 Tail。
+- Abort 释放所有 Staged Component 目标，不挂载任何状态。
 
-Direct restore adds an `EXTERNAL_STAGED` component mode to `InsertParams`. It is a structural-insertion mode, not a second tree insertion implementation:
+直连恢复为 `InsertParams` 增加 `EXTERNAL_STAGED` Component Mode。它是结构插入模式，而不是第二套 Tree Insert 实现：
 
-- Normal radix traversal, split, overlap handling, Full KV insertion, and node creation still run.
-- Component split hooks still run because existing component data must follow topology changes.
-- SWA/Mamba request-derived recovery and finalization hooks do not allocate, free, or attach state for the restored span; new component data starts as a tombstone.
-- After insertion identifies `InsertResult.last_device_node`, `commit_cache_transfer()` attaches the already staged state across the affected path.
-- The tree pre-validates every staged transfer before structural insertion. Commit performs no allocation or I/O and is treated as an invariant-preserving, non-failing operation.
-- Structural insertion plus all component commits execute synchronously on the scheduler thread. The match result and cache events are published only after all commits and evictability updates complete.
+- 仍然执行正常的 Radix 遍历、Split、Overlap 处理、Full KV 插入和 Node 创建。
+- 仍然执行 Component Split Hook，因为已有 Component Data 必须跟随拓扑变化。
+- 对恢复区间，SWA/Mamba 基于 Request 的 Recovery 和 Finalization Hook 不分配、不释放、也不挂载状态；新 Component Data 初始为 Tombstone。
+- Insert 得到 `InsertResult.last_device_node` 后，`commit_cache_transfer()` 沿受影响路径挂载已 Stage 的状态。
+- Tree 在结构插入前预校验所有 Staged Transfer。Commit 不再执行分配或 I/O，并被视为保持不变量、不会失败的操作。
+- 结构插入与所有 Component Commit 在调度器线程同步执行；只有全部 Commit 和 Evictability 更新完成后，才发布 Match Result 和 Cache Event。
 
-This gives the restore one publication boundary while retaining normal UnifiedTree split and insertion mechanics. An unexpected commit invariant failure is fatal; it is not converted into a partially published cache hit.
+这样既保留 UnifiedTree 正常的 Split 与 Insert 机制，又为恢复操作提供单一发布边界。非预期的 Commit 不变量错误是致命错误，不能转换成部分发布的 Cache Hit。
 
-### External component behavior
+### 外部 Component 行为
 
-| State | Lookup policy | Load behavior | Store behavior |
+| 状态 | Lookup Policy | Load 行为 | Store 行为 |
 |---|---|---|---|
-| Full KV | Anchor, all pages | Tree allocates Full device slots | Tree gathers root-to-node Full slots |
-| SWA | Trailing pages | Component allocates/restores SWA slots and mapping | Component exposes the valid trailing window |
-| Mamba | Trailing pages | Component allocates one applicable checkpoint slot | Component exposes the checkpoint for the stored suffix |
-| Index-derived sidecar | Follows its source pool | Target adapter writes using source-pool indices | Target adapter reads using source-pool indices |
+| Full KV | Anchor，所有 Page | Tree 分配 Full Device Slot | Tree 收集 Root-to-Node Full Slot |
+| SWA | 尾部 Page | Component 分配并恢复 SWA Slot 与 Mapping | Component 暴露有效 Tail Window |
+| Mamba | 尾部 Page | Component 分配一个适用的 Checkpoint Slot | Component 暴露已存后缀对应的 Checkpoint |
+| 索引派生 Sidecar | 跟随源 Pool | 目标 Adapter 使用源 Pool Index 写入 | 目标 Adapter 使用源 Pool Index 读取 |
 
-Mamba and SWA staged state is attached after structural insertion returns the final target node but before the restore is published. `InsertResult.last_device_node` must therefore be populated by UnifiedTree insertion.
+Mamba 与 SWA 的 Staged State 在结构插入返回最终目标 Node 后、恢复结果发布前挂载。因此 UnifiedTree Insert 必须填充 `InsertResult.last_device_node`。
 
-### Lookup and load result semantics
+### Lookup 与 Load 结果语义
 
-Connector lookup evaluates every exact boundary in the shared root-relative search interval. This is required because Full KV availability is monotonic but a longer Mamba checkpoint or SWA trailing window does not imply that a shorter boundary has the corresponding state.
+Connector Lookup 需要评估共享 Root-Relative 搜索区间中的每个精确边界。原因是 Full KV 可用性具有单调性，但更长边界上的 Mamba Checkpoint 或 SWA Tail Window，并不意味着更短边界也具有对应状态。
 
-| Operation | Policy/pool | Result interpretation |
+| 操作 | Policy/Pool | 结果解释 |
 |---|---|---|
-| Lookup | Full KV anchor | Boundary `b` is externally valid only if every requested Full object through `b` exists. |
-| Lookup | `ALL_PAGES` | Boundary `b` is valid only if all component objects required from the search base through `b` exist. |
-| Lookup | `TRAILING_PAGES` | Boundary `b` is checked against the exact trailing window or checkpoint keys declared for `b`; validity is not inferred from another boundary. |
-| Load | Every pool and policy | Transactional in version 1: every requested object must load successfully on every TP/CP rank. Any failure aborts the entire external load and publishes no new prefix. |
-| Store | Every pool and policy | Partial backend failure is allowed, but the operation reports failure. A later lookup recomputes the usable common prefix. |
+| Lookup | Full KV Anchor | 只有直到边界 `b` 的所有 Full Object 都存在时，`b` 才在外部有效。 |
+| Lookup | `ALL_PAGES` | 只有从搜索 Base 到 `b` 所需的所有 Component Object 都存在时，`b` 才有效。 |
+| Lookup | `TRAILING_PAGES` | 使用边界 `b` 声明的精确 Tail Window 或 Checkpoint Key 检查，不能从其他边界推断有效性。 |
+| Load | 所有 Pool 和 Policy | 版本 1 使用事务语义：每个 TP/CP Rank 上的所有请求对象都必须成功加载；任意失败都会中止整个外部 Load，且不发布新前缀。 |
+| Store | 所有 Pool 和 Policy | 允许后端部分失败，但操作需要上报失败；后续 Lookup 重新计算可用公共前缀。 |
 
-`ConnectorLookupResult.pool_valid_boundaries` is combined with local per-pool masks for exact-boundary agreement. Its `PoolTransferResult` summary remains lookup-only and is not reduced as a scalar hit length. `ConnectorLoadResult.successes` is used only for load and must contain one boolean per requested object. Version 1 deliberately does not partially commit a shorter Full prefix after load failure because SWA/Mamba trailing state is tied to the originally agreed prefix boundary.
+`ConnectorLookupResult.pool_valid_boundaries` 与本地逐 Pool Mask 组合，用于精确边界一致性。其 `PoolTransferResult` 汇总结果仍只用于 Lookup，不以标量 Hit Length 做 Reduce。`ConnectorLoadResult.successes` 只用于 Load，并且每个请求对象必须对应一个 Boolean。版本 1 在 Load 失败后不尝试部分提交更短的 Full Prefix，因为 SWA/Mamba Tail State 与此前达成一致的边界绑定。
 
-After TP/CP lookup agreement, components build fresh load transfers from `ExternalLoadRequest.agreed_full_page_keys`. Rank-local descriptors or backend state for a longer lookup result are never reused.
+TP/CP Lookup 达成一致后，Component 根据 `ExternalLoadRequest.agreed_full_page_keys` 重新构建 Load Transfer，绝不复用更长 Lookup 结果对应的 Rank Local 描述符或后端状态。
 
-## Tree State
+## Tree 状态
 
-The direct path adds only operation state to `UnifiedRadixCache`:
+直连路径只向 `UnifiedRadixCache` 增加操作状态：
 
 ```python
 pending_external_matches: dict[str, PendingExternalMatch]
@@ -435,249 +435,249 @@ ongoing_external_stores: OrderedDict[int, OngoingExternalStore]
 external_store_sequence: int
 ```
 
-`PendingExternalMatch` contains a snapshot of the matched logical key, key context, the cross-rank common exact-local boundary, the rank-local Full-device frontier, the rank-local per-pool validity bits at the agreed boundary, and the TP/CP-agreed absolute boundary. Fresh load requests are derived from this immutable range; connector-private lookup state and rank-local descriptors are not retained. When the agreed boundary exceeds the common local boundary, every rank creates the pending entry, including ranks that already hold all exact state for the agreed boundary locally.
+`PendingExternalMatch` 包含以下快照：匹配的 Logical Key、Key Context、跨 Rank 的公共精确本地边界、Rank Local Full Device Frontier、该 Rank 在一致边界上的逐 Pool 有效位，以及 TP/CP 达成一致的绝对边界。新的 Load Request 从这个不可变范围派生，不保留 Connector 私有 Lookup 状态或 Rank Local 描述符。当一致边界大于公共本地边界时，每个 Rank 都创建 Pending Entry，包括本地已经拥有该精确边界全部状态的 Rank。
 
-`OngoingExternalStore` is keyed by the tree sequence number and contains an optional local connector handle, local completion/success state, the final tree node, and the exact `DecLockRefParams` returned when that node was protected. A rejected local submission therefore still occupies its sequence position.
+`OngoingExternalStore` 以 Tree Sequence Number 为 Key，保存可选的本地 Connector Handle、本地完成/成功状态、最终 Tree Node，以及保护该 Node 时返回的精确 `DecLockRefParams`。因此，即使本地提交被拒绝，也必须占据对应的 Sequence 位置。
 
-No external residency bit is added to a node. Future lookups remain authoritative, which also tolerates partial store failure across ranks.
+Node 不增加外部 Residency Bit。后续 Lookup 始终是外部状态的权威来源，因此也能容忍不同 Rank 的 Store 部分失败。
 
-## Read Path
+## 读路径
 
-### Match
+### Match 阶段
 
-1. Run normal UnifiedTree local matching.
-2. Ask every component for rank-local per-pool exact-boundary validity masks over the page-aligned candidate range and derive index-sidecar masks. AND the required pool masks to obtain the rank-local complete-bundle mask.
-3. Pack that mask and apply TP/CP `MIN` elementwise. The highest true boundary is `common_local_pages`; root boundary zero is always true.
-4. If `common_local_pages` equals the candidate boundary, return the common local hit. Every rank has entered the same local-mask collective, so the decision cannot diverge.
-5. Build Full and component `LOOKUP_EXTERNAL` descriptors for `[common_local_pages, candidate_pages]`, expand sidecars, and call local connector `lookup()` on every rank.
-6. For every pool and boundary, compute `pool_reachable = local_pool_valid OR external_pool_valid`, then AND all required pool results into the rank-local reachable-boundary mask. This is the L1-Full plus external-Mamba/SWA/sidecar composition point.
-7. Pack the reachability mask and apply TP/CP `MIN` elementwise. Select the highest true exact boundary as `agreed_pages`; this is an intersection of valid boundaries, not a minimum of scalar hit lengths.
-8. If `agreed_pages > common_local_pages`, every rank saves the agreed range and its per-pool local validity at that boundary under `req.rid`. Fresh component load descriptors are built only in the load phase for pools whose local bit is false.
-9. Return device indices through `common_local_pages` plus the common `external_hit_length = (agreed_pages - common_local_pages) * page_size`.
+1. 执行正常的 UnifiedTree 本地 Match。
+2. 要求每个 Component 在 Page-Aligned 候选范围内生成 Rank Local、逐 Pool 的精确边界有效性 Mask，并派生索引 Sidecar Mask。对所有必需 Pool Mask 做 AND，得到该 Rank 的完整 Bundle Mask。
+3. 打包该 Mask，通过 TP/CP 逐元素执行 `MIN`。最高的 True 边界即 `common_local_pages`；Root 边界 0 始终为 True。
+4. 如果 `common_local_pages` 等于候选边界，直接返回公共本地命中。所有 Rank 都已进入同一个 Local Mask Collective，因此不会产生分叉。
+5. 为 `[common_local_pages, candidate_pages]` 构建 Full 和 Component 的 `LOOKUP_EXTERNAL` 描述符，展开 Sidecar，并在每个 Rank 调用本地 Connector `lookup()`。
+6. 对每个 Pool 和边界计算 `pool_reachable = local_pool_valid OR external_pool_valid`，再对所有必需 Pool 结果做 AND，得到 Rank Local Reachable Boundary Mask。这一步负责组合 L1 Full 与外部 Mamba/SWA/Sidecar。
+7. 打包 Reachability Mask，通过 TP/CP 逐元素执行 `MIN`。选择最高的 True 精确边界作为 `agreed_pages`。这是有效边界的交集，不是标量 Hit Length 的最小值。
+8. 如果 `agreed_pages > common_local_pages`，每个 Rank 都按 `req.rid` 保存一致范围，以及该边界上逐 Pool 的本地有效性。只有本地位为 False 的 Pool 才在 Load 阶段重新构建 Component Load 描述符。
+9. 返回直到 `common_local_pages` 的 Device Index，并附带公共的 `external_hit_length = (agreed_pages - common_local_pages) * page_size`。
 
-`MatchResult`, `Req`, and load parameters gain `external_hit_length`. Because both the base and target are cross-rank exact boundaries, `external_hit_length > 0` is the same on every rank and safely drives `Req.needs_external_load()`. A rank that already has exact state at `agreed_pages` still enters `init_external_load()` but performs no local connector I/O. The direct path does not overload `host_hit_length`, `last_host_node`, or host-only semantics.
+`MatchResult`、`Req` 和 Load 参数增加 `external_hit_length`。由于 Base 与 Target 都是跨 Rank 的精确边界，所有 Rank 上的 `external_hit_length > 0` 结果一致，可以安全驱动 `Req.needs_external_load()`。已经持有 `agreed_pages` 精确状态的 Rank 仍进入 `init_external_load()`，但不执行本地 Connector I/O。直连路径不复用 `host_hit_length`、`last_host_node` 或任何 Host-Only 语义。
 
-### Load and publication
+### Load 与发布阶段
 
-1. Consume `pending_external_matches[req.rid]`.
-2. Start with `local_load_ok = 1`. If every required pool is already exact-local at the agreed boundary on this rank, stage no resources and skip to agreement. Otherwise allocate Full device slots only when Full's local bit is false and only beyond the existing Full-device frontier; an aux-only load therefore has no Full destination transfer.
-3. Ask components to build fresh `LOAD_EXTERNAL` transfers only for state missing at the agreed exact boundary and stage their device slots, then expand sidecars.
-4. If any local allocation/build step fails, set `local_load_ok = 0`, keep all successfully staged resources for abort, and skip local connector I/O. Do not return.
-5. Otherwise, call connector `load()` only when this rank has missing objects. A rank with no local I/O keeps `local_load_ok = 1`.
-6. Validate result cardinality, object success, and staged attachability. Any exception or malformed result sets `local_load_ok = 0`.
-7. Every rank reduces `local_load_ok` with `MIN` across TP/CP, regardless of whether it allocated or called the connector.
-8. If the agreed result is zero, call abort for every locally staged component transfer, free all newly allocated Full slots, restore the scheduler-visible prefix to `common_local_pages`, and publish no new cache state.
-9. Call normal UnifiedTree insertion/no-op insertion in `EXTERNAL_STAGED` mode to ensure the agreed target boundary exists. Set `prev_prefix_len` to `min(full_device_pages, agreed_pages) * page_size`, preserve the corresponding existing Full indices, and provide newly loaded Full slots only for the missing suffix.
-10. Populate `InsertResult.last_device_node`, commit staged component and sidecar state in deterministic component order, refresh evictability, and publish the agreed boundary.
-11. Return the Full indices that became newly usable to the scheduler. These can include already-resident Full indices exposed by an aux-only SWA/Mamba load as well as newly loaded Full indices.
+1. 消费 `pending_external_matches[req.rid]`。
+2. 初始化 `local_load_ok = 1`。如果该 Rank 在一致边界上已经精确持有所有必需 Pool，则不 Stage 资源，直接等待一致性阶段。否则，仅当 Full 的本地有效位为 False 时分配 Full Device Slot，并且只分配现有 Full Device Frontier 之后的部分；因此 Aux-Only Load 不包含 Full 目标 Transfer。
+3. 仅为一致精确边界上缺失的状态构建新的 `LOAD_EXTERNAL` Transfer，并由 Component Stage 相应 Device Slot，然后展开 Sidecar。
+4. 任一本地分配或构建步骤失败时，设置 `local_load_ok = 0`，保留所有已成功 Stage 的资源供 Abort 使用，跳过本地 Connector I/O，但不能提前返回。
+5. 否则，仅当该 Rank 存在缺失对象时调用 Connector `load()`。无需本地 I/O 的 Rank 保持 `local_load_ok = 1`。
+6. 校验结果数量、对象成功状态和 Staged State 是否可以挂载。任意异常或非法结果都将 `local_load_ok` 设为 0。
+7. 无论是否完成分配或调用 Connector，每个 Rank 都通过 TP/CP 对 `local_load_ok` 执行 `MIN`。
+8. 如果一致结果为 0，对每个本地 Staged Component Transfer 调用 Abort，释放所有新分配的 Full Slot，把调度器可见前缀恢复到 `common_local_pages`，且不发布任何新缓存状态。
+9. 以 `EXTERNAL_STAGED` Mode 调用正常 UnifiedTree Insert 或 No-Op Insert，保证一致目标边界存在。将 `prev_prefix_len` 设置为 `min(full_device_pages, agreed_pages) * page_size`，保留对应的现有 Full Index，只为缺失后缀提供新加载的 Full Slot。
+10. 填充 `InsertResult.last_device_node`，按确定的 Component 顺序提交 Staged Component 与 Sidecar State，刷新 Evictability，然后发布一致边界。
+11. 向调度器返回新变为可用的 Full Index。其中既可以包含通过 Aux-Only SWA/Mamba Load 重新暴露的已有 Full Index，也可以包含新加载的 Full Index。
 
-No path manually constructs or grafts a tree node.
+任何路径都不能手动构造或嫁接 Tree Node。
 
-## Write Path
+## 写路径
 
-1. Complete normal `cache_finished_req()` preparation and UnifiedTree insertion.
-2. Obtain the final target node from `InsertResult.last_device_node`.
-3. Acquire component locks for that node and save the returned release parameters.
-4. Build the Full root-to-node `STORE_EXTERNAL` transfer.
-5. Ask non-Full components for store transfers and expand sidecars.
-6. Allocate the same tree-local sequence number on every rank and submit one connector store containing all pool descriptors.
-7. Insert an `OngoingExternalStore` entry on every rank. An accepted rank stores its connector handle; a rejected rank stores `handle=None`, `local_complete=True`, and `local_success=False`.
-8. Poll accepted handles from the scheduler thread and update their sequence entries.
-9. Release locks only when that sequence lies in the TP/CP-agreed consecutive completed operation prefix.
+1. 完成正常的 `cache_finished_req()` 准备与 UnifiedTree Insert。
+2. 从 `InsertResult.last_device_node` 获取最终目标 Node。
+3. 获取该 Node 的 Component Lock，并保存返回的 Release 参数。
+4. 构建 Full Root-to-Node `STORE_EXTERNAL` Transfer。
+5. 要求非 Full Component 构建 Store Transfer，并展开 Sidecar。
+6. 在每个 Rank 分配相同的 Tree Local Sequence Number，提交一个包含全部 Pool 描述符的 Connector Store。
+7. 在每个 Rank 插入一个 `OngoingExternalStore` Entry。已受理的 Rank 保存 Connector Handle；被拒绝的 Rank 保存 `handle=None`、`local_complete=True` 和 `local_success=False`。
+8. 在调度器线程 Poll 已受理 Handle，并更新对应 Sequence Entry。
+9. 只有该 Sequence 进入 TP/CP 一致的连续已完成操作前缀后，才释放 Lock。
 
-The external store does not need backend-level atomicity across pools. A later lookup applies all required hit policies and truncates the usable prefix if any required state is missing.
+外部 Store 不要求后端在不同 Pool 间提供原子性。后续 Lookup 会应用所有必需 Hit Policy；任一必需状态缺失时，都会缩短可用前缀。
 
-Normal eviction never waits for all stores. Locked nodes are already ineligible for eviction. Rejected placeholders remain locked only until the common completion-prefix poll can drain their sequence. Only reset, flush, and shutdown synchronously drain the common store sequence, waiting for any accepted local handles on the way.
+普通 Eviction 不等待所有 Store。已加锁 Node 本身就不能被驱逐。被拒绝的 Placeholder 只保持锁定，直到公共完成前缀 Poll 能够排空其 Sequence。只有 Reset、Flush 和 Shutdown 才同步排空公共 Store Sequence，并在过程中等待本地已受理 Handle。
 
-## TP/CP Ownership and Agreement
+## TP/CP 所有权与一致性
 
-Distributed coordination belongs to `UnifiedRadixCache`, not the connector.
+分布式协调属于 `UnifiedRadixCache`，不属于 Connector。
 
-### Lookup agreement
+### Lookup 一致性
 
-The tree performs elementwise `MIN` on two deterministic boolean boundary masks through the existing attention CP and attention TP groups:
+Tree 通过现有 Attention CP Group 和 Attention TP Group，对两个确定性的 Boolean Boundary Mask 逐元素执行 `MIN`：
 
-1. The all-component local-validity masks are intersected to select the highest boundary already exact-local on every rank.
-2. Above that base, each rank ORs local and external validity separately for every required pool, then ANDs the pools. Those rank-reachable masks are intersected, and the highest common true boundary becomes the external target.
+1. 对所有 Component 的 Local Validity Mask 求交集，选择每个 Rank 都精确本地可用的最高边界。
+2. 在该 Base 以上，每个 Rank 对每个必需 Pool 分别计算本地与外部有效性的 OR，再对所有 Pool 做 AND。最后对 Rank Reachable Mask 求交集，最高的公共 True 边界成为外部目标。
 
-This handles non-monotonic SWA windows and Mamba checkpoints: validity at boundary 100 does not imply validity at boundary 90. Scalar `MIN(hit_pages)` is therefore forbidden on the direct hybrid path. Only the two combined rank masks cross the network, encoded as page-aligned `uint8` vectors with identical root-relative ordering and length; per-pool composition stays local. `PoolTransferResult` remains diagnostic; pool names are sorted if per-pool metrics are packed.
+这可以处理非单调的 SWA Window 与 Mamba Checkpoint：边界 100 有效并不代表边界 90 有效。因此，直连 Hybrid 路径禁止使用标量 `MIN(hit_pages)`。只有两个合并后的 Rank Mask 跨网络传输，并编码成具有相同 Root-Relative 顺序和长度的 Page-Aligned `uint8` Vector；逐 Pool 组合保留在本地。`PoolTransferResult` 只用于诊断；如果需要打包逐 Pool Metric，必须按 Pool Name 排序。
 
-### Load agreement
+### Load 一致性
 
-Each rank validates one boolean per requested object and staged attachability. A rank with no missing local objects starts with `load_ok = 1`; a rank with allocation/build failure sets it to zero and skips connector I/O. Every rank still enters the `MIN` reduction across TP/CP. All ranks commit the complete agreed prefix when the result is one; all ranks abort every locally staged destination when it is zero. Version 1 has no partial direct-load publication.
+每个 Rank 校验每个请求对象的 Boolean 结果以及 Staged State 是否可以挂载。没有本地缺失对象的 Rank 以 `load_ok = 1` 开始；分配或构建失败的 Rank 将其设为 0，并跳过 Connector I/O。所有 Rank 仍必须进入 TP/CP `MIN`。结果为 1 时，所有 Rank 提交完整的一致前缀；结果为 0 时，所有 Rank Abort 本地所有 Staged 目标。版本 1 不支持直连 Load 的部分发布。
 
-### Store completion agreement
+### Store 完成一致性
 
-Stores receive a tree-local monotonically increasing sequence number in submission order. At each event poll:
+Store 按提交顺序获得 Tree Local 单调递增 Sequence Number。每次 Event Poll 时：
 
-1. Each rank counts the consecutive completed operations at the head of its queue.
-2. The tree reduces that count with `MIN` across TP/CP.
-3. Every rank drains exactly that many operations in the same order.
-4. Completion success is reduced for metrics, but locks are released after completion even when storage failed.
+1. 每个 Rank 统计 Queue Head 连续完成的操作数。
+2. Tree 通过 TP/CP 对该数量执行 `MIN`。
+3. 每个 Rank 按相同顺序精确排空该数量的操作。
+4. 完成成功状态参与 Reduce 以供 Metric 使用；即使 Storage 失败，操作完成后也要释放 Lock。
 
-A rank-local submission rejection is an immediately completed failed placeholder, not an immediate dequeue. This preserves identical sequence positions when another rank accepted the same operation and is still performing I/O.
+Rank Local 提交被拒绝时，记录一个立即完成且失败的 Placeholder，而不是立即出队。这样在其他 Rank 已受理同一操作并仍在执行 I/O 时，各 Rank 仍能保持一致的 Sequence 位置。
 
-Future lookup agreement prevents a partially stored prefix from becoming a cache hit.
+后续 Lookup 一致性会阻止部分 Store 的前缀成为 Cache Hit。
 
-The connector never calls `all_reduce()` and never receives a process group. Mooncake's current `_tp_min()` logic moves to the tree.
+Connector 永远不调用 `all_reduce()`，也不接收 Process Group。Mooncake 当前的 `_tp_min()` 逻辑迁移到 Tree。
 
-## Scheduler and Base Cache Compatibility
+## Scheduler 与 Base Cache 兼容
 
-The scheduler-facing changes are generic:
+面向调度器的改动保持通用：
 
-- Add `external_hit_length` alongside existing host/component hit lengths.
-- Add `Req.needs_external_load()` based on the now cross-rank-common `external_hit_length`.
-- Add `UnifiedRadixCache.init_external_load()`; keep `init_load_back()` for HiCache.
-- Add `check_cache_events()` as the neutral polling entry.
-- Keep `check_hicache_events()` as a compatibility alias.
-- Add `requires_event_polling` on `BasePrefixCache`; the scheduler no longer checks Mooncake/FlexKV-specific flags.
+- 在现有 Host/Component Hit Length 旁增加 `external_hit_length`。
+- 增加 `Req.needs_external_load()`，基于所有 Rank 一致的 `external_hit_length`。
+- 增加 `UnifiedRadixCache.init_external_load()`；HiCache 继续保留 `init_load_back()`。
+- 增加中立的 Poll 入口 `check_cache_events()`。
+- 保留 `check_hicache_events()` 作为兼容别名。
+- 在 `BasePrefixCache` 增加 `requires_event_polling`；调度器不再检查 Mooncake/FlexKV 专用 Flag。
 
-The scheduler dispatches external load before constructing the prefill batch. Existing HiCache load-back behavior is unchanged.
+调度器在构建 Prefill Batch 前派发 External Load。现有 HiCache Load-Back 行为不变。
 
-## Initialization and Configuration
+## 初始化与配置
 
-Add a connector registry separate from the radix-cache registry:
+增加独立于 Radix Cache Registry 的 Connector Registry：
 
 ```python
 register_cache_connector(name, factory)
 get_cache_connector_factory(name)
 ```
 
-Use a neutral server option:
+使用中立的 Server Option：
 
 ```text
 --cache-connector mooncake
 ```
 
-When configured:
+配置后：
 
-- Tree-cache construction selects `UnifiedRadixCache`.
-- Normal model inspection selects Full, SWA, and Mamba components.
-- The existing hybrid assembler registers component/sidecar pool adapters.
-- The connector registers all device allocations before serving.
-- Startup rejects HiCache, PP greater than one, missing pool adapters, unsupported layouts, and disabled radix cache.
+- Tree Cache 构建选择 `UnifiedRadixCache`。
+- 正常 Model Inspection 选择 Full、SWA 和 Mamba Component。
+- 现有 Hybrid Assembler 注册 Component/Sidecar Pool Adapter。
+- Connector 在开始 Serving 前注册所有 Device Allocation。
+- 启动时拒绝以下配置：同时启用 HiCache、PP 大于 1、缺少 Pool Adapter、Layout 不受支持、或 Radix Cache 被关闭。
 
-If the direct Mooncake branch's `--radix-cache-backend mooncake` option must remain compatible, it is translated to `--cache-connector mooncake` with a deprecation warning. It must not construct `MooncakeRadixCache` once the connector path is available.
+如果必须兼容 Mooncake 直连分支的 `--radix-cache-backend mooncake`，则将其转换为 `--cache-connector mooncake` 并输出弃用警告。Connector 路径可用后，该选项不得再构造 `MooncakeRadixCache`。
 
-## Error and Lifetime Rules
+## 错误与生命周期规则
 
-### Lookup failure
+### Lookup 失败
 
-Treat connector exceptions as an all-false external-boundary mask and still enter TP/CP agreement. Misaligned component keys, malformed mask lengths, configuration, and layout are invariant failures and remain fatal.
+Connector 异常按全 False 的 External Boundary Mask 处理，但仍必须进入 TP/CP 一致性流程。Component Key 不对齐、Mask 长度非法、配置错误和 Layout 错误属于不变量失败，仍然是致命错误。
 
-### Allocation failure
+### 分配失败
 
-Set local `load_ok=0`, preserve successfully staged resources for rollback, and still enter TP/CP load agreement. After the common result is zero, abort all staged component transfers, free Full destinations, remove the pending match, and continue from the cross-rank common local prefix as an ordinary cache miss.
+设置本地 `load_ok=0`，保留已成功 Stage 的资源以供 Rollback，同时仍进入 TP/CP Load 一致性流程。公共结果为 0 后，Abort 所有 Staged Component Transfer，释放 Full 目标，移除 Pending Match，并从跨 Rank 公共本地前缀开始按普通 Cache Miss 继续执行。
 
-### Load failure or partial load
+### Load 失败或部分 Load
 
-Set local `load_ok=0`, reduce it across TP/CP on every rank, call every component abort hook, free all newly allocated Full destinations, and publish no new prefix. A rank must not return early because its peer may be waiting in the collective. Partial load publication is deferred beyond version 1.
+设置本地 `load_ok=0`，并在每个 Rank 通过 TP/CP Reduce。调用所有 Component Abort Hook，释放所有新分配的 Full 目标，不发布新前缀。Rank 不得提前返回，因为其他 Rank 可能正在 Collective 中等待。部分 Load 发布推迟到版本 1 之后。
 
-### Store rejection
+### Store 被拒绝
 
-Record an immediately completed failed placeholder for the operation's sequence. Keep the node locked until the common completion-prefix poll drains that sequence, then release it. Serving continues without external persistence.
+为该操作 Sequence 记录一个立即完成且失败的 Placeholder。保持 Node 锁定，直到公共完成前缀 Poll 排空该 Sequence，然后释放。Serving 继续执行，但本次状态不会持久化到外部。
 
-### Store failure after acceptance
+### Store 受理后失败
 
-Keep the node locked until completion, record a failure metric, then release it. Do not delete local tree state or retry in version 1.
+保持 Node 锁定直到操作完成，记录失败 Metric，然后释放。版本 1 不删除本地 Tree State，也不重试。
 
-### Request abort
+### Request 中止
 
-Remove only the pending lookup/load marker. Accepted stores are independent of request IDs and remain protected until connector completion.
+只移除 Pending Lookup/Load 标记。已受理 Store 与 Request ID 无关，在 Connector 完成前继续受到保护。
 
-### Reset and flush
+### Reset 与 Flush
 
-Drain the common store sequence, waiting for accepted local handles and consuming rejected placeholders in order. Then release its locks, clear pending matches, and reset the local tree. External objects remain intact.
+排空公共 Store Sequence，等待已受理的本地 Handle，并按顺序消费被拒绝的 Placeholder。随后释放 Lock、清空 Pending Match，并 Reset 本地 Tree。外部对象保持不变。
 
-### Shutdown
+### 关闭
 
-Drain stores, close the connector, unregister device allocations, then release device pools.
+排空 Store，关闭 Connector，注销 Device Allocation，然后释放 Device Pool。
 
-## Observability
+## 可观测性
 
-Add backend- and pool-labeled counters for:
+增加带 Backend 与 Pool Label 的 Counter：
 
-- lookup requests, hit pages, and misses
-- load requested/committed pages
-- partial loads and load failures
-- accepted/rejected/completed/failed stores
-- pending store count
-- TP/CP lookup or load disagreement
+- Lookup Request、Hit Page 和 Miss
+- Load 请求与提交 Page 数
+- 部分 Load 与 Load 失败
+- 已受理/被拒绝/已完成/失败的 Store
+- Pending Store 数量
+- TP/CP Lookup 或 Load 不一致
 
-Replica placement such as Mooncake memory versus SSD is connector-specific diagnostic information and is not part of Tree scheduling.
+Mooncake Memory 与 SSD 等 Replica Placement 属于 Connector 专用诊断信息，不参与 Tree 调度。
 
-## Testing
+## 测试
 
-### Connector unit tests
+### Connector 单元测试
 
-- Stable key namespace varies with model, `extra_key`, TP rank, and CP rank.
-- Every device allocation is registered once.
-- MHA/MLA, SWA, Mamba, and sidecar adapters return one object-major span list per logical key.
-- Lookup honors `ALL_PAGES` and `TRAILING_PAGES`.
-- Load/store use matching keys and buffer shapes.
-- Store rejection and completion are reported correctly.
+- 稳定 Key Namespace 随 Model、`extra_key`、TP Rank 和 CP Rank 正确变化。
+- 每个 Device Allocation 只注册一次。
+- MHA/MLA、SWA、Mamba 和 Sidecar Adapter 为每个 Logical Key 返回一组 Object-Major Span。
+- Lookup 正确遵循 `ALL_PAGES` 与 `TRAILING_PAGES`。
+- Load/Store 使用匹配的 Key 与 Buffer Shape。
+- 正确上报 Store 拒绝与完成。
 
-### UnifiedTree unit tests
+### UnifiedTree 单元测试
 
-- A full local hit on every rank bypasses connector I/O after the common local-validity collective.
-- External lookup reports `external_hit_length` without host state.
-- External load uses normal insertion and preserves split/LRU/size invariants.
-- Full plus Mamba, Full plus SWA, and sidecar loads commit only when all required state exists.
-- Aux-only load exposes already resident Full indices after restoring missing SWA/Mamba state.
-- Per-pool masks allow local Full plus external Mamba/SWA even when Full is absent externally.
-- `EXTERNAL_STAGED` insertion leaves auxiliary tombstones until deterministic component commit and exposes no intermediate match result.
-- Partial load frees every uncommitted pool slot.
-- Store locks the exact final node and unlocks once.
-- Request abort never unlocks an accepted store.
-- Eviction skips store-locked nodes without globally draining stores.
-- Reset drains stores while preserving external objects.
+- 所有 Rank 均为完整本地命中时，在公共 Local Validity Collective 后跳过 Connector I/O。
+- External Lookup 在不创建 Host State 的情况下上报 `external_hit_length`。
+- External Load 使用正常 Insert，并保持 Split/LRU/Size 不变量。
+- Full+Mamba、Full+SWA 和 Sidecar Load 只有在所有必需状态存在时才 Commit。
+- Aux-Only Load 恢复缺失 SWA/Mamba 后，能够暴露已经常驻的 Full Index。
+- 即使外部不存在 Full，逐 Pool Mask 也允许组合本地 Full 与外部 Mamba/SWA。
+- `EXTERNAL_STAGED` Insert 在确定性 Component Commit 前保留辅助 Tombstone，不暴露中间 Match Result。
+- 部分 Load 释放所有未提交 Pool Slot。
+- Store 锁定精确的最终 Node，并且只解锁一次。
+- Request Abort 不得解锁已受理 Store。
+- Eviction 跳过 Store-Locked Node，不全局排空 Store。
+- Reset 排空 Store，同时保留外部对象。
 
-### Distributed tests
+### 分布式测试
 
-- TP ranks with different and non-monotonic local/external boundary masks publish their highest common exact boundary.
-- A rank already exact-local at the agreed boundary skips load I/O but still joins load agreement required by another rank.
-- CP ranks use distinct physical keys and intersect exact-boundary masks.
-- One-rank allocation failure makes every rank abort without a collective hang.
-- Any TP/CP load failure aborts publication of the entire previously agreed prefix.
-- Store completion queues drain in identical order across ranks.
+- TP Rank 具有不同且非单调的本地/外部 Boundary Mask 时，发布最高公共精确边界。
+- 在一致边界上已经精确本地可用的 Rank 跳过 Load I/O，但仍参与其他 Rank 所需的 Load 一致性。
+- CP Rank 使用不同 Physical Key，并对精确边界 Mask 求交集。
+- 单个 Rank 分配失败时，所有 Rank 都 Abort，且 Collective 不发生 Hang。
+- 任意 TP/CP Load 失败都会中止此前一致前缀的完整发布。
+- 不同 Rank 的 Store Completion Queue 按相同顺序排空。
 
-### Regression tests
+### 回归测试
 
-- Existing UnifiedTree Full/SWA/Mamba tests pass without a connector.
-- Existing Unified HiCache host/storage tests pass unchanged.
-- Existing scheduler abort, timeout, and priority-preemption tests pass through generic event cleanup.
+- 不启用 Connector 时，现有 UnifiedTree Full/SWA/Mamba 测试通过。
+- 现有 Unified HiCache Host/Storage 测试无需修改即可通过。
+- 现有调度器 Abort、Timeout 和 Priority Preemption 测试通过通用 Event Cleanup。
 
-### End-to-end tests
+### 端到端测试
 
-- Mooncake direct round trip for MHA TP2.
-- Mooncake direct round trip for MLA TP2.
-- Hybrid Mamba state round trip.
-- Hybrid SWA state round trip.
-- At least one registered sidecar round trip.
-- CP round trip on a model/configuration with CP-aware cache slices.
-- Flush local tree, reload from Mooncake, and verify cached-token count and output correctness.
+- Mooncake 直连 MHA TP2 Round Trip。
+- Mooncake 直连 MLA TP2 Round Trip。
+- Hybrid Mamba 状态往返测试。
+- Hybrid SWA 状态往返测试。
+- 至少一个已注册 Sidecar Round Trip。
+- 在具有 CP-Aware Cache Slice 的模型或配置上完成 CP Round Trip。
+- Flush 本地 Tree，从 Mooncake 重新加载，并校验 Cached Token 数量与输出正确性。
 
-## Rollout Sequence
+## 落地顺序
 
-1. Introduce neutral component hook names and compatibility wrappers; keep all behavior unchanged.
-2. Add connector registry, shared direct connector types, pool adapters, and generic scheduler polling.
-3. Integrate Full-only direct Mooncake through UnifiedTree and delete the separate tree lifecycle from `MooncakeRadixCache`.
-4. Add SWA and Mamba external phases with allocation rollback tests.
-5. Register and validate sidecar adapters.
-6. Enable TP/CP agreement and distributed tests.
-7. Enable `--cache-connector mooncake` for the complete supported component matrix.
+1. 引入中立的 Component Hook 名称与兼容 Wrapper，保持所有行为不变。
+2. 增加 Connector Registry、共享直连 Connector 类型、Pool Adapter 和通用 Scheduler Polling。
+3. 通过 UnifiedTree 集成仅 Full 的 Mooncake 直连路径，并删除 `MooncakeRadixCache` 中独立的 Tree 生命周期。
+4. 增加 SWA 与 Mamba External Phase，以及 Allocation Rollback 测试。
+5. 注册并校验 Sidecar Adapter。
+6. 启用 TP/CP 一致性与分布式测试。
+7. 对完整受支持 Component Matrix 启用 `--cache-connector mooncake`。
 
-Each step must keep the existing HiCache path green. The final option is not enabled for a model until every required component and sidecar pool has an adapter and test coverage.
+每一步都必须保持现有 HiCache 路径测试通过。只有模型所需的每个 Component 与 Sidecar Pool 都具备 Adapter 和测试覆盖后，才能为该模型启用最终选项。
 
-## Acceptance Criteria
+## 验收标准
 
-The design is complete when all of the following hold:
+满足以下全部条件后，设计才算完成：
 
-- Direct external caching uses `UnifiedRadixCache`, not a backend-specific RadixCache subclass.
-- No direct connector path allocates or publishes host indices.
-- Full, SWA, Mamba, and registered index-derived sidecars use the same connector operation.
-- Loaded data enters the tree only through normal UnifiedTree insertion and component commit hooks.
-- TP/CP exact-boundary validity masks and load success are reduced in the tree, with connector-local I/O only.
-- In-flight store data cannot be evicted or freed before completion.
-- Existing HiCache behavior and tests remain unchanged.
-- Direct Mooncake MHA, MLA, hybrid-state, sidecar, and CP round trips pass.
+- 直连外部缓存使用 `UnifiedRadixCache`，而不是后端专用 RadixCache 子类。
+- 直连 Connector 路径不分配也不发布 Host Index。
+- Full、SWA、Mamba 和已注册的索引派生 Sidecar 使用同一套 Connector 操作。
+- 已加载数据只通过正常 UnifiedTree Insert 与 Component Commit Hook 进入 Tree。
+- TP/CP 精确边界有效性 Mask 与 Load 成功状态在 Tree 中 Reduce，Connector 只执行本地 I/O。
+- In-Flight Store 数据在完成前不能被 Evict 或释放。
+- 现有 HiCache 行为与测试保持不变。
+- Mooncake 直连 MHA、MLA、Hybrid State、Sidecar 和 CP Round Trip 全部通过。
