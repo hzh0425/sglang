@@ -233,7 +233,7 @@ class _MooncakeStorage:
         pass
 
 
-def _make_mooncake_connector():
+def _make_mooncake_connector(*, tp_rank=0, tp_size=1):
     storage = _MooncakeStorage()
     stack = ExternalPoolStack(
         anchor=LogicalDevicePool(page_size=2),
@@ -260,8 +260,8 @@ def _make_mooncake_connector():
             kv_cache_dtype="bf16",
             mooncake_store_workers=1,
         ),
-        tp_rank=0,
-        tp_size=1,
+        tp_rank=tp_rank,
+        tp_size=tp_size,
         pp_rank=0,
         pp_size=1,
         attn_cp_rank=0,
@@ -272,6 +272,28 @@ def _make_mooncake_connector():
 
 
 class TestMooncakeConnectorBundle(CustomTestCase):
+    def test_each_tp_rank_uses_its_own_namespace_and_stores(self):
+        connector, storage = _make_mooncake_connector(tp_rank=1, tp_size=2)
+        key = RadixKey(array("q", [1, 2]))
+        transfers = [
+            PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([2, 3])),
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                device_indices=torch.tensor([2, 3]),
+                indices_from_pool=PoolName.KV,
+            ),
+        ]
+
+        operation_id = connector.store_async(key, transfers)
+        completions = connector.wait_for_all_stores()
+
+        self.assertIn(
+            "_tp1of2_cp0of1", storage.storage_config.extra_config["extra_backend_tag"]
+        )
+        self.assertEqual(completions, [ExternalStoreCompletion(operation_id, True)])
+        self.assertEqual(len(storage.set_calls), 1)
+        connector.close()
+
     def test_logical_full_is_not_sent_to_v2_io(self):
         connector, storage = _make_mooncake_connector()
         key = RadixKey(array("q", [1, 2, 3, 4]))

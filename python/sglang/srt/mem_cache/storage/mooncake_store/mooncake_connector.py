@@ -72,11 +72,13 @@ class MooncakeConnector(ExternalCacheConnector):
     ):
         self.page_size = pool_stack.anchor.page_size
         self.pool_stack = pool_stack
-        self.store_skip = tp_rank != 0
         namespace = _stable_namespace(
             model_config, server_args, self.page_size, tp_size
         )
-        backend_tag = f"{namespace}_cp{attn_cp_rank}of{attn_cp_size}"
+        backend_tag = (
+            f"{namespace}_tp{tp_rank}of{tp_size}"
+            f"_cp{attn_cp_rank}of{attn_cp_size}"
+        )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
         )
@@ -231,8 +233,6 @@ class MooncakeConnector(ExternalCacheConnector):
         return self._all_transfers_succeeded(results, resolved)
 
     def _store(self, key: RadixKey, transfers: Sequence[PoolTransfer]) -> bool:
-        if self.store_skip:
-            return True
         page_keys = self._page_keys(key)
         resolved = self._resolve_transfers(page_keys, transfers)
         results = self.storage.batch_set_v2(resolved)
