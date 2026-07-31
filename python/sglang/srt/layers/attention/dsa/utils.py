@@ -90,9 +90,10 @@ def is_dsa_enable_prefill_cp():
     # DeepSeek Sparse Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
+    hf_config = get_server_args().get_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
@@ -185,6 +186,7 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     cp_align_size = get_cp_padding_align_size()
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
+
     # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:

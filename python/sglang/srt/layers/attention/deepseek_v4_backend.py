@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillWorkspace,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -323,11 +324,18 @@ class DSV4AttnMetadata:
         "c128_out_loc",
     ]
 
-    def apply_cp_reindex(self) -> None:
+    def apply_cp_reindex(self, logical_global_len: Optional[int] = None) -> None:
         cp_rank = get_parallel().attn_cp_rank
         cp_size = get_parallel().attn_cp_size
         idx = slice(cp_rank, None, cp_size)
         pre_global_len = self.seq_lens_casual.shape[0]
+        if logical_global_len is not None and not (
+            0 <= logical_global_len <= pre_global_len
+        ):
+            raise ValueError(
+                f"apply_cp_reindex: logical_global_len={logical_global_len} must "
+                f"be between 0 and physical_global_len={pre_global_len}."
+            )
         assert pre_global_len % cp_size == 0, (
             f"apply_cp_reindex: global token count {pre_global_len} is not divisible by cp_size={cp_size}. "
             "CP round-robin requires padding to ensure divisibility."
@@ -354,6 +362,8 @@ class DSV4AttnMetadata:
                 f"apply_cp_reindex post-condition: global field {field_name}.shape[0]={val.shape[0]} "
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
+            if logical_global_len is not None:
+                setattr(self, field_name, val[:logical_global_len].contiguous())
 
     def init_flashmla_related(self, is_prefill: bool = False):
         # c4_sparse_topk is set from model_config.index_topk per-model
@@ -723,7 +733,31 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> DSV4Metadata:
+        logical_out_cache_loc = out_cache_loc
+        cp_v2_active = forward_batch is not None and is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            cp_metadata = forward_batch.attn_cp_metadata
+            assert cp_metadata is not None
+            physical_num_tokens = sum(cp_metadata.per_rank_actual_token)
+            if logical_out_cache_loc.shape[0] != num_tokens:
+                raise ValueError(
+                    "DSV4 CP-v2 out_cache_loc must remain in the logical token "
+                    f"domain, got locations={logical_out_cache_loc.shape[0]}, "
+                    f"logical={num_tokens}."
+                )
+            if physical_num_tokens < num_tokens:
+                raise ValueError(
+                    "DSV4 CP-v2 physical token count must cover the logical "
+                    f"tokens, got physical={physical_num_tokens}, logical={num_tokens}."
+                )
+            out_cache_loc = F.pad(
+                logical_out_cache_loc,
+                (0, physical_num_tokens - logical_out_cache_loc.shape[0]),
+                value=0,
+            )
+
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -744,6 +778,9 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
             dspark_block_size=dspark_block_size,
         )
+        if cp_v2_active:
+            core_attn_metadata.apply_cp_reindex(logical_global_len=num_tokens)
+            core_attn_metadata.init_flashmla_related(is_prefill=True)
         indexer_metadata = (
             self.init_forward_metadata_indexer(
                 core_attn_metadata,
@@ -775,7 +812,7 @@ class DeepseekV4AttnBackend(
                         extend_lens=extend_seq_lens,
                         extend_lens_cpu=None,
                         use_prefill_cuda_graph=True,
-                        num_q_tokens=out_cache_loc.shape[0],
+                        num_q_tokens=logical_out_cache_loc.shape[0],
                         online_state_slot_offset=online_c128_state_slot_offset,
                     )
                 return create_paged_compressor_data(
@@ -1460,6 +1497,7 @@ class DeepseekV4AttnBackend(
                 extend_start_loc=forward_batch.extend_start_loc,
                 need_compress=True,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                forward_batch=forward_batch,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")

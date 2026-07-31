@@ -371,15 +371,24 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
-        hidden_states = cp_gather_after_forward(
-            hidden_states, forward_batch, torch.cuda.current_stream()
-        )
+        stream = torch.cuda.current_stream()
+        prepare_logits = getattr(model, "prepare_cp_v2_logits", None)
+        if prepare_logits is None:
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            logits_kwargs = {}
+        else:
+            hidden_states, logits_kwargs = prepare_logits(
+                hidden_states, forward_batch, stream
+            )
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
             aux_hidden_states,
+            **logits_kwargs,
         )
 
     def _execute_idle(

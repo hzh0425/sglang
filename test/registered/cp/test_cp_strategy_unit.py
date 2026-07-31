@@ -1,10 +1,11 @@
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.layers.attention.dsa.utils import cal_padded_tokens
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -21,12 +22,14 @@ from sglang.srt.layers.cp.padding import (
     pad_logical_token_to_physical,
 )
 from sglang.srt.layers.cp.utils import (
+    cp_gather_kv_cache,
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,6 +69,36 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertEqual(ContextParallelStrategyKind.ZIGZAG.cli_value, "zigzag")
         self.assertEqual(ContextParallelStrategyKind.INTERLEAVE.cli_value, "interleave")
 
+    def test_cp_gather_kv_cache_uses_active_strategy(self):
+        tensor = torch.arange(8).view(4, 2)
+        forward_batch = SimpleNamespace()
+        strategy = MagicMock()
+        strategy.gather_kv_cache.return_value = tensor
+
+        with (
+            patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+            patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        ):
+            self.assertIs(cp_gather_kv_cache(tensor, forward_batch), tensor)
+
+        strategy.gather_kv_cache.assert_called_once_with(tensor, forward_batch, None)
+
+    def test_cp_gather_kv_cache_preserves_legacy_dispatch(self):
+        tensor = torch.arange(8).view(4, 2)
+        forward_batch = SimpleNamespace()
+
+        with (
+            get_parallel().override(attn_cp_size=4),
+            patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=False),
+            patch(
+                "sglang.srt.layers.utils.cp_utils.cp_all_gather_rerange_output",
+                return_value=tensor,
+            ) as legacy_gather,
+        ):
+            self.assertIs(cp_gather_kv_cache(tensor, forward_batch), tensor)
+
+        legacy_gather.assert_called_once_with(tensor, 4, forward_batch, None)
+
     def test_init_cp_strategy_binds_zigzag_strategy(self):
         init_cp_strategy(
             SimpleNamespace(
@@ -100,6 +133,44 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
+
+    def test_dsa_padding_keeps_short_cp_v2_fallback_length(self):
+        forward_batch = SimpleNamespace(
+            global_num_tokens_cpu=[6],
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+            extend_seq_lens_cpu=[6],
+        )
+
+        with (
+            get_parallel().override(attn_cp_size=8, attn_cp_rank=0),
+            patch(
+                "sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=False
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.can_dsa_prefill_cp_round_robin_split",
+                return_value=False,
+            ),
+        ):
+            self.assertEqual(cal_padded_tokens(forward_batch), 6)
+
+    def test_dsa_padding_uses_prepared_cp_v1_length(self):
+        forward_batch = SimpleNamespace(
+            global_num_tokens_cpu=[8],
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+            extend_seq_lens_cpu=[6],
+        )
+
+        with (
+            get_parallel().override(attn_cp_size=8, attn_cp_rank=0),
+            patch(
+                "sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=False
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.can_dsa_prefill_cp_round_robin_split",
+                return_value=False,
+            ),
+        ):
+            self.assertEqual(cal_padded_tokens(forward_batch), 8)
 
 
 class TestCPZigzagStrategy(CustomTestCase):

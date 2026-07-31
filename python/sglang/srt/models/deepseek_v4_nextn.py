@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     dp_gather_partial,
     get_global_dp_buffer_len,
@@ -37,7 +38,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
+from sglang.srt.models.deepseek_v4 import (
+    DeepseekV4DecoderLayer,
+    DeepseekV4ForCausalLM,
+    prepare_dsv4_cp_v2_input_ids,
+)
 from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix
 
@@ -115,6 +120,9 @@ class DeepseekV4ModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def get_input_embeddings(self) -> nn.Module:
+        return self.embed_tokens
+
     def hc_head(
         self,
         x: torch.Tensor,
@@ -137,6 +145,7 @@ class DeepseekV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        cp_v2_active = is_cp_v2_active(forward_batch)
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -156,7 +165,10 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if cp_v2_active:
+            input_ids = prepare_dsv4_cp_v2_input_ids(input_ids, forward_batch)
+            input_ids_global = input_ids
+        elif get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -167,7 +179,7 @@ class DeepseekV4ModelNextN(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) and not cp_v2_active:
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             input_ids = cp_round_robin_input_ids(input_ids)
@@ -185,7 +197,7 @@ class DeepseekV4ModelNextN(nn.Module):
             # deferred fused hc_post state.
             hidden_states = self.decoder.hc_post(hidden_states, residual, post, comb)
 
-        if dsa_use_prefill_cp(forward_batch):
+        if dsa_use_prefill_cp(forward_batch) and not cp_v2_active:
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
@@ -244,7 +256,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

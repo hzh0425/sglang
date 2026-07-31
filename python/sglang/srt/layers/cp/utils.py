@@ -238,6 +238,20 @@ def cp_gather_after_forward(x: Any, forward_batch, stream: Optional[Any] = None)
     return strategy.gather_hidden_states(x, forward_batch, stream)
 
 
+def cp_gather_kv_cache(x: Any, forward_batch, stream: Optional[Any] = None):
+    """Materialize a CP tensor in the global logical token order."""
+    if is_cp_v2_active(forward_batch):
+        strategy = get_cp_strategy()
+        assert strategy is not None
+        return strategy.gather_kv_cache(x, forward_batch, stream)
+
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    return cp_all_gather_rerange_output(
+        x, get_parallel().attn_cp_size, forward_batch, stream
+    )
+
+
 @contextmanager
 def cp_shard_model_inputs(
     complete_hidden_states: Any,
@@ -293,6 +307,7 @@ __all__ = [
     "get_cp_strategy",
     "is_cp_v2_active",
     "cp_gather_after_forward",
+    "cp_gather_kv_cache",
     "cp_shard_hidden_states",
     "cp_shard_model_inputs",
     "cp_shard_position_ids",
