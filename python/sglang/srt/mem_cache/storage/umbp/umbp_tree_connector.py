@@ -1,0 +1,566 @@
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from queue import Queue
+from typing import Any
+
+import torch
+
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageConfig,
+    PoolName,
+    PoolTransfer,
+)
+from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
+
+logger = logging.getLogger(__name__)
+
+# Keep every control-plane RPC comfortably below gRPC's message-size limit.
+# This is a logical-page count; object batches contain CHUNK_PAGES * layers.
+CHUNK_PAGES = 64
+
+
+class _LogicalPool:
+    def __init__(self, page_size: int):
+        self.page_size = page_size
+        self.kv_buffer = None
+
+
+class _LayerRowsPool:
+    """Expose per-layer GPU tensors as page-major pointer metadata."""
+
+    def __init__(
+        self,
+        buffers: Sequence[torch.Tensor],
+        page_size: int,
+        *,
+        rows_are_pages: bool,
+    ):
+        if not buffers:
+            raise ValueError("Direct UMBP requires at least one layer buffer.")
+        self.kv_buffer = list(buffers)
+        self.page_size = page_size
+        self._page_offsets = torch.arange(page_size)
+        self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
+        self._row_span = 1 if rows_are_pages else page_size
+        self._rows_are_pages = rows_are_pages
+        self.row_sizes = tuple(
+            buffer[0].numel() * buffer.element_size() * self._row_span
+            for buffer in self.kv_buffer
+        )
+
+    def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
+        return self.kv_buffer
+
+    def _rows(self, indices: torch.Tensor) -> torch.Tensor:
+        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
+        if slots.numel() % self.page_size:
+            raise ValueError(
+                f"UMBP transfer has {slots.numel()} indices, expected a multiple "
+                f"of page_size={self.page_size}."
+            )
+        if not slots.numel():
+            return torch.empty((0,), dtype=torch.int64)
+
+        pages = slots.reshape(-1, self.page_size)
+        starts = pages[:, 0]
+        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
+            pages, starts[:, None] + self._page_offsets
+        ):
+            raise ValueError("Direct UMBP requires aligned contiguous device pages.")
+
+        rows = (
+            starts.div(self.page_size, rounding_mode="floor")
+            if self._rows_are_pages
+            else starts
+        )
+        first_row = int(rows.min())
+        last_row = int(rows.max()) + self._row_span
+        if first_row < 0 or last_row > self._row_count:
+            bad_row = first_row if first_row < 0 else last_row - 1
+            raise ValueError(
+                f"UMBP row {bad_row} exceeds buffer shapes "
+                f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
+            )
+        return rows
+
+    def get_page_buffer_meta(self, indices: torch.Tensor):
+        rows = self._rows(indices).tolist()
+        ptrs = [buffer[row].data_ptr() for row in rows for buffer in self.kv_buffer]
+        return ptrs, list(self.row_sizes) * len(rows)
+
+
+class _TokenRowsPool(_LayerRowsPool):
+    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
+        super().__init__(buffers, page_size, rows_are_pages=False)
+
+
+class _PageRowsPool(_LayerRowsPool):
+    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
+        super().__init__(buffers, page_size, rows_are_pages=True)
+
+
+def _build_pools(kvcache: Any, page_size: int):
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if not isinstance(kvcache, DSATokenToKVPool):
+        raise TypeError("Direct UMBP connector currently supports DSA KV pools only.")
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "DSA KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+
+    return (
+        _LogicalPool(page_size),
+        {
+            PoolName.KV: _TokenRowsPool(kvcache.kv_buffer, page_size),
+            PoolName.INDEXER: _PageRowsPool(
+                kvcache.index_k_with_scale_buffer, page_size
+            ),
+        },
+    )
+
+
+class LayerWiseLoadCounter:
+    """CPU completion counter compatible with KV pools' layer wait hook."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self._producer_index = -1
+        self.consumer_index = -1
+        self._events: dict[int, list[threading.Event]] = {}
+        self._errors: dict[int, BaseException] = {}
+
+    def update_producer(self) -> int:
+        self._producer_index += 1
+        self._events[self._producer_index] = [
+            threading.Event() for _ in range(self.num_layers)
+        ]
+        return self._producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def complete(self, index: int, layer: int) -> None:
+        self._events[index][layer].set()
+
+    def fail(self, index: int, error: BaseException) -> None:
+        events = self._events.get(index)
+        if events is None:
+            return
+        self._errors[index] = error
+        for event in events:
+            event.set()
+
+    def wait_until(self, threshold: int) -> None:
+        index = self.consumer_index
+        events = self._events.get(index)
+        if events is None:
+            return
+        events[threshold].wait()
+        error = self._errors.get(index)
+        if threshold == self.num_layers - 1:
+            self._events.pop(index, None)
+            self._errors.pop(index, None)
+        if error is not None:
+            raise RuntimeError("UMBP layer-wise KV load failed.") from error
+
+    def reset(self) -> None:
+        self._producer_index = -1
+        self.consumer_index = -1
+        self._events.clear()
+        self._errors.clear()
+
+
+@dataclass
+class _LayerObjectPlan:
+    name: PoolName
+    keys: list[str]
+    ptrs: list[int]
+    sizes: list[int]
+    num_layers: int
+
+    @property
+    def num_pages(self) -> int:
+        return len(self.keys) // self.num_layers
+
+    def layer_meta(self, layer: int):
+        return (
+            self.keys[layer :: self.num_layers],
+            self.ptrs[layer :: self.num_layers],
+            self.sizes[layer :: self.num_layers],
+        )
+
+
+def _config_bool(value: Any, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"UMBP connector config {key!r} must be boolean, got {value!r}.")
+
+
+def _parse_storage_extra_config(raw_config):
+    # Keep the connector module importable in CPU-only unit tests. The hybrid
+    # controller imports device-specific memory-pool modules transitively.
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+        HybridCacheController,
+    )
+
+    extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+        raw_config
+    )
+    return extra_config
+
+
+class UMBPTreeConnector(UnifiedTreeConnector):
+    def __init__(
+        self,
+        server_args,
+        params: CacheInitParams,
+        *,
+        _storage=None,
+    ):
+        self.page_size = params.page_size
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        anchor, self.pools = _build_pools(kvcache, self.page_size)
+        self.num_layers = len(self.pools[PoolName.KV].kv_buffer)
+        if self.num_layers == 0 or any(
+            len(pool.kv_buffer) != self.num_layers for pool in self.pools.values()
+        ):
+            raise ValueError("UMBP KV and INDEXER pools must have equal layer counts.")
+
+        tp_rank = 0
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+
+        extra_config = _parse_storage_extra_config(
+            server_args.hicache_storage_backend_extra_config
+        )
+        extra_config = dict(extra_config)
+        for key in ("ssd_enabled", "cache_remote_fetches"):
+            if key in extra_config and _config_bool(extra_config[key], key):
+                raise ValueError(
+                    f"Direct UMBP requires {key}=false because its GPU path "
+                    "cannot use the corresponding host-memory fallback."
+                )
+            extra_config[key] = False
+
+        min_object_size = min(
+            size for pool in self.pools.values() for size in pool.row_sizes
+        )
+        dram_page_size = int(extra_config.get("dram_page_size", min_object_size))
+        if not 0 < dram_page_size <= min_object_size:
+            raise ValueError(
+                "Direct UMBP requires 0 < dram_page_size <= the smallest "
+                f"per-layer object ({min_object_size} bytes), got {dram_page_size}."
+            )
+        extra_config["dram_page_size"] = dram_page_size
+
+        storage_config = HiCacheStorageConfig(
+            tp_rank=tp_rank,
+            tp_size=server_args.tp_size,
+            pp_rank=params.pp_rank,
+            pp_size=params.pp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_size=params.attn_cp_size,
+            is_mla_model=True,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name=server_args.model_path,
+            extra_config=extra_config,
+        )
+
+        if _storage is None:
+            from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+
+            self.storage = UMBPStore(storage_config, mem_pool_host=None)
+        else:
+            self.storage = _storage
+
+        try:
+            client = self.storage.client
+            if not bool(client.is_distributed()):
+                raise ValueError("Direct UMBP requires distributed deployment mode.")
+            if getattr(self.storage, "_disable_zero_copy_register", False):
+                raise ValueError(
+                    "Direct UMBP cannot disable zero-copy memory registration."
+                )
+
+            self.storage.mem_pool_host = anchor
+            self.storage._kv_anchor_is_logical = True
+            self.storage.registered_pools = self.pools
+            self.storage.mla_suffix = (
+                f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
+            )
+            self._register_buffers()
+        except BaseException:
+            self.storage.close()
+            raise
+
+        self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self._pending: dict[str, list[PoolTransfer]] = {}
+        self._load_queue: Queue[tuple[int, list[_LayerObjectPlan]] | None] = Queue()
+        self._stats = {"lookup": 0, "load": 0, "offload": 0}
+        self._load_thread = threading.Thread(
+            target=self._load_thread_func,
+            daemon=True,
+            name=f"umbp-layerwise-tp{tp_rank}",
+        )
+        self._closed = False
+        self._load_thread.start()
+
+    def _register_buffers(self) -> None:
+        seen = set()
+        for pool in self.pools.values():
+            for buffer in pool.get_hybrid_pool_buffer():
+                storage = buffer.untyped_storage()
+                allocation = (int(storage.data_ptr()), int(storage.nbytes()))
+                if allocation in seen:
+                    continue
+                seen.add(allocation)
+                if not self.storage.client.register_memory(*allocation):
+                    raise RuntimeError(
+                        "Failed to register a GPU KV buffer with UMBP: "
+                        f"ptr=0x{allocation[0]:x}, size={allocation[1]}."
+                    )
+
+    def _expand(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
+        kv = next(
+            (transfer for transfer in transfers if transfer.name == PoolName.KV),
+            None,
+        )
+        if kv is None or not kv.keys:
+            return []
+        return [
+            replace(
+                kv,
+                name=name,
+                host_indices=kv.device_indices,
+                keys=list(kv.keys),
+                indices_from_pool=None,
+            )
+            for name in self.pools
+        ]
+
+    def _object_keys(self, transfer: PoolTransfer) -> list[str]:
+        page_keys, multiplier = self.storage._get_hybrid_page_component_keys(
+            list(transfer.keys or []), transfer
+        )
+        if multiplier != 1:
+            raise ValueError(
+                f"Direct UMBP requires one page key per pool, got multiplier="
+                f"{multiplier} for {transfer.name}."
+            )
+        return [
+            f"{page_key}_L{layer}"
+            for page_key in page_keys
+            for layer in range(self.num_layers)
+        ]
+
+    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        expanded = self._expand(transfers)
+        if not expanded:
+            return []
+
+        hit_pages = None
+        chunk_objects = CHUNK_PAGES * self.num_layers
+        for transfer in expanded:
+            object_keys = self._object_keys(transfer)
+            pages = 0
+            for start in range(0, len(object_keys), chunk_objects):
+                block = object_keys[start : start + chunk_objects]
+                consecutive = int(self.storage.client.batch_exists_consecutive(block))
+                if not 0 <= consecutive <= len(block):
+                    raise RuntimeError(
+                        "UMBP returned an invalid consecutive-exists count: "
+                        f"{consecutive} for {len(block)} keys."
+                    )
+                pages += consecutive // self.num_layers
+                if consecutive < len(block):
+                    break
+            hit_pages = pages if hit_pages is None else min(hit_pages, pages)
+
+        self._stats["lookup"] += 1
+        if not hit_pages:
+            return []
+        logger.debug("Unified tree UMBP lookup hit: rid=%s pages=%d", rid, hit_pages)
+        return list(range(1, hit_pages + 1))
+
+    def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        expanded = self._expand(transfers)
+        if not expanded:
+            return False
+        if rid in self._pending:
+            raise RuntimeError(f"UMBP load for rid={rid} is already queued.")
+        self._pending[rid] = expanded
+        return True
+
+    def cancel_queued_load(self, rid: str) -> None:
+        self._pending.pop(rid, None)
+
+    def start_layer_wise_loading(self) -> int:
+        if not self._pending:
+            return -1
+        pending = self._pending
+        self._pending = {}
+        plans = self._build_load_plans(list(pending.values()))
+        counter_index = self.layer_done_counter.update_producer()
+        self._load_queue.put((counter_index, plans))
+        self._stats["load"] += len(pending)
+        return counter_index
+
+    def _build_load_plans(
+        self, request_transfers: list[list[PoolTransfer]]
+    ) -> list[_LayerObjectPlan]:
+        grouped: dict[PoolName, list[PoolTransfer]] = {}
+        for transfers in request_transfers:
+            for transfer in transfers:
+                grouped.setdefault(transfer.name, []).append(transfer)
+
+        plans = []
+        for name, transfers in grouped.items():
+            keys: list[str] = []
+            ptrs: list[int] = []
+            sizes: list[int] = []
+            for transfer in transfers:
+                transfer_keys = self._object_keys(transfer)
+                transfer_ptrs, transfer_sizes = self.pools[name].get_page_buffer_meta(
+                    transfer.host_indices
+                )
+                if not len(transfer_keys) == len(transfer_ptrs) == len(transfer_sizes):
+                    raise ValueError(
+                        f"Layer-wise UMBP metadata mismatch for pool {name}: "
+                        f"keys={len(transfer_keys)} ptrs={len(transfer_ptrs)} "
+                        f"sizes={len(transfer_sizes)}."
+                    )
+                keys.extend(transfer_keys)
+                ptrs.extend(transfer_ptrs)
+                sizes.extend(transfer_sizes)
+            plans.append(_LayerObjectPlan(name, keys, ptrs, sizes, self.num_layers))
+
+        if not plans or not plans[0].keys:
+            raise ValueError("Layer-wise UMBP load has no object keys.")
+        num_pages = plans[0].num_pages
+        if any(plan.num_pages != num_pages for plan in plans):
+            raise ValueError("Layer-wise UMBP pools must cover the same page set.")
+        return plans
+
+    def _load_thread_func(self) -> None:
+        while True:
+            task = self._load_queue.get()
+            try:
+                if task is None:
+                    return
+                counter_index, plans = task
+                self._run_layer_wise_batch(counter_index, plans)
+            finally:
+                self._load_queue.task_done()
+
+    def _run_layer_wise_batch(
+        self, counter_index: int, plans: list[_LayerObjectPlan]
+    ) -> None:
+        try:
+            max_objects_per_call = CHUNK_PAGES * self.num_layers
+            for layer in range(self.num_layers):
+                for plan in plans:
+                    keys, ptrs, sizes = plan.layer_meta(layer)
+                    for start in range(0, len(keys), max_objects_per_call):
+                        chunk_keys = keys[start : start + max_objects_per_call]
+                        results = list(
+                            self.storage.client.batch_get_into_ptr(
+                                chunk_keys,
+                                ptrs[start : start + max_objects_per_call],
+                                sizes[start : start + max_objects_per_call],
+                            )
+                        )
+                        if len(results) != len(chunk_keys) or not all(results):
+                            raise RuntimeError(
+                                f"UMBP get failed for pool={plan.name}, layer={layer}: "
+                                f"success={sum(bool(value) for value in results)}/"
+                                f"{len(chunk_keys)}."
+                            )
+                self.layer_done_counter.complete(counter_index, layer)
+        except BaseException as error:
+            self.layer_done_counter.fail(counter_index, error)
+            logger.exception("UMBP layer-wise load batch failed")
+
+    def offload(self, transfers: list[PoolTransfer]) -> bool:
+        expanded = self._expand(transfers)
+        if not expanded:
+            return False
+
+        self._wait_for_device()
+        chunk_objects = CHUNK_PAGES * self.num_layers
+        for transfer in expanded:
+            keys = self._object_keys(transfer)
+            ptrs, sizes = self.pools[transfer.name].get_page_buffer_meta(
+                transfer.host_indices
+            )
+            if not len(keys) == len(ptrs) == len(sizes):
+                raise ValueError(
+                    f"UMBP offload metadata mismatch for pool {transfer.name}."
+                )
+            for start in range(0, len(keys), chunk_objects):
+                chunk_keys = keys[start : start + chunk_objects]
+                results = list(
+                    self.storage.client.batch_put_from_ptr(
+                        chunk_keys,
+                        ptrs[start : start + chunk_objects],
+                        sizes[start : start + chunk_objects],
+                    )
+                )
+                if len(results) != len(chunk_keys) or not all(results):
+                    logger.warning(
+                        "UMBP offload failed: pool=%s object_range=[%d,%d) "
+                        "success=%d/%d returned=%d",
+                        transfer.name,
+                        start,
+                        min(start + chunk_objects, len(keys)),
+                        sum(bool(value) for value in results),
+                        len(chunk_keys),
+                        len(results),
+                    )
+                    return False
+
+        self._stats["offload"] += 1
+        return True
+
+    def _wait_for_device(self) -> None:
+        device = next(
+            (
+                buffer.device
+                for pool in self.pools.values()
+                for buffer in pool.get_hybrid_pool_buffer()
+                if buffer.device.type == "cuda"
+            ),
+            None,
+        )
+        if device is not None:
+            torch.cuda.synchronize(device)
+
+    def reset(self) -> None:
+        self._pending.clear()
+        self._load_queue.join()
+        self.layer_done_counter.reset()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.reset()
+        self._load_queue.put(None)
+        self._load_thread.join()
+        logger.info("Unified tree UMBP stats: %s", self._stats)
+        self.storage.close()

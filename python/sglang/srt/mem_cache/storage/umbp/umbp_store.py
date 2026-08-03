@@ -18,6 +18,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 
@@ -787,6 +791,12 @@ class UMBPStore(HiCacheStorage):
                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
                 cfg.ssd.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
+        # Initialize multi-pool state before the optional constructor-time
+        # registration below. Logical hybrid anchors have no physical tensor;
+        # their side pools are registered independently through the v2 API.
+        self.registered_pools: dict = {}
+        self._kv_anchor_is_logical = False
+
         self.client = UMBPClient(cfg)
         if mem_pool_host is not None:
             self.register_mem_pool_host(mem_pool_host)
@@ -867,23 +877,36 @@ class UMBPStore(HiCacheStorage):
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
 
+        # A hybrid logical anchor owns allocation indices but no physical KV
+        # tensor. Its side pools carry the data and are registered through the
+        # v2 path below.
+        self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
+        self._zero_copy_registered = False
+        if self._kv_anchor_is_logical:
+            return
+
         # In distributed mode, pre-register the entire host KV buffer with the
         # underlying RDMA IOEngine so PoolClient can take the zero-copy path
         # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
         # buffer memcpy + lock and removes the per-call `staging_buffer_size`
         # cap).  Standalone returns true as no-op by IUMBPClient contract;
         # we still gate on is_distributed() below to avoid a pointless call.
-        self._zero_copy_registered = False
+        self._zero_copy_registered = self._register_host_buffer_for_zero_copy(
+            mem_pool_host
+        )
+
+    def _register_host_buffer_for_zero_copy(self, host_pool: HostKVCache) -> bool:
+        """Register one contiguous host pool with UMBP's RDMA engine."""
         if self.client is None:
-            return
+            return False
         try:
             is_distributed = bool(self.client.is_distributed())
         except Exception:
             is_distributed = False
         if not is_distributed:
-            return
+            return False
         if not hasattr(self.client, "register_memory"):
-            return
+            return False
         if getattr(self, "_disable_zero_copy_register", False):
             logger.info(
                 "UMBPStore: skipping host KV buffer RDMA registration because "
@@ -891,9 +914,11 @@ class UMBPStore(HiCacheStorage):
                 "Falling back to the staging-buffer transfer path; per-transfer "
                 "size is capped by distributed.staging_buffer_size."
             )
-            return
+            return False
+        kv_buffer = getattr(host_pool, "kv_buffer", None)
+        if kv_buffer is None:
+            return False
         try:
-            kv_buffer = mem_pool_host.kv_buffer
             host_ptr = int(kv_buffer.data_ptr())
             host_size = int(kv_buffer.numel() * kv_buffer.element_size())
             # When the buffer is backed by hugepages the mmap region is
@@ -901,7 +926,7 @@ class UMBPStore(HiCacheStorage):
             # some NICs (AINIC / ROCm) requires the registered region to
             # cover complete hugepages, so use the full mapped_size
             # instead of the logical tensor size.
-            allocator = getattr(mem_pool_host, "allocator", None)
+            allocator = getattr(host_pool, "allocator", None)
             mapped_size_fn = getattr(allocator, "mapped_size_for", None)
             if mapped_size_fn is not None:
                 mapped_size = mapped_size_fn(host_ptr)
@@ -917,20 +942,26 @@ class UMBPStore(HiCacheStorage):
                 "distributed.staging_buffer_size.",
                 exc,
             )
-            return
+            return False
         if ok:
-            self._zero_copy_registered = True
             logger.info(
                 "UMBPStore: registered host KV buffer for RDMA zero-copy "
                 "(ptr=0x%x, size=%d MB)",
                 host_ptr,
                 host_size // (1024 * 1024),
             )
-        else:
-            logger.warning(
-                "UMBPStore: register_memory returned false; staying on staging "
-                "buffer fallback path."
-            )
+            return True
+        logger.warning(
+            "UMBPStore: register_memory returned false; staying on staging "
+            "buffer fallback path."
+        )
+        return False
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        if host_pool_name == PoolName.KV:
+            return
+        self.registered_pools[host_pool_name] = host_pool
+        self._register_host_buffer_for_zero_copy(host_pool)
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
@@ -1007,6 +1038,9 @@ class UMBPStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if self._kv_anchor_is_logical:
+            return [True] * len(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         # Normalize sizes to list of per-key sizes
@@ -1076,6 +1110,9 @@ class UMBPStore(HiCacheStorage):
             page_count = len(host_indices) // self.mem_pool_host.page_size
             return [True] * page_count
 
+        if self._kv_anchor_is_logical:
+            return [True] * len(keys)
+
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         if isinstance(buffer_sizes, int):
@@ -1137,6 +1174,151 @@ class UMBPStore(HiCacheStorage):
 
         hit_count = self.client.batch_exists_consecutive(query_keys)
         return hit_count // key_multiplier
+
+    # ------------------------------------------------------------------
+    # Multi-pool v2 interface
+    # ------------------------------------------------------------------
+    def _get_hybrid_page_component_keys(self, page_keys, transfer: PoolTransfer):
+        """Expand logical page keys for one registered hybrid side pool."""
+        pool_name = transfer.name
+        host_pool = self.registered_pools.get(pool_name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
+
+        if self.is_mla_backend:
+            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        elif getattr(host_pool, "v_buffer", None) is not None:
+            suffixes = [
+                f"_{self.mha_suffix}_{pool_name}_k",
+                f"_{self.mha_suffix}_{pool_name}_v",
+            ]
+        else:
+            suffixes = [f"_{self.mha_suffix}_{pool_name}"]
+
+        component_keys = [
+            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
+        ]
+        return component_keys, len(suffixes)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        kv_pages = (
+            len(keys)
+            if self._kv_anchor_is_logical
+            else self.batch_exists(keys, extra_info)
+        )
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            component_keys, multiplier = self._get_hybrid_page_component_keys(
+                keys[:final_pages], transfer
+            )
+            exists = list(self.client.batch_exists(component_keys))
+            if len(exists) != len(component_keys):
+                logger.error(
+                    "UMBP v2 exists result-size mismatch for pool %s: expected=%d actual=%d",
+                    transfer.name,
+                    len(component_keys),
+                    len(exists),
+                )
+                final_pages = 0
+                break
+
+            page_exists = [
+                all(exists[i * multiplier : (i + 1) * multiplier])
+                for i in range(final_pages)
+            ]
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                boundary = (
+                    page_exists.index(False) if False in page_exists else final_pages
+                )
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(final_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool) -> dict:
+        results: dict = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools.get(transfer.name)
+            if host_pool is None:
+                raise ValueError(f"Unregistered UMBP hybrid pool: {transfer.name}")
+
+            keys = transfer.keys or []
+            host_indices = transfer.host_indices
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            if not keys or host_indices is None:
+                results[transfer.name] = [False] * len(keys)
+                continue
+            if len(keys) != len(host_indices) // page_size:
+                raise ValueError(
+                    f"UMBP v2 pool {transfer.name} has {len(keys)} keys for "
+                    f"{len(host_indices)} indices with page_size={page_size}."
+                )
+
+            key_strs, multiplier = self._get_hybrid_page_component_keys(keys, transfer)
+            ptrs, sizes = host_pool.get_page_buffer_meta(host_indices)
+            if not len(key_strs) == len(ptrs) == len(sizes):
+                raise ValueError(
+                    f"UMBP v2 buffer-meta mismatch for pool {transfer.name}: "
+                    f"keys={len(key_strs)} ptrs={len(ptrs)} sizes={len(sizes)}"
+                )
+
+            operation = (
+                self.client.batch_put_from_ptr
+                if is_set
+                else self.client.batch_get_into_ptr
+            )
+            io_results = [bool(value) for value in operation(key_strs, ptrs, sizes)]
+            if len(io_results) != len(key_strs):
+                logger.error(
+                    "UMBP v2 %s result-size mismatch for pool %s: expected=%d actual=%d",
+                    "set" if is_set else "get",
+                    transfer.name,
+                    len(key_strs),
+                    len(io_results),
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+
+            results[transfer.name] = [
+                all(io_results[i * multiplier : (i + 1) * multiplier])
+                for i in range(len(keys))
+            ]
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
 
     # ------------------------------------------------------------------
     # Legacy ABC interface (required by HiCacheStorage)
