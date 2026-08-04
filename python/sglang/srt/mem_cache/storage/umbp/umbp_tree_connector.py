@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -249,24 +250,44 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             server_args.hicache_storage_backend_extra_config
         )
         extra_config = dict(extra_config)
-        for key in ("ssd_enabled", "cache_remote_fetches"):
-            if key in extra_config and _config_bool(extra_config[key], key):
-                raise ValueError(
-                    f"Direct UMBP requires {key}=false because its GPU path "
-                    "cannot use the corresponding host-memory fallback."
-                )
-            extra_config[key] = False
+        standalone_requested = bool(
+            extra_config.get("standalone_address")
+            or os.getenv("UMBP_STANDALONE_ADDRESS")
+        )
+        if "ssd_enabled" in extra_config and _config_bool(
+            extra_config["ssd_enabled"], "ssd_enabled"
+        ):
+            raise ValueError(
+                "Direct UMBP requires ssd_enabled=false because its GPU path "
+                "cannot use the corresponding host-memory fallback."
+            )
+        extra_config["ssd_enabled"] = False
+
+        if "cache_remote_fetches" in extra_config and _config_bool(
+            extra_config["cache_remote_fetches"], "cache_remote_fetches"
+        ):
+            raise ValueError(
+                "Direct UMBP requires cache_remote_fetches=false because its GPU "
+                "path cannot use the corresponding host-memory fallback."
+            )
+        if standalone_requested:
+            extra_config.pop("cache_remote_fetches", None)
+        else:
+            extra_config["cache_remote_fetches"] = False
 
         min_object_size = min(
             size for pool in self.pools.values() for size in pool.row_sizes
         )
-        dram_page_size = int(extra_config.get("dram_page_size", min_object_size))
-        if not 0 < dram_page_size <= min_object_size:
-            raise ValueError(
-                "Direct UMBP requires 0 < dram_page_size <= the smallest "
-                f"per-layer object ({min_object_size} bytes), got {dram_page_size}."
-            )
-        extra_config["dram_page_size"] = dram_page_size
+        if standalone_requested:
+            extra_config.pop("dram_page_size", None)
+        else:
+            dram_page_size = int(extra_config.get("dram_page_size", min_object_size))
+            if not 0 < dram_page_size <= min_object_size:
+                raise ValueError(
+                    "Direct UMBP requires 0 < dram_page_size <= the smallest "
+                    f"per-layer object ({min_object_size} bytes), got {dram_page_size}."
+                )
+            extra_config["dram_page_size"] = dram_page_size
 
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -291,8 +312,18 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
         try:
             client = self.storage.client
-            if not bool(client.is_distributed()):
-                raise ValueError("Direct UMBP requires distributed deployment mode.")
+            mode = client.get_deployment_mode()
+            mode_type = type(mode)
+            if mode not in {
+                mode_type.Distributed,
+                mode_type.StandaloneProcess,
+            }:
+                raise ValueError(
+                    "Direct UMBP supports only Distributed or StandaloneProcess "
+                    f"deployment modes, got {mode!r}."
+                )
+            self.deployment_mode = mode
+            self._standalone_process_mode = mode == mode_type.StandaloneProcess
             if getattr(self.storage, "_disable_zero_copy_register", False):
                 raise ValueError(
                     "Direct UMBP cannot disable zero-copy memory registration."
@@ -323,6 +354,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
     def _register_buffers(self) -> None:
         seen = set()
+        self._registered: list[tuple[int, int]] = []
         for pool in self.pools.values():
             for buffer in pool.get_hybrid_pool_buffer():
                 storage = buffer.untyped_storage()
@@ -335,6 +367,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                         "Failed to register a GPU KV buffer with UMBP: "
                         f"ptr=0x{allocation[0]:x}, size={allocation[1]}."
                     )
+                self._registered.append(allocation)
 
     def _expand(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
         kv = next(
@@ -558,9 +591,15 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         self.reset()
-        self._load_queue.put(None)
-        self._load_thread.join()
+        if self._load_thread.is_alive():
+            self._load_queue.put(None)
+            self._load_thread.join()
+        if self._standalone_process_mode and self._registered:
+            # StandaloneProcess deregistration is client-wide; one call tears
+            # down every registered region. Keep the GPU tensors alive until
+            # the synchronous RPC has completed successfully.
+            self.storage.client.deregister_memory(self._registered[0][0])
         logger.info("Unified tree UMBP stats: %s", self._stats)
         self.storage.close()
+        self._closed = True

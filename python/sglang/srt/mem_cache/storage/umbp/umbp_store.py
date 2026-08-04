@@ -38,6 +38,7 @@ def _import_umbp_client():
     UMBPIoBackend = getattr(umbp_mod, "UMBPIoBackend", None)
     UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
     UMBPDistributedConfig = getattr(umbp_mod, "UMBPDistributedConfig", None)
+    UMBPStandaloneProcessConfig = getattr(umbp_mod, "UMBPStandaloneProcessConfig", None)
 
     return (
         UMBPClient,
@@ -46,6 +47,7 @@ def _import_umbp_client():
         UMBPIoBackend,
         UMBPDurabilityMode,
         UMBPDistributedConfig,
+        UMBPStandaloneProcessConfig,
     )
 
 
@@ -164,6 +166,8 @@ _COMMON_EXTRA_KEYS = frozenset(
         "kv_events_subscriber",
         "kv_events_endpoint",
         "kv_events_topic",
+        "disable_zero_copy_register",
+        "extra_backend_tag",
     }
 )
 
@@ -175,6 +179,9 @@ _STANDALONE_ONLY_EXTRA_KEYS = frozenset(
         "eviction_policy",
         "eviction_candidate_window",
         "auto_promote_on_read",
+        "standalone_address",
+        "standalone_auto_start",
+        "standalone_startup_timeout_ms",
     }
 )
 
@@ -192,7 +199,6 @@ _DISTRIBUTED_ONLY_EXTRA_KEYS = frozenset(
         "peer_service_port",
         "cache_remote_fetches",
         "dram_page_size",
-        "disable_zero_copy_register",
     }
 )
 
@@ -246,6 +252,7 @@ class UMBPStore(HiCacheStorage):
             UMBPIoBackend,
             UMBPDurabilityMode,
             UMBPDistributedConfig,
+            UMBPStandaloneProcessConfig,
         ) = _import_umbp_client()
 
         if storage_config is not None:
@@ -268,6 +275,12 @@ class UMBPStore(HiCacheStorage):
         # and skip writes.
         cfg.role = UMBPRole.Standalone
         extra = getattr(storage_config, "extra_config", None) or {}
+        prefix_parts = []
+        if extra.get("extra_backend_tag") is not None:
+            prefix_parts.append(str(extra["extra_backend_tag"]))
+        if storage_config is not None and storage_config.model_name:
+            prefix_parts.append("-".join(storage_config.model_name.split("/")))
+        self.config_prefix = "_".join(prefix_parts) if prefix_parts else None
         explicit_tenant_id = (
             os.getenv("UMBP_SPDK_PROXY_TENANT_ID") is not None
             or "spdk_proxy_tenant_id" in extra
@@ -361,8 +374,7 @@ class UMBPStore(HiCacheStorage):
             ssd_backend = str(extra["ssd_backend"]).strip().lower()
             if ssd_backend not in ("file", "spdk", "spdk_proxy"):
                 raise ValueError(
-                    "extra_config['ssd_backend'] must be one of: "
-                    "file, spdk, spdk_proxy"
+                    "extra_config['ssd_backend'] must be one of: file, spdk, spdk_proxy"
                 )
             cfg.ssd.ssd_backend = ssd_backend
         if "spdk_nvme_pci_addr" in extra:
@@ -462,6 +474,20 @@ class UMBPStore(HiCacheStorage):
         master_address = extra.get(
             "master_address", _optional_env_str("UMBP_MASTER_ADDRESS")
         )
+        standalone_address = extra.get(
+            "standalone_address", _optional_env_str("UMBP_STANDALONE_ADDRESS")
+        )
+        if master_address and standalone_address:
+            raise ValueError(
+                "master_address and standalone_address are mutually exclusive "
+                "(distributed vs. standalone-process mode)."
+            )
+        if standalone_address and mem_pool_host is not None:
+            raise ValueError(
+                "standalone-process mode with a host KV pool requires shared-memory "
+                "allocation support; this path is only enabled for the direct GPU "
+                "UMBP connector"
+            )
 
         _warn_extra_config_scope(extra, distributed_enabled=bool(master_address))
         if master_address and UMBPDistributedConfig is not None:
@@ -636,6 +662,37 @@ class UMBPStore(HiCacheStorage):
                 dist_cfg.io_engine.port,
                 dist_cfg.peer_service_port,
             )
+        elif standalone_address:
+            if UMBPStandaloneProcessConfig is None:
+                raise RuntimeError(
+                    "Installed mori does not expose UMBPStandaloneProcessConfig"
+                )
+            standalone_cfg = UMBPStandaloneProcessConfig()
+            standalone_cfg.address = str(standalone_address)
+            auto_start = extra.get(
+                "standalone_auto_start",
+                _optional_env_str("UMBP_STANDALONE_AUTO_START"),
+            )
+            if auto_start is not None:
+                standalone_cfg.auto_start = _strict_bool(
+                    auto_start, "standalone_auto_start"
+                )
+            startup_timeout_ms = extra.get(
+                "standalone_startup_timeout_ms",
+                _optional_env_int("UMBP_STANDALONE_STARTUP_TIMEOUT_MS"),
+            )
+            if startup_timeout_ms is not None:
+                standalone_cfg.startup_timeout_ms = int(startup_timeout_ms)
+            if standalone_cfg.startup_timeout_ms <= 0:
+                raise ValueError("standalone_startup_timeout_ms must be > 0")
+            cfg.standalone_process = standalone_cfg
+            logger.info(
+                "UMBPStore standalone-process mode: address=%s, auto_start=%s, "
+                "startup_timeout_ms=%s",
+                standalone_cfg.address,
+                standalone_cfg.auto_start,
+                standalone_cfg.startup_timeout_ms,
+            )
 
         self.storage_config = storage_config
 
@@ -646,8 +703,10 @@ class UMBPStore(HiCacheStorage):
         self.is_mla_follower = False
         tp_size = self.tp_size
         use_spdk = cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
-        distributed_enabled = cfg.distributed is not None
-        if not distributed_enabled and self.is_mla_backend and tp_size > 1:
+        remote_process_enabled = (
+            cfg.distributed is not None or cfg.standalone_process is not None
+        )
+        if not remote_process_enabled and self.is_mla_backend and tp_size > 1:
             cfg.ssd.enabled = True
             if self.local_rank == 0:
                 # Leader: copy every DRAM write to shared SSD.
@@ -1198,6 +1257,11 @@ class UMBPStore(HiCacheStorage):
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
         ]
+        if self.config_prefix:
+            component_keys = [
+                f"{self.config_prefix}_{component_key}"
+                for component_key in component_keys
+            ]
         return component_keys, len(suffixes)
 
     def batch_exists_v2(

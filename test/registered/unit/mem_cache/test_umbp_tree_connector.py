@@ -1,5 +1,6 @@
 import json
 import unittest
+from enum import Enum
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class _DeploymentMode(Enum):
+    Local = 0
+    StandaloneProcess = 1
+    Distributed = 2
+
+
 class TestUMBPTreeConnector(unittest.TestCase):
     page_size = 2
     num_layers = 3
@@ -40,6 +47,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.client = MagicMock()
         self.client.is_distributed.return_value = True
+        self.client.get_deployment_mode.return_value = _DeploymentMode.Distributed
         self.client.register_memory.return_value = True
         self.client.batch_put_from_ptr.side_effect = lambda keys, ptrs, sizes: (
             [True] * len(keys)
@@ -219,6 +227,64 @@ class TestUMBPTreeConnector(unittest.TestCase):
         connector = self.make_connector({"dram_page_size": 6})
         self.assertFalse(connector._closed)
 
+    def test_standalone_process_skips_distributed_page_config(self):
+        self.client.is_distributed.return_value = False
+        self.client.get_deployment_mode.return_value = _DeploymentMode.StandaloneProcess
+
+        connector = self.make_connector(
+            {
+                "standalone_address": "unix:///tmp/umbp-test.sock",
+                "dram_page_size": 1024,
+            }
+        )
+
+        self.assertEqual(connector.deployment_mode, _DeploymentMode.StandaloneProcess)
+
+    def test_rejects_local_deployment_mode(self):
+        self.client.is_distributed.return_value = False
+        self.client.get_deployment_mode.return_value = _DeploymentMode.Local
+
+        with self.assertRaisesRegex(ValueError, "Distributed or StandaloneProcess"):
+            self.make_connector()
+
+    def test_standalone_close_deregisters_before_storage_close(self):
+        self.client.is_distributed.return_value = False
+        self.client.get_deployment_mode.return_value = _DeploymentMode.StandaloneProcess
+        events = []
+        self.client.deregister_memory.side_effect = lambda ptr: events.append(
+            ("deregister", ptr)
+        )
+        self.storage.close.side_effect = lambda: events.append(("storage_close", None))
+        connector = self.make_connector(
+            {"standalone_address": "unix:///tmp/umbp-test.sock"}
+        )
+
+        connector.close()
+
+        self.assertGreater(len(connector._registered), 0)
+        self.assertEqual(events[0][0], "deregister")
+        self.assertEqual(events[1][0], "storage_close")
+        self.client.deregister_memory.assert_called_once_with(
+            connector._registered[0][0]
+        )
+
+    def test_standalone_close_can_retry_deregistration(self):
+        self.client.is_distributed.return_value = False
+        self.client.get_deployment_mode.return_value = _DeploymentMode.StandaloneProcess
+        self.client.deregister_memory.side_effect = [RuntimeError("rpc failed"), None]
+        connector = self.make_connector(
+            {"standalone_address": "unix:///tmp/umbp-test.sock"}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "rpc failed"):
+            connector.close()
+        self.assertFalse(connector._closed)
+        self.assertFalse(connector._load_thread.is_alive())
+
+        connector.close()
+        self.assertTrue(connector._closed)
+        self.assertEqual(self.client.deregister_memory.call_count, 2)
+
     def test_does_not_retain_second_client_reference(self):
         connector = self.make_connector()
         self.assertNotIn("client", vars(connector))
@@ -239,6 +305,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         store.registered_pools = self.pools
         store.is_mla_backend = True
         store.mla_suffix = "tp0_cp0_pp0"
+        store.config_prefix = None
         transfer = PoolTransfer(name=PoolName.INDEXER)
 
         keys, multiplier = store._get_hybrid_page_component_keys(
@@ -253,6 +320,15 @@ class TestUMBPTreeConnector(unittest.TestCase):
                 "page-1_tp0_cp0_pp0_indexer",
             ],
         )
+
+        store.config_prefix = "model-a"
+        tagged_keys, _ = store._get_hybrid_page_component_keys(["page-0"], transfer)
+        self.assertEqual(tagged_keys, ["model-a_page-0_tp0_cp0_pp0_indexer"])
+
+    def test_extra_backend_tag_is_a_known_store_option(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_store import _COMMON_EXTRA_KEYS
+
+        self.assertIn("extra_backend_tag", _COMMON_EXTRA_KEYS)
 
     def test_connector_backend_dispatches_to_mori(self):
         cache = SimpleNamespace(tree_components=(ComponentType.FULL,))
