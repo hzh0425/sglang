@@ -198,6 +198,39 @@ class _LayerObjectPlan:
         )
 
 
+def _sort_by_device_address(
+    keys: list[str], ptrs: list[int], sizes: list[int]
+) -> tuple[list[str], list[int], list[int]]:
+    """Reorder an offload batch so objects go out in GPU-address order.
+
+    The storage tier allocates slots in the order objects arrive, so the send
+    order decides the storage-side layout. Objects are built page-major
+    (`_object_keys` / `get_page_buffer_meta`), which scatters one layer's pages
+    across the tier with a stride of `num_layers`; the layer-wise load then
+    reads exactly that strided set and cannot coalesce anything, even though
+    its GPU side is ~98% contiguous.
+
+    Sorting by GPU address groups objects by layer buffer and orders pages
+    within each layer, so the tier's slots end up mirroring the GPU layout and
+    both sides of a later load become contiguous.
+
+    Sorting by address rather than building an explicit layer-major permutation
+    keeps this adaptive to the real allocation layout. The key strings are
+    unchanged and travel with their pointers -- `lookup` builds its own
+    page-major query list, which must stay page-major because
+    `batch_exists_consecutive` counts an object prefix and the caller divides
+    that by `num_layers` to get whole pages.
+    """
+    if len(keys) < 2:
+        return keys, ptrs, sizes
+    order = sorted(range(len(ptrs)), key=ptrs.__getitem__)
+    return (
+        [keys[i] for i in order],
+        [ptrs[i] for i in order],
+        [sizes[i] for i in order],
+    )
+
+
 def _config_bool(value: Any, key: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -545,6 +578,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 raise ValueError(
                     f"UMBP offload metadata mismatch for pool {transfer.name}."
                 )
+            keys, ptrs, sizes = _sort_by_device_address(keys, ptrs, sizes)
             for start in range(0, len(keys), chunk_objects):
                 chunk_keys = keys[start : start + chunk_objects]
                 results = list(

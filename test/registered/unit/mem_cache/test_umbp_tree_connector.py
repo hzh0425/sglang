@@ -163,6 +163,52 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(len(calls), 6)
         self.assertEqual([len(call.args[0]) for call in calls], [6, 6, 3, 6, 6, 3])
 
+    def test_offload_sends_objects_in_device_address_order(self):
+        """Offload must go out sorted by GPU address.
+
+        The storage tier allocates slots in arrival order, so this send order is
+        what makes a later layer-wise load able to coalesce. See
+        UMBP_STANDALONE_PROCESS_DESIGN.md 11.2.
+        """
+        connector = self.make_connector()
+        self.assertTrue(connector.offload([self.transfer(pages=3)]))
+
+        for call in self.client.batch_put_from_ptr.call_args_list:
+            ptrs = call.args[1]
+            self.assertEqual(
+                ptrs, sorted(ptrs), "offload batch is not in device-address order"
+            )
+
+    def test_offload_reorder_keeps_key_pointer_pairing(self):
+        """The permutation must move keys, pointers and sizes together.
+
+        Desyncing them would store one object's bytes under another object's
+        key -- silent corruption that no return value would reveal.
+        """
+        connector = self.make_connector()
+
+        expected = {}
+        for transfer in connector._expand([self.transfer(pages=3)]):
+            keys = connector._object_keys(transfer)
+            ptrs, sizes = connector.pools[transfer.name].get_page_buffer_meta(
+                transfer.host_indices
+            )
+            for key, ptr, size in zip(keys, ptrs, sizes):
+                expected[key] = (ptr, size)
+
+        self.client.batch_put_from_ptr.reset_mock()
+        self.assertTrue(connector.offload([self.transfer(pages=3)]))
+
+        seen = {}
+        for call in self.client.batch_put_from_ptr.call_args_list:
+            keys, ptrs, sizes = call.args[0], call.args[1], call.args[2]
+            self.assertEqual(len(keys), len(ptrs))
+            self.assertEqual(len(keys), len(sizes))
+            for key, ptr, size in zip(keys, ptrs, sizes):
+                seen[key] = (ptr, size)
+
+        self.assertEqual(seen, expected)
+
     def test_background_load_completes_each_layer(self):
         connector = self.make_connector()
         self.assertTrue(connector.load("rid", [self.transfer(pages=3)]))
