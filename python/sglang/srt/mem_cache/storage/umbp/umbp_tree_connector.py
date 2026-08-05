@@ -14,6 +14,7 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -388,34 +389,74 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         keys, _ = self._object_keys_for_pages(list(transfer.keys or []), transfer)
         return keys
 
+    def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
+        component_count = len(self.pools[transfer.name].components)
+        pool_layer_count = len(self.pool_layers[transfer.name])
+        objects_per_page = component_count * pool_layer_count
+        max_objects = CHUNK_PAGES * self.num_layers
+        pages_per_call = max(1, max_objects // objects_per_page)
+
+        page_exists = []
+        for start in range(0, len(page_keys), pages_per_call):
+            chunk_pages = page_keys[start : start + pages_per_call]
+            object_keys, _ = self._object_keys_for_pages(chunk_pages, transfer)
+            exists = list(self.storage.client.batch_exists(object_keys))
+            if len(exists) != len(object_keys):
+                raise RuntimeError(
+                    f"UMBP exists result-size mismatch for pool {transfer.name}: "
+                    f"expected={len(object_keys)} actual={len(exists)}."
+                )
+            page_exists.extend(
+                all(exists[index : index + objects_per_page])
+                for index in range(0, len(exists), objects_per_page)
+            )
+        return page_exists
+
+    @staticmethod
+    def _apply_hit_policy(
+        valid_pages: list[int], page_exists: list[bool], transfer: PoolTransfer
+    ) -> list[int]:
+        present_prefix = [0]
+        for present in page_exists:
+            present_prefix.append(present_prefix[-1] + int(present))
+
+        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+            return [end for end in valid_pages if present_prefix[end] == end]
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            trailing = max(1, len(transfer.keys or ()))
+            return [
+                end
+                for end in valid_pages
+                if present_prefix[end] - present_prefix[max(0, end - trailing)]
+                == end - max(0, end - trailing)
+            ]
+        raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
+        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
+        page_keys = list(kv.keys or [])
+        if not page_keys:
+            return []
 
-        hit_pages = None
-        chunk_objects = CHUNK_PAGES * self.num_layers
+        valid_pages = list(range(1, len(page_keys) + 1))
         for transfer in expanded:
-            object_keys = self._object_keys(transfer)
-            pages = 0
-            for start in range(0, len(object_keys), chunk_objects):
-                block = object_keys[start : start + chunk_objects]
-                consecutive = int(self.storage.client.batch_exists_consecutive(block))
-                if not 0 <= consecutive <= len(block):
-                    raise RuntimeError(
-                        "UMBP returned an invalid consecutive-exists count: "
-                        f"{consecutive} for {len(block)} keys."
-                    )
-                pages += consecutive // self.num_layers
-                if consecutive < len(block):
-                    break
-            hit_pages = pages if hit_pages is None else min(hit_pages, pages)
+            page_exists = self._page_exists(page_keys, transfer)
+            valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
+            if not valid_pages:
+                break
 
         self._stats["lookup"] += 1
-        if not hit_pages:
-            return []
-        logger.debug("Unified tree UMBP lookup hit: rid=%s pages=%d", rid, hit_pages)
-        return list(range(1, hit_pages + 1))
+        if valid_pages:
+            logger.debug(
+                "Unified tree UMBP lookup hit: rid=%s pages=%d candidates=%d",
+                rid,
+                valid_pages[-1],
+                len(valid_pages),
+            )
+        return valid_pages
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers)

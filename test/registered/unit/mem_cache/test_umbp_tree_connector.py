@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
     DevicePoolGroup,
@@ -75,6 +79,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.client.is_distributed.return_value = True
         self.client.get_deployment_mode.return_value = _DeploymentMode.Distributed
         self.client.register_memory.return_value = True
+        self.client.batch_exists.side_effect = lambda keys: [True] * len(keys)
         self.client.batch_put_from_ptr.side_effect = lambda keys, ptrs, sizes: (
             [True] * len(keys)
         )
@@ -113,14 +118,15 @@ class TestUMBPTreeConnector(unittest.TestCase):
         for connector in self.connectors:
             connector.close()
 
-    def make_connector(self, extra_config=None):
+    def make_connector(self, extra_config=None, pool_group=None):
+        pool_group = pool_group or self.pool_group
         self.server_args.hicache_storage_backend_extra_config = (
             json.dumps(extra_config) if extra_config is not None else None
         )
         with (
             patch(
                 "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._resolve_umbp_pool_group",
-                return_value=self.pool_group,
+                return_value=pool_group,
             ),
             patch(
                 "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._parse_storage_extra_config",
@@ -247,7 +253,13 @@ class TestUMBPTreeConnector(unittest.TestCase):
         connector = self.make_connector()
         # Per pool: first two pages complete, then one complete page plus one
         # layer of the fourth page. Both pools therefore expose 3 pages.
-        self.client.batch_exists_consecutive.side_effect = [6, 4, 6, 4]
+        partial = [True, True, True, True, False, False]
+        self.client.batch_exists.side_effect = [
+            [True] * 6,
+            partial,
+            [True] * 6,
+            partial,
+        ]
         with patch(
             "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
             2,
@@ -255,7 +267,70 @@ class TestUMBPTreeConnector(unittest.TestCase):
             hit = connector.lookup("rid", [self.transfer(pages=4)])
 
         self.assertEqual(hit, [1, 2, 3])
-        self.assertEqual(self.client.batch_exists_consecutive.call_count, 4)
+        self.assertEqual(self.client.batch_exists.call_count, 4)
+
+    def test_trailing_hit_policy_returns_sparse_valid_prefixes(self):
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            keys=["tail"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+
+        valid = UMBPTreeConnector._apply_hit_policy(
+            [1, 2, 3, 4], [True, True, False, True], transfer
+        )
+
+        self.assertEqual(valid, [1, 2, 4])
+
+    def test_lookup_uses_full_kv_key_domain_for_trailing_pool(self):
+        identity = {0: 0}
+        pool_group = DevicePoolGroup(
+            [
+                DevicePoolEntry(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[[torch.zeros((4, 3), dtype=torch.uint8)]],
+                    layer_mapping=identity,
+                    page_size=self.page_size,
+                    rows_are_pages=True,
+                ),
+                DevicePoolEntry(
+                    name=PoolName.SWA,
+                    indices_from_pool=PoolName.SWA,
+                    device_pool=None,
+                    components=[[torch.zeros((4, 5), dtype=torch.uint8)]],
+                    layer_mapping=identity,
+                    page_size=self.page_size,
+                    rows_are_pages=True,
+                ),
+            ],
+            num_layers=1,
+            page_size=self.page_size,
+        )
+        connector = self.make_connector(pool_group=pool_group)
+        kv = PoolTransfer(
+            name=PoolName.KV,
+            device_indices=torch.arange(8),
+            keys=["p0", "p1", "p2", "p3"],
+        )
+        swa = PoolTransfer(
+            name=PoolName.SWA,
+            device_indices=torch.tensor([6, 7]),
+            keys=["p3"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+
+        valid = connector.lookup("rid", [kv, swa])
+
+        self.assertEqual(valid, [1, 2, 3, 4])
+        queried = [
+            key
+            for call in self.client.batch_exists.call_args_list
+            for key in call.args[0]
+        ]
+        self.assertIn("p0_rank_swa_L0", queried)
+        self.assertIn("p3_rank_swa_L0", queried)
 
     def test_offload_is_chunked_on_logical_page_boundaries(self):
         connector = self.make_connector()
