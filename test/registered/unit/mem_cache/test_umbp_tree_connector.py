@@ -237,6 +237,137 @@ class TestUMBPTreeConnector(unittest.TestCase):
             _ordered_layers(group.entry_map[PoolName.DEEPSEEK_V4_C4]), [2, 0]
         )
 
+    def test_hybrid_linear_component_keys_match_qwen_and_kimi_layouts(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+
+        qwen_group, _ = self._hybrid_linear_pool_group(use_mla=False)
+        kimi_group, _ = self._hybrid_linear_pool_group(use_mla=True)
+
+        def keys_for(group, pool_name):
+            store = UMBPStore.__new__(UMBPStore)
+            store.registered_pools = group.entry_map
+            store.mla_suffix = "tp0_cp0_pp0"
+            store.mha_suffix = "tp0_cp0_pp0"
+            store.config_prefix = None
+            return store._get_hybrid_page_component_keys(
+                ["page"], PoolTransfer(name=pool_name)
+            )
+
+        qwen_kv, qwen_multiplier = keys_for(qwen_group, PoolName.KV)
+        kimi_kv, kimi_multiplier = keys_for(kimi_group, PoolName.KV)
+        mamba, mamba_multiplier = keys_for(qwen_group, PoolName.MAMBA)
+
+        self.assertEqual(qwen_multiplier, 2)
+        self.assertEqual(
+            qwen_kv,
+            ["page_tp0_cp0_pp0_kv_k", "page_tp0_cp0_pp0_kv_v"],
+        )
+        self.assertEqual(kimi_multiplier, 1)
+        self.assertEqual(kimi_kv, ["page_tp0_cp0_pp0_kv"])
+        self.assertEqual(mamba_multiplier, 2)
+        self.assertEqual(
+            mamba,
+            ["page_tp0_cp0_pp0_temporal", "page_tp0_cp0_pp0_conv_0"],
+        )
+
+    def test_connector_registers_mamba_layer_counter(self):
+        pool_group, _ = self._hybrid_linear_pool_group(use_mla=False)
+
+        connector = self.make_connector(pool_group=pool_group)
+
+        self.params.req_to_token_pool.register_layer_transfer_counter.assert_called_once_with(
+            connector.layer_done_counter
+        )
+
+    def test_hybrid_linear_object_keys_align_with_flattened_pointers(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
+
+        pool_group, _ = self._hybrid_linear_pool_group(use_mla=False)
+        store = UMBPStore.__new__(UMBPStore)
+        store.registered_pools = pool_group.entry_map
+        store.mla_suffix = "tp0_cp0_pp0"
+        store.mha_suffix = "tp0_cp0_pp0"
+        store.config_prefix = None
+        self.storage._get_hybrid_page_component_keys.side_effect = (
+            store._get_hybrid_page_component_keys
+        )
+        connector = self.make_connector(pool_group=pool_group)
+        transfers = pool_group.resolve_transfers(
+            [
+                PoolTransfer(
+                    name=PoolName.KV,
+                    device_indices=torch.tensor([0, 1]),
+                    keys=["page"],
+                ),
+                PoolTransfer(
+                    name=PoolName.MAMBA,
+                    device_indices=torch.tensor([0]),
+                    keys=["page"],
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                ),
+            ]
+        )
+
+        by_name = {transfer.name: transfer for transfer in transfers}
+        kv_keys = connector._object_keys(by_name[PoolName.KV])
+        kv_ptrs, kv_sizes = connector.pools[PoolName.KV].get_page_buffer_meta(
+            by_name[PoolName.KV].host_indices
+        )
+        mamba_keys = connector._object_keys(by_name[PoolName.MAMBA])
+        mamba_ptrs, mamba_sizes = connector.pools[PoolName.MAMBA].get_page_buffer_meta(
+            by_name[PoolName.MAMBA].host_indices
+        )
+
+        self.assertEqual(
+            kv_keys,
+            ["page_tp0_cp0_pp0_kv_k_L3", "page_tp0_cp0_pp0_kv_v_L3"],
+        )
+        self.assertEqual((len(kv_keys), len(kv_ptrs), len(kv_sizes)), (2, 2, 2))
+        self.assertEqual(
+            mamba_keys,
+            [
+                "page_tp0_cp0_pp0_temporal_L0",
+                "page_tp0_cp0_pp0_temporal_L1",
+                "page_tp0_cp0_pp0_temporal_L2",
+                "page_tp0_cp0_pp0_conv_0_L0",
+                "page_tp0_cp0_pp0_conv_0_L1",
+                "page_tp0_cp0_pp0_conv_0_L2",
+            ],
+        )
+        self.assertEqual(
+            (len(mamba_keys), len(mamba_ptrs), len(mamba_sizes)), (6, 6, 6)
+        )
+
+    def _hybrid_linear_pool_group(self, *, use_mla):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        kvcache.use_mla = use_mla
+        kvcache.full_attention_layer_id_mapping = {3: 0}
+        if use_mla:
+            kvcache.full_kv_pool = SimpleNamespace(
+                kv_buffer=[torch.zeros((6, 9), dtype=torch.uint8)]
+            )
+        else:
+            kvcache.full_kv_pool = SimpleNamespace(
+                size=4,
+                k_scale_buffer=None,
+                k_buffer=[torch.zeros((6, 3), dtype=torch.uint8)],
+                v_buffer=[torch.zeros((6, 5), dtype=torch.uint8)],
+            )
+        req_pool = SimpleNamespace(
+            mamba_ckpt_pool=None,
+            mamba_map={0: 0, 1: 1, 2: 2},
+            mamba_pool=SimpleNamespace(
+                mamba_cache=SimpleNamespace(
+                    temporal=torch.zeros((3, 2, 2, 2), dtype=torch.uint8),
+                    conv=[torch.zeros((3, 2, 4), dtype=torch.uint8)],
+                )
+            ),
+            translate_mamba_indices=lambda indices: indices,
+        )
+        return _resolve_umbp_pool_group(kvcache, self.page_size, req_pool), req_pool
+
     def test_pool_layers_follow_buffer_indices_not_logical_layer_order(self):
         buffers = [
             torch.zeros((4, 3), dtype=torch.uint8),

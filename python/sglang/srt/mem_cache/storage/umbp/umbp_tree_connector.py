@@ -309,15 +309,19 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             self.storage.mem_pool_host = self.pool_group
             self.storage._kv_anchor_is_logical = True
             self.storage.registered_pools = self.pools
-            self.storage.mla_suffix = (
-                f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
-            )
+            rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
+            self.storage.mla_suffix = rank_suffix
+            self.storage.mha_suffix = rank_suffix
             self._register_buffers()
         except BaseException:
             self.storage.close()
             raise
 
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        if PoolName.MAMBA in self.pools:
+            params.req_to_token_pool.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._load_queue: Queue[tuple[int, list[_LayerObjectPlan]] | None] = Queue()
         self._offload_queue: Queue[list[PoolTransfer] | None] = Queue()

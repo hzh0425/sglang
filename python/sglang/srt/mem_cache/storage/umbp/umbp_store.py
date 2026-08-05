@@ -1244,7 +1244,25 @@ class UMBPStore(HiCacheStorage):
         if host_pool is None:
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 
-        if self.is_mla_backend:
+        components = getattr(host_pool, "components", None)
+        if pool_name == PoolName.MAMBA:
+            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
+            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+        elif components is not None and len(components) == 1:
+            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        elif components is not None and len(components) == 2:
+            suffixes = [
+                f"_{self.mha_suffix}_{pool_name}_k",
+                f"_{self.mha_suffix}_{pool_name}_v",
+            ]
+        elif components is not None:
+            raise ValueError(
+                f"Unsupported UMBP component count for pool {pool_name}: "
+                f"{len(components)}"
+            )
+        elif self.is_mla_backend:
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
         elif getattr(host_pool, "v_buffer", None) is not None:
             suffixes = [

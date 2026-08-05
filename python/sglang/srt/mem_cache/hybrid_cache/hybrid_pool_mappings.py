@@ -384,18 +384,27 @@ def resolve_hybrid_device_pool_group(
             )
         mappings = resolve_hybrid_linear_pool_mappings(kvcache, req_to_token_pool)
         full_pool = kvcache.full_kv_pool
-        if kvcache.use_mla or getattr(full_pool, "k_scale_buffer", None) is not None:
+        if (
+            not kvcache.use_mla
+            and getattr(full_pool, "k_scale_buffer", None) is not None
+        ):
             raise ValueError(
-                "Direct tree connectors require unquantized Qwen3.5 MHA KV."
+                "Direct tree connectors require unquantized hybrid MHA KV."
             )
+        if kvcache.use_mla:
+            full_components = [full_pool.kv_buffer]
+            rows_are_pages = False
+        else:
+            full_components = [full_pool.k_buffer, full_pool.v_buffer]
+            rows_are_pages = full_pool.k_buffer[0].shape[0] < full_pool.size + page_size
         kv = DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=full_pool,
-            components=[full_pool.k_buffer, full_pool.v_buffer],
+            components=full_components,
             layer_mapping=mappings.local_full,
             page_size=page_size,
-            rows_are_pages=full_pool.k_buffer[0].shape[0] < full_pool.size + page_size,
+            rows_are_pages=rows_are_pages,
         )
 
         state_pool = req_to_token_pool.mamba_pool
