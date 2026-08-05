@@ -12,7 +12,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
-from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import UMBPTreeConnector
+from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
+    LayerWiseLoadCounter,
+    UMBPTreeConnector,
+    _LayerObjectPlan,
+    _ordered_layers,
+)
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_connector_mixin import (
     UnifiedCacheConnectorMixin,
@@ -173,6 +178,70 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.assertEqual(transfer.keys, source.keys)
             self.assertTrue(torch.equal(transfer.host_indices, source.device_indices))
             self.assertIsNone(transfer.indices_from_pool)
+
+    def test_pool_layers_follow_buffer_indices_not_logical_layer_order(self):
+        buffers = [
+            torch.zeros((4, 3), dtype=torch.uint8),
+            torch.zeros((4, 5), dtype=torch.uint8),
+        ]
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[buffers],
+            layer_mapping={0: 1, 2: 0},
+            page_size=2,
+            rows_are_pages=False,
+        )
+
+        layers = _ordered_layers(entry)
+        ptrs, _ = entry.get_page_buffer_meta(torch.tensor([0, 1]))
+
+        self.assertEqual(layers, [2, 0])
+        self.assertEqual(ptrs, [buffers[0][0].data_ptr(), buffers[1][0].data_ptr()])
+
+    def test_load_plans_allow_different_page_counts_per_pool(self):
+        connector = self.make_connector()
+        kv_transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([0, 1, 2, 3]),
+            keys=["kv-0", "kv-1"],
+        )
+        indexer_transfer = PoolTransfer(
+            name=PoolName.INDEXER,
+            host_indices=torch.tensor([0, 1]),
+            keys=["indexer-0"],
+        )
+
+        plans = connector._build_load_plans([[kv_transfer, indexer_transfer]])
+
+        self.assertEqual(
+            {plan.name: plan.logical_pages for plan in plans},
+            {PoolName.KV: 2, PoolName.INDEXER: 1},
+        )
+
+    def test_layerwise_load_completes_logical_layers_without_objects(self):
+        connector = UMBPTreeConnector.__new__(UMBPTreeConnector)
+        connector.num_layers = 3
+        connector.pool_layers = {PoolName.KV: [0, 2]}
+        connector.storage = self.storage
+        connector.layer_done_counter = LayerWiseLoadCounter(connector.num_layers)
+        plan = _LayerObjectPlan(
+            name=PoolName.KV,
+            keys=["page_L0", "page_L2"],
+            ptrs=[100, 200],
+            sizes=[8, 8],
+            logical_pages=1,
+            component_count=1,
+            pool_layer_count=2,
+        )
+        counter = connector.layer_done_counter.update_producer()
+        connector.layer_done_counter.set_consumer(counter)
+
+        connector._run_layer_wise_batch(counter, [plan])
+
+        connector.layer_done_counter.wait_until(2)
+        self.assertEqual(self.client.batch_get_into_ptr.call_count, 2)
 
     def test_lookup_stops_at_first_partial_page_across_chunks(self):
         connector = self.make_connector()

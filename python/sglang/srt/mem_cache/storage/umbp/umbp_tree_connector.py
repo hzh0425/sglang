@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -27,6 +28,29 @@ logger = logging.getLogger(__name__)
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; object batches contain CHUNK_PAGES * layers.
 CHUNK_PAGES = 64
+
+
+def _ordered_layers(entry) -> list[int]:
+    component_lengths = {len(component) for component in entry.components}
+    if len(component_lengths) != 1:
+        raise ValueError(
+            f"UMBP pool {entry.name} components have different layer counts."
+        )
+    pool_layer_count = component_lengths.pop()
+    if pool_layer_count != len(entry.layer_mapping):
+        raise ValueError(
+            f"UMBP pool {entry.name} has {pool_layer_count} buffers per component "
+            f"but {len(entry.layer_mapping)} mapped layers."
+        )
+    by_buffer = {
+        buffer_index: logical_layer
+        for logical_layer, buffer_index in entry.layer_mapping.items()
+    }
+    if sorted(by_buffer) != list(range(pool_layer_count)):
+        raise ValueError(
+            f"UMBP pool {entry.name} layer mapping is not a contiguous bijection."
+        )
+    return [by_buffer[index] for index in range(pool_layer_count)]
 
 
 def _resolve_umbp_pool_group(
@@ -94,17 +118,15 @@ class _LayerObjectPlan:
     keys: list[str]
     ptrs: list[int]
     sizes: list[int]
-    num_layers: int
-
-    @property
-    def num_pages(self) -> int:
-        return len(self.keys) // self.num_layers
+    logical_pages: int
+    component_count: int
+    pool_layer_count: int
 
     def layer_meta(self, layer: int):
         return (
-            self.keys[layer :: self.num_layers],
-            self.ptrs[layer :: self.num_layers],
-            self.sizes[layer :: self.num_layers],
+            self.keys[layer :: self.pool_layer_count],
+            self.ptrs[layer :: self.pool_layer_count],
+            self.sizes[layer :: self.pool_layer_count],
         )
 
 
@@ -183,10 +205,22 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
-        if self.num_layers == 0 or any(
-            len(pool.kv_buffer) != self.num_layers for pool in self.pools.values()
-        ):
-            raise ValueError("UMBP KV and INDEXER pools must have equal layer counts.")
+        if self.num_layers <= 0:
+            raise ValueError("UMBP requires at least one logical layer.")
+        self.pool_layers = {
+            name: _ordered_layers(entry) for name, entry in self.pools.items()
+        }
+        invalid_layers = {
+            name: [layer for layer in layers if not 0 <= layer < self.num_layers]
+            for name, layers in self.pool_layers.items()
+        }
+        invalid_layers = {
+            name: layers for name, layers in invalid_layers.items() if layers
+        }
+        if invalid_layers:
+            raise ValueError(
+                f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
+            )
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -221,9 +255,13 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         else:
             extra_config["cache_remote_fetches"] = False
 
-        probe = torch.arange(self.page_size, dtype=torch.int64)
         min_object_size = min(
-            min(pool.get_page_buffer_meta(probe)[1]) for pool in self.pools.values()
+            min(
+                pool.get_page_buffer_meta(
+                    torch.arange(pool.page_size, dtype=torch.int64)
+                )[1]
+            )
+            for pool in self.pools.values()
         )
         if standalone_requested:
             extra_config.pop("dram_page_size", None)
@@ -324,20 +362,31 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                     )
                 self._registered.append(allocation)
 
-    def _object_keys(self, transfer: PoolTransfer) -> list[str]:
-        page_keys, multiplier = self.storage._get_hybrid_page_component_keys(
-            list(transfer.keys or []), transfer
+    def _object_keys_for_pages(
+        self, page_keys: list[str], transfer: PoolTransfer
+    ) -> tuple[list[str], int]:
+        component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
+            page_keys, transfer
         )
-        if multiplier != 1:
+        component_count = len(self.pools[transfer.name].components)
+        if multiplier != component_count:
             raise ValueError(
-                f"Direct UMBP requires one page key per pool, got multiplier="
-                f"{multiplier} for {transfer.name}."
+                f"UMBP pool {transfer.name} produced {multiplier} key components "
+                f"for {component_count} buffer components."
             )
-        return [
-            f"{page_key}_L{layer}"
-            for page_key in page_keys
-            for layer in range(self.num_layers)
-        ]
+        layers = self.pool_layers[transfer.name]
+        return (
+            [
+                f"{component_key}_L{logical_layer}"
+                for component_key in component_keys
+                for logical_layer in layers
+            ],
+            multiplier,
+        )
+
+    def _object_keys(self, transfer: PoolTransfer) -> list[str]:
+        keys, _ = self._object_keys_for_pages(list(transfer.keys or []), transfer)
+        return keys
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -404,8 +453,13 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             keys: list[str] = []
             ptrs: list[int] = []
             sizes: list[int] = []
+            logical_pages = 0
+            component_count = None
             for transfer in transfers:
-                transfer_keys = self._object_keys(transfer)
+                page_keys = list(transfer.keys or [])
+                transfer_keys, multiplier = self._object_keys_for_pages(
+                    page_keys, transfer
+                )
                 transfer_ptrs, transfer_sizes = self.pools[name].get_page_buffer_meta(
                     transfer.host_indices
                 )
@@ -418,13 +472,36 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 keys.extend(transfer_keys)
                 ptrs.extend(transfer_ptrs)
                 sizes.extend(transfer_sizes)
-            plans.append(_LayerObjectPlan(name, keys, ptrs, sizes, self.num_layers))
+                logical_pages += len(page_keys)
+                if component_count is None:
+                    component_count = multiplier
+                elif component_count != multiplier:
+                    raise ValueError(
+                        f"UMBP pool {name} changed component count within one load."
+                    )
+            pool_layer_count = len(self.pool_layers[name])
+            component_count = component_count or 0
+            expected = logical_pages * component_count * pool_layer_count
+            if not len(keys) == len(ptrs) == len(sizes) == expected:
+                raise ValueError(
+                    f"Layer-wise UMBP plan mismatch for pool {name}: "
+                    f"keys={len(keys)} ptrs={len(ptrs)} sizes={len(sizes)} "
+                    f"expected={expected}."
+                )
+            plans.append(
+                _LayerObjectPlan(
+                    name,
+                    keys,
+                    ptrs,
+                    sizes,
+                    logical_pages,
+                    component_count,
+                    pool_layer_count,
+                )
+            )
 
         if not plans or not plans[0].keys:
             raise ValueError("Layer-wise UMBP load has no object keys.")
-        num_pages = plans[0].num_pages
-        if any(plan.num_pages != num_pages for plan in plans):
-            raise ValueError("Layer-wise UMBP pools must cover the same page set.")
         return plans
 
     def _load_thread_func(self) -> None:
@@ -442,10 +519,17 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self, counter_index: int, plans: list[_LayerObjectPlan]
     ) -> None:
         try:
+            by_layer: dict[int, list[tuple[_LayerObjectPlan, int]]] = defaultdict(list)
+            for plan in plans:
+                for local_layer, logical_layer in enumerate(
+                    self.pool_layers[plan.name]
+                ):
+                    by_layer[logical_layer].append((plan, local_layer))
+
             max_objects_per_call = CHUNK_PAGES * self.num_layers
-            for layer in range(self.num_layers):
-                for plan in plans:
-                    keys, ptrs, sizes = plan.layer_meta(layer)
+            for logical_layer in range(self.num_layers):
+                for plan, local_layer in by_layer.get(logical_layer, ()):
+                    keys, ptrs, sizes = plan.layer_meta(local_layer)
                     for start in range(0, len(keys), max_objects_per_call):
                         chunk_keys = keys[start : start + max_objects_per_call]
                         results = list(
@@ -461,7 +545,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
-                self.layer_done_counter.complete(counter_index, layer)
+                self.layer_done_counter.complete(counter_index, logical_layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")
@@ -490,9 +574,10 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
     def _run_offload(self, expanded: list[PoolTransfer]) -> bool:
         self._wait_for_device()
-        chunk_objects = CHUNK_PAGES * self.num_layers
         for transfer in expanded:
-            keys = self._object_keys(transfer)
+            keys, component_count = self._object_keys_for_pages(
+                list(transfer.keys or []), transfer
+            )
             ptrs, sizes = self.pools[transfer.name].get_page_buffer_meta(
                 transfer.host_indices
             )
@@ -501,6 +586,9 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                     f"UMBP offload metadata mismatch for pool {transfer.name}."
                 )
             keys, ptrs, sizes = _sort_by_device_address(keys, ptrs, sizes)
+            chunk_objects = (
+                CHUNK_PAGES * len(self.pool_layers[transfer.name]) * component_count
+            )
             for start in range(0, len(keys), chunk_objects):
                 chunk_keys = keys[start : start + chunk_objects]
                 results = list(
