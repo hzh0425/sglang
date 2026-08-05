@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from concurrent.futures import Future
 from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from typing import Any
@@ -50,48 +51,41 @@ class LayerWiseLoadCounter:
         self.num_layers = num_layers
         self._producer_index = -1
         self.consumer_index = -1
-        self._events: dict[int, list[threading.Event]] = {}
-        self._errors: dict[int, BaseException] = {}
+        self._futures: dict[int, list[Future]] = {}
 
     def update_producer(self) -> int:
         self._producer_index += 1
-        self._events[self._producer_index] = [
-            threading.Event() for _ in range(self.num_layers)
-        ]
+        self._futures[self._producer_index] = [Future() for _ in range(self.num_layers)]
         return self._producer_index
 
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
     def complete(self, index: int, layer: int) -> None:
-        self._events[index][layer].set()
+        self._futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
-        events = self._events.get(index)
-        if events is None:
-            return
-        self._errors[index] = error
-        for event in events:
-            event.set()
+        for future in self._futures.get(index, ()):
+            if not future.done():
+                future.set_exception(error)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
-        events = self._events.get(index)
-        if events is None:
+        futures = self._futures.get(index)
+        if futures is None:
             return
-        events[threshold].wait()
-        error = self._errors.get(index)
-        if threshold == self.num_layers - 1:
-            self._events.pop(index, None)
-            self._errors.pop(index, None)
-        if error is not None:
+        try:
+            futures[threshold].result()
+        except BaseException as error:
             raise RuntimeError("UMBP layer-wise KV load failed.") from error
+        finally:
+            if threshold == self.num_layers - 1:
+                self._futures.pop(index, None)
 
     def reset(self) -> None:
         self._producer_index = -1
         self.consumer_index = -1
-        self._events.clear()
-        self._errors.clear()
+        self._futures.clear()
 
 
 @dataclass
