@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from typing import Any
@@ -16,6 +15,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
+    DevicePoolGroup,
+    resolve_hybrid_device_pool_group,
+)
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
 
 logger = logging.getLogger(__name__)
@@ -25,87 +28,9 @@ logger = logging.getLogger(__name__)
 CHUNK_PAGES = 64
 
 
-class _LogicalPool:
-    def __init__(self, page_size: int):
-        self.page_size = page_size
-        self.kv_buffer = None
-
-
-class _LayerRowsPool:
-    """Expose per-layer GPU tensors as page-major pointer metadata."""
-
-    def __init__(
-        self,
-        buffers: Sequence[torch.Tensor],
-        page_size: int,
-        *,
-        rows_are_pages: bool,
-    ):
-        if not buffers:
-            raise ValueError("Direct UMBP requires at least one layer buffer.")
-        self.kv_buffer = list(buffers)
-        self.page_size = page_size
-        self._page_offsets = torch.arange(page_size)
-        self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
-        self._row_span = 1 if rows_are_pages else page_size
-        self._rows_are_pages = rows_are_pages
-        self.row_sizes = tuple(
-            buffer[0].numel() * buffer.element_size() * self._row_span
-            for buffer in self.kv_buffer
-        )
-
-    def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
-        return self.kv_buffer
-
-    def _rows(self, indices: torch.Tensor) -> torch.Tensor:
-        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
-        if slots.numel() % self.page_size:
-            raise ValueError(
-                f"UMBP transfer has {slots.numel()} indices, expected a multiple "
-                f"of page_size={self.page_size}."
-            )
-        if not slots.numel():
-            return torch.empty((0,), dtype=torch.int64)
-
-        pages = slots.reshape(-1, self.page_size)
-        starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
-        ):
-            raise ValueError("Direct UMBP requires aligned contiguous device pages.")
-
-        rows = (
-            starts.div(self.page_size, rounding_mode="floor")
-            if self._rows_are_pages
-            else starts
-        )
-        first_row = int(rows.min())
-        last_row = int(rows.max()) + self._row_span
-        if first_row < 0 or last_row > self._row_count:
-            bad_row = first_row if first_row < 0 else last_row - 1
-            raise ValueError(
-                f"UMBP row {bad_row} exceeds buffer shapes "
-                f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
-            )
-        return rows
-
-    def get_page_buffer_meta(self, indices: torch.Tensor):
-        rows = self._rows(indices).tolist()
-        ptrs = [buffer[row].data_ptr() for row in rows for buffer in self.kv_buffer]
-        return ptrs, list(self.row_sizes) * len(rows)
-
-
-class _TokenRowsPool(_LayerRowsPool):
-    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
-        super().__init__(buffers, page_size, rows_are_pages=False)
-
-
-class _PageRowsPool(_LayerRowsPool):
-    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
-        super().__init__(buffers, page_size, rows_are_pages=True)
-
-
-def _build_pools(kvcache: Any, page_size: int):
+def _resolve_umbp_pool_group(
+    kvcache: Any, page_size: int, req_to_token_pool: Any
+) -> DevicePoolGroup:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     if not isinstance(kvcache, DSATokenToKVPool):
@@ -115,16 +40,7 @@ def _build_pools(kvcache: Any, page_size: int):
             "DSA KV page size must match the tree page size: "
             f"{kvcache.page_size} != {page_size}."
         )
-
-    return (
-        _LogicalPool(page_size),
-        {
-            PoolName.KV: _TokenRowsPool(kvcache.kv_buffer, page_size),
-            PoolName.INDEXER: _PageRowsPool(
-                kvcache.index_k_with_scale_buffer, page_size
-            ),
-        },
-    )
+    return resolve_hybrid_device_pool_group(kvcache, page_size, req_to_token_pool)
 
 
 class LayerWiseLoadCounter:
@@ -268,8 +184,11 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        anchor, self.pools = _build_pools(kvcache, self.page_size)
-        self.num_layers = len(self.pools[PoolName.KV].kv_buffer)
+        pool_group = _resolve_umbp_pool_group(
+            kvcache, self.page_size, params.req_to_token_pool
+        )
+        self.pools = pool_group.entry_map
+        self.num_layers = pool_group.num_layers
         if self.num_layers == 0 or any(
             len(pool.kv_buffer) != self.num_layers for pool in self.pools.values()
         ):
@@ -308,8 +227,9 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         else:
             extra_config["cache_remote_fetches"] = False
 
+        probe = torch.arange(self.page_size, dtype=torch.int64)
         min_object_size = min(
-            size for pool in self.pools.values() for size in pool.row_sizes
+            min(pool.get_page_buffer_meta(probe)[1]) for pool in self.pools.values()
         )
         if standalone_requested:
             extra_config.pop("dram_page_size", None)
@@ -362,7 +282,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                     "Direct UMBP cannot disable zero-copy memory registration."
                 )
 
-            self.storage.mem_pool_host = anchor
+            self.storage.mem_pool_host = pool_group
             self.storage._kv_anchor_is_logical = True
             self.storage.registered_pools = self.pools
             self.storage.mla_suffix = (

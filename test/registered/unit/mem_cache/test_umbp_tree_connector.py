@@ -8,12 +8,11 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
-from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
-    UMBPTreeConnector,
-    _LogicalPool,
-    _PageRowsPool,
-    _TokenRowsPool,
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
+    DevicePoolEntry,
+    DevicePoolGroup,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import UMBPTreeConnector
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_connector_mixin import (
     UnifiedCacheConnectorMixin,
@@ -40,11 +39,32 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.indexer_buffers = [
             torch.zeros((16, 6), dtype=torch.uint8) for _ in range(self.num_layers)
         ]
-        self.pools = {
-            PoolName.KV: _TokenRowsPool(self.kv_buffers, self.page_size),
-            PoolName.INDEXER: _PageRowsPool(self.indexer_buffers, self.page_size),
-        }
-        self.anchor = _LogicalPool(self.page_size)
+        identity = {layer: layer for layer in range(self.num_layers)}
+        self.pool_group = DevicePoolGroup(
+            [
+                DevicePoolEntry(
+                    name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[self.kv_buffers],
+                    layer_mapping=identity,
+                    page_size=self.page_size,
+                    rows_are_pages=False,
+                ),
+                DevicePoolEntry(
+                    name=PoolName.INDEXER,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[self.indexer_buffers],
+                    layer_mapping=identity,
+                    page_size=self.page_size,
+                    rows_are_pages=True,
+                ),
+            ],
+            self.num_layers,
+            self.page_size,
+        )
+        self.pools = self.pool_group.entry_map
 
         self.client = MagicMock()
         self.client.is_distributed.return_value = True
@@ -74,6 +94,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         )
         self.params = SimpleNamespace(
             page_size=self.page_size,
+            req_to_token_pool=MagicMock(),
             token_to_kv_pool_allocator=MagicMock(),
             tp_cache_group=None,
             pp_rank=0,
@@ -93,8 +114,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
         )
         with (
             patch(
-                "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._build_pools",
-                return_value=(self.anchor, self.pools),
+                "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._resolve_umbp_pool_group",
+                return_value=self.pool_group,
             ),
             patch(
                 "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._parse_storage_extra_config",
