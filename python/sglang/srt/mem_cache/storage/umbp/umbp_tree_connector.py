@@ -5,7 +5,7 @@ import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any
 
 import torch
@@ -376,14 +376,22 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._load_queue: Queue[tuple[int, list[_LayerObjectPlan]] | None] = Queue()
+        self._offload_queue: Queue[list[PoolTransfer] | None] = Queue()
+        self._offload_results: Queue[bool] = Queue()
         self._stats = {"lookup": 0, "load": 0, "offload": 0}
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
             name=f"umbp-layerwise-tp{tp_rank}",
         )
+        self._offload_thread = threading.Thread(
+            target=self._offload_thread_func,
+            daemon=True,
+            name=f"umbp-offload-tp{tp_rank}",
+        )
         self._closed = False
         self._load_thread.start()
+        self._offload_thread.start()
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -566,7 +574,25 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         expanded = self._expand(transfers)
         if not expanded:
             return False
+        self._offload_queue.put(expanded)
+        return True
 
+    def _offload_thread_func(self) -> None:
+        while True:
+            task = self._offload_queue.get()
+            try:
+                if task is None:
+                    return
+                try:
+                    success = self._run_offload(task)
+                except BaseException:
+                    logger.exception("UMBP offload failed")
+                    success = False
+                self._offload_results.put(success)
+            finally:
+                self._offload_queue.task_done()
+
+    def _run_offload(self, expanded: list[PoolTransfer]) -> bool:
         self._wait_for_device()
         chunk_objects = CHUNK_PAGES * self.num_layers
         for transfer in expanded:
@@ -604,6 +630,12 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self._stats["offload"] += 1
         return True
 
+    def num_completed_offloads(self) -> int:
+        return self._offload_results.qsize()
+
+    def pop_completed_offload(self) -> bool:
+        return self._offload_results.get_nowait()
+
     def _wait_for_device(self) -> None:
         device = next(
             (
@@ -620,15 +652,25 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     def reset(self) -> None:
         self._pending.clear()
         self._load_queue.join()
+        self._offload_queue.join()
+        while True:
+            try:
+                self._offload_results.get_nowait()
+            except Empty:
+                break
         self.layer_done_counter.reset()
 
     def close(self) -> None:
         if self._closed:
             return
         self.reset()
-        if self._load_thread.is_alive():
-            self._load_queue.put(None)
-            self._load_thread.join()
+        for thread, queue in (
+            (self._offload_thread, self._offload_queue),
+            (self._load_thread, self._load_queue),
+        ):
+            if thread.is_alive():
+                queue.put(None)
+                thread.join()
         if self._standalone_process_mode and self._registered:
             # StandaloneProcess deregistration is client-wide; one call tears
             # down every registered region. Keep the GPU tensors alive until

@@ -1,4 +1,5 @@
 import json
+import threading
 import unittest
 from enum import Enum
 from types import SimpleNamespace
@@ -116,6 +117,10 @@ class TestUMBPTreeConnector(unittest.TestCase):
             keys=[f"page-{index}" for index in range(pages)],
         )
 
+    @staticmethod
+    def wait_for_offloads(connector):
+        connector._offload_queue.join()
+
     def test_object_key_and_pointer_order_are_page_major(self):
         connector = self.make_connector()
         transfer = connector._expand([self.transfer(pages=2)])[0]
@@ -157,6 +162,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
             2,
         ):
             self.assertTrue(connector.offload([self.transfer(pages=5)]))
+            self.wait_for_offloads(connector)
 
         # 3 chunks per pool, and every non-tail chunk contains 2 * L objects.
         calls = self.client.batch_put_from_ptr.call_args_list
@@ -172,6 +178,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         """
         connector = self.make_connector()
         self.assertTrue(connector.offload([self.transfer(pages=3)]))
+        self.wait_for_offloads(connector)
 
         for call in self.client.batch_put_from_ptr.call_args_list:
             ptrs = call.args[1]
@@ -198,6 +205,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.client.batch_put_from_ptr.reset_mock()
         self.assertTrue(connector.offload([self.transfer(pages=3)]))
+        self.wait_for_offloads(connector)
 
         seen = {}
         for call in self.client.batch_put_from_ptr.call_args_list:
@@ -208,6 +216,94 @@ class TestUMBPTreeConnector(unittest.TestCase):
                 seen[key] = (ptr, size)
 
         self.assertEqual(seen, expected)
+
+    def test_offload_success_produces_exactly_one_result(self):
+        connector = self.make_connector()
+
+        self.assertTrue(connector.offload([self.transfer(pages=1)]))
+        self.wait_for_offloads(connector)
+
+        self.assertEqual(connector.num_completed_offloads(), 1)
+        self.assertTrue(connector.pop_completed_offload())
+        self.assertEqual(connector.num_completed_offloads(), 0)
+
+    def test_offload_failure_produces_exactly_one_false_result(self):
+        self.client.batch_put_from_ptr.return_value = [False]
+        self.client.batch_put_from_ptr.side_effect = None
+        connector = self.make_connector()
+
+        self.assertTrue(connector.offload([self.transfer(pages=1)]))
+        self.wait_for_offloads(connector)
+
+        self.assertEqual(connector.num_completed_offloads(), 1)
+        self.assertFalse(connector.pop_completed_offload())
+        self.assertEqual(connector.num_completed_offloads(), 0)
+
+    def test_offload_exception_produces_exactly_one_false_result(self):
+        self.client.batch_put_from_ptr.side_effect = RuntimeError("put failed")
+        connector = self.make_connector()
+
+        self.assertTrue(connector.offload([self.transfer(pages=1)]))
+        self.wait_for_offloads(connector)
+
+        self.assertEqual(connector.num_completed_offloads(), 1)
+        self.assertFalse(connector.pop_completed_offload())
+        self.assertEqual(connector.num_completed_offloads(), 0)
+
+    def test_offload_results_are_fifo(self):
+        def result_for_key(keys, ptrs, sizes):
+            return [not keys[0].startswith("fail-")] * len(keys)
+
+        self.client.batch_put_from_ptr.side_effect = result_for_key
+        connector = self.make_connector()
+        success = self.transfer(pages=1)
+        success.keys = ["success-page"]
+        failure = self.transfer(pages=1)
+        failure.keys = ["fail-page"]
+
+        self.assertTrue(connector.offload([success]))
+        self.assertTrue(connector.offload([failure]))
+        self.wait_for_offloads(connector)
+
+        self.assertEqual(connector.num_completed_offloads(), 2)
+        self.assertTrue(connector.pop_completed_offload())
+        self.assertFalse(connector.pop_completed_offload())
+
+    def test_reset_waits_for_offload_and_discards_stale_result(self):
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        reset_started = threading.Event()
+        reset_done = threading.Event()
+
+        def blocked_put(keys, ptrs, sizes):
+            worker_started.set()
+            if not release_worker.wait(timeout=5):
+                raise TimeoutError("test did not release offload worker")
+            return [True] * len(keys)
+
+        self.client.batch_put_from_ptr.side_effect = blocked_put
+        connector = self.make_connector()
+        self.assertTrue(connector.offload([self.transfer(pages=1)]))
+        self.assertTrue(worker_started.wait(timeout=5))
+
+        def run_reset():
+            reset_started.set()
+            connector.reset()
+            reset_done.set()
+
+        reset_thread = threading.Thread(target=run_reset)
+        reset_thread.start()
+        self.assertTrue(reset_started.wait(timeout=5))
+        try:
+            self.assertTrue(reset_thread.is_alive())
+            self.assertFalse(reset_done.is_set())
+        finally:
+            release_worker.set()
+            reset_thread.join(timeout=5)
+
+        self.assertFalse(reset_thread.is_alive())
+        self.assertTrue(reset_done.is_set())
+        self.assertEqual(connector.num_completed_offloads(), 0)
 
     def test_background_load_completes_each_layer(self):
         connector = self.make_connector()
@@ -325,6 +421,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "rpc failed"):
             connector.close()
         self.assertFalse(connector._closed)
+        self.assertFalse(connector._offload_thread.is_alive())
         self.assertFalse(connector._load_thread.is_alive())
 
         connector.close()
