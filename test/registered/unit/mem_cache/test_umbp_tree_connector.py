@@ -144,7 +144,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
     def test_object_key_and_pointer_order_are_page_major(self):
         connector = self.make_connector()
-        transfer = connector._expand([self.transfer(pages=2)])[0]
+        transfer = connector.pool_group.resolve_transfers([self.transfer(pages=2)])[0]
 
         keys = connector._object_keys(transfer)
         ptrs, sizes = connector.pools[transfer.name].get_page_buffer_meta(
@@ -161,6 +161,18 @@ class TestUMBPTreeConnector(unittest.TestCase):
         )
         self.assertEqual(len(keys), len(ptrs))
         self.assertEqual(len(keys), len(sizes))
+
+    def test_dsa_transfer_resolution_matches_legacy_expansion(self):
+        connector = self.make_connector()
+        source = self.transfer(pages=2)
+
+        resolved = connector.pool_group.resolve_transfers([source])
+
+        self.assertEqual([transfer.name for transfer in resolved], list(self.pools))
+        for transfer in resolved:
+            self.assertEqual(transfer.keys, source.keys)
+            self.assertTrue(torch.equal(transfer.host_indices, source.device_indices))
+            self.assertIsNone(transfer.indices_from_pool)
 
     def test_lookup_stops_at_first_partial_page_across_chunks(self):
         connector = self.make_connector()
@@ -216,7 +228,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
         connector = self.make_connector()
 
         expected = {}
-        for transfer in connector._expand([self.transfer(pages=3)]):
+        for transfer in connector.pool_group.resolve_transfers(
+            [self.transfer(pages=3)]
+        ):
             keys = connector._object_keys(transfer)
             ptrs, sizes = connector.pools[transfer.name].get_page_buffer_meta(
                 transfer.host_indices

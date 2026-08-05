@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from concurrent.futures import Future
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Any
 
@@ -178,11 +178,11 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        pool_group = _resolve_umbp_pool_group(
+        self.pool_group = _resolve_umbp_pool_group(
             kvcache, self.page_size, params.req_to_token_pool
         )
-        self.pools = pool_group.entry_map
-        self.num_layers = pool_group.num_layers
+        self.pools = self.pool_group.entry_map
+        self.num_layers = self.pool_group.num_layers
         if self.num_layers == 0 or any(
             len(pool.kv_buffer) != self.num_layers for pool in self.pools.values()
         ):
@@ -276,7 +276,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                     "Direct UMBP cannot disable zero-copy memory registration."
                 )
 
-            self.storage.mem_pool_host = pool_group
+            self.storage.mem_pool_host = self.pool_group
             self.storage._kv_anchor_is_logical = True
             self.storage.registered_pools = self.pools
             self.storage.mla_suffix = (
@@ -324,24 +324,6 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                     )
                 self._registered.append(allocation)
 
-    def _expand(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
-        kv = next(
-            (transfer for transfer in transfers if transfer.name == PoolName.KV),
-            None,
-        )
-        if kv is None or not kv.keys:
-            return []
-        return [
-            replace(
-                kv,
-                name=name,
-                host_indices=kv.device_indices,
-                keys=list(kv.keys),
-                indices_from_pool=None,
-            )
-            for name in self.pools
-        ]
-
     def _object_keys(self, transfer: PoolTransfer) -> list[str]:
         page_keys, multiplier = self.storage._get_hybrid_page_component_keys(
             list(transfer.keys or []), transfer
@@ -358,7 +340,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         ]
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        expanded = self._expand(transfers)
+        expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return []
 
@@ -387,7 +369,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         return list(range(1, hit_pages + 1))
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        expanded = self._expand(transfers)
+        expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return False
         if rid in self._pending:
@@ -485,7 +467,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             logger.exception("UMBP layer-wise load batch failed")
 
     def offload(self, transfers: list[PoolTransfer]) -> bool:
-        expanded = self._expand(transfers)
+        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
         self._offload_queue.put(expanded)
