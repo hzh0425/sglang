@@ -290,6 +290,91 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertTrue(connector.pop_completed_offload())
         self.assertFalse(connector.pop_completed_offload())
 
+    @staticmethod
+    def _drain_fixture(
+        pending,
+        local_completed,
+        slowest_rank_completed,
+        *,
+        local_results=None,
+        peer_results=None,
+    ):
+        """A stand-in tree with `pending` queued offloads, whose connector reports
+        `local_completed` finished ones while the slowest rank reports fewer."""
+        local_results = list(local_results or [True] * local_completed)
+        peer_results = list(peer_results or [True] * slowest_rank_completed)
+        nodes = [
+            SimpleNamespace(id=i, connector_offloaded=False) for i in range(pending)
+        ]
+        cache = SimpleNamespace(
+            connector=SimpleNamespace(
+                num_completed_offloads=lambda: local_completed,
+                pop_completed_offload=lambda: local_results.pop(0),
+            ),
+            nodes=nodes,
+            connector_offloads=[(node, object()) for node in nodes],
+            released=[],
+        )
+        cache.dec_lock_ref = lambda node, params: cache.released.append(node.id)
+        cache._connector_sync_min = lambda value: (
+            UnifiedCacheConnectorMixin._connector_sync_min(cache, value)
+        )
+        collective_index = 0
+
+        def all_reduce(tensor, op):
+            nonlocal collective_index
+            if collective_index == 0:
+                tensor.fill_(min(int(tensor.item()), slowest_rank_completed))
+            else:
+                peer = torch.tensor(peer_results[: tensor.numel()], dtype=tensor.dtype)
+                tensor.copy_(torch.minimum(tensor, peer))
+            collective_index += 1
+
+        cache._all_reduce_attn_groups = all_reduce
+        return cache
+
+    def test_drain_consumes_the_cross_rank_minimum(self):
+        """Draining a rank-local count desyncs lock_ref across TP ranks, which
+        desyncs evictable_size() and therefore the admission decision -- ranks
+        then disagree on whether to run a forward at all and deadlock."""
+        cache = self._drain_fixture(
+            pending=5, local_completed=4, slowest_rank_completed=2
+        )
+
+        UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
+
+        self.assertEqual(cache.released, [0, 1])
+        self.assertEqual(len(cache.connector_offloads), 3)
+
+    def test_drain_skips_the_collective_when_nothing_is_queued(self):
+        """The empty-queue gate must be rank-consistent on its own: issuing the
+        MIN-reduce on only some ranks would itself hang."""
+        cache = self._drain_fixture(
+            pending=0, local_completed=3, slowest_rank_completed=0
+        )
+        cache._all_reduce_attn_groups = lambda tensor, op: self.fail(
+            "collective issued with an empty offload queue"
+        )
+
+        UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
+
+        self.assertEqual(cache.released, [])
+
+    def test_drain_synchronizes_offload_failures_across_ranks(self):
+        cache = self._drain_fixture(
+            pending=1,
+            local_completed=1,
+            slowest_rank_completed=1,
+            local_results=[True],
+            peer_results=[False],
+        )
+
+        UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
+
+        self.assertEqual(cache.released, [0])
+        self.assertFalse(cache.connector_offloads)
+        self.assertFalse(cache.nodes[0].connector_offloaded)
+
     def test_reset_waits_for_offload_and_discards_stale_result(self):
         worker_started = threading.Event()
         release_worker = threading.Event()

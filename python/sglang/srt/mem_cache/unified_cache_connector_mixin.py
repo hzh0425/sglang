@@ -391,14 +391,31 @@ class UnifiedCacheConnectorMixin:
         self.connector_offloads.append((node, lock_params))
 
     def drain_connector_offloads(self) -> None:
-        if self.connector is None:
+        if self.connector is None or not self.connector_offloads:
             return
+        # `num_completed_offloads()` is fed by this rank's background offload
+        # thread, so it differs across ranks at any given step. Draining a
+        # rank-local count would leave `lock_ref` -- and hence
+        # `evictable_size()`, `rem_total_tokens` and every scheduling decision
+        # derived from them -- rank-dependent, and TP ranks that disagree on
+        # whether a request fits will disagree on whether to run a forward at
+        # all. Agree on the count first.
+        #
+        # `len(self.connector_offloads)` is already rank-consistent: it only
+        # grows from tree inserts, which are identical on every rank.
         count = min(
             self.connector.num_completed_offloads(), len(self.connector_offloads)
         )
-        for _ in range(count):
+        count = self._connector_sync_min(count)
+        results = torch.tensor(
+            [int(self.connector.pop_completed_offload()) for _ in range(count)],
+            dtype=torch.int,
+        )
+        if count:
+            self._all_reduce_attn_groups(results, torch.distributed.ReduceOp.MIN)
+        for success in results.tolist():
             node, lock_params = self.connector_offloads.pop(0)
-            node.connector_offloaded = self.connector.pop_completed_offload()
+            node.connector_offloaded = bool(success)
             self.dec_lock_ref(node, lock_params)
 
     def _connector_sync_success(self, success: bool) -> bool:
@@ -406,6 +423,12 @@ class UnifiedCacheConnectorMixin:
         synced = torch.tensor([int(success)], dtype=torch.int)
         self._all_reduce_attn_groups(synced, torch.distributed.ReduceOp.MIN)
         return bool(synced.item())
+
+    def _connector_sync_min(self, value: int) -> int:
+        """MIN-reduce a per-rank count so every rank consumes the same amount."""
+        synced = torch.tensor([value], dtype=torch.int)
+        self._all_reduce_attn_groups(synced, torch.distributed.ReduceOp.MIN)
+        return int(synced.item())
 
     # ---- lifecycle helpers used by the tree's own hooks ----
 
