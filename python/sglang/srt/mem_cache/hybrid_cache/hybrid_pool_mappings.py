@@ -301,7 +301,9 @@ def resolve_hybrid_device_pool_group(
 
     if isinstance(kvcache, DeepSeekV4TokenToKVPool):
         if kvcache._unified_kv or isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
-            raise ValueError("Direct Mooncake does not support unified-KV or HiSparse.")
+            raise ValueError(
+                "Direct tree connectors do not support unified-KV or HiSparse."
+            )
         if kvcache.swa_page_size != page_size:
             raise ValueError(
                 "DeepSeek V4 SWA page size must match the tree page size: "
@@ -378,12 +380,14 @@ def resolve_hybrid_device_pool_group(
     if isinstance(kvcache, HybridLinearKVPool):
         if getattr(req_to_token_pool, "mamba_ckpt_pool", None) is not None:
             raise ValueError(
-                "Direct Mooncake does not support int8 Mamba checkpoint storage."
+                "Direct tree connectors do not support int8 Mamba checkpoint storage."
             )
         mappings = resolve_hybrid_linear_pool_mappings(kvcache, req_to_token_pool)
         full_pool = kvcache.full_kv_pool
         if kvcache.use_mla or getattr(full_pool, "k_scale_buffer", None) is not None:
-            raise ValueError("Direct Mooncake requires unquantized Qwen3.5 MHA KV.")
+            raise ValueError(
+                "Direct tree connectors require unquantized Qwen3.5 MHA KV."
+            )
         kv = DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
@@ -415,7 +419,7 @@ def resolve_hybrid_device_pool_group(
 
     if not isinstance(kvcache, DSATokenToKVPool):
         raise TypeError(
-            "Direct Mooncake supports DSA, DeepSeek V4, and hybrid linear KV pools."
+            "Direct tree connectors support DSA, DeepSeek V4, and hybrid linear KV pools."
         )
     if kvcache.page_size != page_size:
         raise ValueError(

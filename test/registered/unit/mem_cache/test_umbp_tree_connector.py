@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
     UMBPTreeConnector,
     _LayerObjectPlan,
     _ordered_layers,
+    _resolve_umbp_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_connector_mixin import (
@@ -185,6 +186,57 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.assertTrue(torch.equal(transfer.host_indices, source.device_indices))
             self.assertIsNone(transfer.indices_from_pool)
 
+    def test_resolver_accepts_deepseek_v4_pool(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4LayerItem,
+            DeepSeekV4TokenToKVPool,
+        )
+
+        def state_pool():
+            return SimpleNamespace(
+                ring_size=2,
+                kv_score_buffer=SimpleNamespace(
+                    kv_score=torch.zeros((8, 3), dtype=torch.uint8)
+                ),
+            )
+
+        kvcache = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        kvcache._unified_kv = False
+        kvcache.start_layer = 0
+        kvcache.end_layer = 3
+        kvcache.swa_page_size = self.page_size
+        kvcache.swa_kv_pool = SimpleNamespace(
+            kv_buffer=[
+                torch.zeros((8, 3), dtype=torch.uint8) for _ in range(kvcache.end_layer)
+            ]
+        )
+        kvcache.c4_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
+        )
+        kvcache.c4_indexer_kv_pool = SimpleNamespace(
+            index_k_with_scale_buffer=[
+                torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
+            ]
+        )
+        kvcache.c128_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)]
+        )
+        kvcache.layer_mapping = [
+            DeepSeekV4LayerItem(4, 1),
+            DeepSeekV4LayerItem(128, 0),
+            DeepSeekV4LayerItem(4, 0),
+        ]
+        kvcache.compress_state_pools = [state_pool(), None, state_pool()]
+        kvcache.indexer_compress_state_pools = [state_pool(), None, state_pool()]
+
+        group = _resolve_umbp_pool_group(kvcache, self.page_size, None)
+
+        self.assertEqual(group.num_layers, 3)
+        self.assertEqual(len(group.entry_map), 6)
+        self.assertEqual(
+            _ordered_layers(group.entry_map[PoolName.DEEPSEEK_V4_C4]), [2, 0]
+        )
+
     def test_pool_layers_follow_buffer_indices_not_logical_layer_order(self):
         buffers = [
             torch.zeros((4, 3), dtype=torch.uint8),
@@ -283,31 +335,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(valid, [1, 2, 4])
 
     def test_lookup_uses_full_kv_key_domain_for_trailing_pool(self):
-        identity = {0: 0}
-        pool_group = DevicePoolGroup(
-            [
-                DevicePoolEntry(
-                    name=PoolName.DEEPSEEK_V4_C4,
-                    indices_from_pool=PoolName.KV,
-                    device_pool=None,
-                    components=[[torch.zeros((4, 3), dtype=torch.uint8)]],
-                    layer_mapping=identity,
-                    page_size=self.page_size,
-                    rows_are_pages=True,
-                ),
-                DevicePoolEntry(
-                    name=PoolName.SWA,
-                    indices_from_pool=PoolName.SWA,
-                    device_pool=None,
-                    components=[[torch.zeros((4, 5), dtype=torch.uint8)]],
-                    layer_mapping=identity,
-                    page_size=self.page_size,
-                    rows_are_pages=True,
-                ),
-            ],
-            num_layers=1,
-            page_size=self.page_size,
-        )
+        pool_group = self._hybrid_pool_group()
         connector = self.make_connector(pool_group=pool_group)
         kv = PoolTransfer(
             name=PoolName.KV,
@@ -331,6 +359,54 @@ class TestUMBPTreeConnector(unittest.TestCase):
         ]
         self.assertIn("p0_rank_swa_L0", queried)
         self.assertIn("p3_rank_swa_L0", queried)
+
+    def test_offload_allows_partial_hybrid_sources(self):
+        connector = self.make_connector(pool_group=self._hybrid_pool_group())
+        kv = PoolTransfer(
+            name=PoolName.KV,
+            device_indices=torch.arange(8),
+            keys=["p0", "p1", "p2", "p3"],
+        )
+
+        self.assertTrue(connector.offload([kv]))
+        self.wait_for_offloads(connector)
+
+        self.assertTrue(connector.pop_completed_offload())
+        sent_keys = [
+            key
+            for call in self.client.batch_put_from_ptr.call_args_list
+            for key in call.args[0]
+        ]
+        self.assertTrue(sent_keys)
+        self.assertTrue(all("deepseek_v4_c4" in key for key in sent_keys))
+        self.assertTrue(all("_swa_" not in key for key in sent_keys))
+
+    def _hybrid_pool_group(self):
+        identity = {0: 0}
+        return DevicePoolGroup(
+            [
+                DevicePoolEntry(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[[torch.zeros((4, 3), dtype=torch.uint8)]],
+                    layer_mapping=identity,
+                    page_size=self.page_size,
+                    rows_are_pages=True,
+                ),
+                DevicePoolEntry(
+                    name=PoolName.SWA,
+                    indices_from_pool=PoolName.SWA,
+                    device_pool=None,
+                    components=[[torch.zeros((4, 5), dtype=torch.uint8)]],
+                    layer_mapping=identity,
+                    page_size=self.page_size,
+                    rows_are_pages=True,
+                ),
+            ],
+            num_layers=1,
+            page_size=self.page_size,
+        )
 
     def test_offload_is_chunked_on_logical_page_boundaries(self):
         connector = self.make_connector()

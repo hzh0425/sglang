@@ -57,15 +57,6 @@ def _ordered_layers(entry) -> list[int]:
 def _resolve_umbp_pool_group(
     kvcache: Any, page_size: int, req_to_token_pool: Any
 ) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-
-    if not isinstance(kvcache, DSATokenToKVPool):
-        raise TypeError("Direct UMBP connector currently supports DSA KV pools only.")
-    if kvcache.page_size != page_size:
-        raise ValueError(
-            "DSA KV page size must match the tree page size: "
-            f"{kvcache.page_size} != {page_size}."
-        )
     return resolve_hybrid_device_pool_group(kvcache, page_size, req_to_token_pool)
 
 
