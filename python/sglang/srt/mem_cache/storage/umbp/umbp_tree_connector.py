@@ -577,7 +577,8 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                         )
                         if len(results) != len(chunk_keys) or not all(results):
                             raise RuntimeError(
-                                f"UMBP get failed for pool={plan.name}, layer={layer}: "
+                                f"UMBP get failed for pool={plan.name}, "
+                                f"layer={logical_layer}: "
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )

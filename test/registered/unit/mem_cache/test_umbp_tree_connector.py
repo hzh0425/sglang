@@ -824,8 +824,15 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertTrue(connector.load("rid", [self.transfer(pages=2)]))
         counter = connector.start_layer_wise_loading()
         connector.layer_done_counter.set_consumer(counter)
-        with self.assertRaisesRegex(RuntimeError, "UMBP layer-wise KV load failed"):
+        with self.assertRaisesRegex(
+            RuntimeError, "UMBP layer-wise KV load failed"
+        ) as raised:
             connector.layer_done_counter.wait_until(1)
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertEqual(
+            str(raised.exception.__cause__),
+            "UMBP get failed for pool=kv, layer=1: success=0/2.",
+        )
 
     def test_rejects_unsafe_storage_options(self):
         with self.assertRaisesRegex(ValueError, "ssd_enabled=false"):
