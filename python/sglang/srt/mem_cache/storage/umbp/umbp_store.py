@@ -39,6 +39,7 @@ def _import_umbp_client():
     UMBPDurabilityMode = getattr(umbp_mod, "UMBPDurabilityMode", None)
     UMBPDistributedConfig = getattr(umbp_mod, "UMBPDistributedConfig", None)
     UMBPStandaloneProcessConfig = getattr(umbp_mod, "UMBPStandaloneProcessConfig", None)
+    UMBPDeploymentMode = getattr(umbp_mod, "UMBPDeploymentMode", None)
 
     return (
         UMBPClient,
@@ -48,6 +49,7 @@ def _import_umbp_client():
         UMBPDurabilityMode,
         UMBPDistributedConfig,
         UMBPStandaloneProcessConfig,
+        UMBPDeploymentMode,
     )
 
 
@@ -136,6 +138,10 @@ def _select_rank_config_value(
 # knobs outside this list go through the "spdk_passthrough" escape hatch.
 _COMMON_EXTRA_KEYS = frozenset(
     {
+        "node_address",
+        "node_id",
+        "node_tags",
+        "tags",
         "dram_capacity_bytes",
         "ssd_enabled",
         "ssd_storage_dir",
@@ -188,8 +194,6 @@ _STANDALONE_ONLY_EXTRA_KEYS = frozenset(
 _DISTRIBUTED_ONLY_EXTRA_KEYS = frozenset(
     {
         "master_address",
-        "node_address",
-        "node_id",
         "auto_heartbeat",
         "io_engine_host",
         "io_engine_port",
@@ -253,6 +257,7 @@ class UMBPStore(HiCacheStorage):
             UMBPDurabilityMode,
             UMBPDistributedConfig,
             UMBPStandaloneProcessConfig,
+            UMBPDeploymentMode,
         ) = _import_umbp_client()
 
         if storage_config is not None:
@@ -267,6 +272,7 @@ class UMBPStore(HiCacheStorage):
             self.pp_rank = 0
             self.pp_size = 1
             self.tp_size = 1
+        self._umbp_deployment_mode_enum = UMBPDeploymentMode
 
         cfg = UMBPConfig.from_environment()
         # UMBPStore owns role selection explicitly. Do not inherit LOCAL_RANK /
@@ -474,20 +480,64 @@ class UMBPStore(HiCacheStorage):
         master_address = extra.get(
             "master_address", _optional_env_str("UMBP_MASTER_ADDRESS")
         )
-        standalone_address = extra.get(
-            "standalone_address", _optional_env_str("UMBP_STANDALONE_ADDRESS")
-        )
+        standalone_extra_address = extra.get("standalone_address")
+        standalone_env_address = _optional_env_str("UMBP_STANDALONE_ADDRESS")
+        standalone_address = standalone_extra_address or standalone_env_address
+        # Verified after the client is built: a silent demotion to plain local
+        # mode would make every put fail with no error.
+        self._standalone_process_expected = bool(standalone_address)
         if master_address and standalone_address:
             raise ValueError(
                 "master_address and standalone_address are mutually exclusive "
                 "(distributed vs. standalone-process mode)."
             )
-        if standalone_address and mem_pool_host is not None:
+        if (
+            mem_pool_host is not None
+            and standalone_extra_address
+            and not standalone_env_address
+        ):
+            # The allocator picks Anonymous vs. AnonymousShm before this config
+            # is parsed, so with a host pool the address must come from the
+            # environment. The direct GPU connector has no host pool.
             raise ValueError(
-                "standalone-process mode with a host KV pool requires shared-memory "
-                "allocation support; this path is only enabled for the direct GPU "
-                "UMBP connector"
+                "standalone_address in hicache-storage-backend-extra-config is "
+                "not supported when a host KV pool is present. The host memory "
+                "pool allocator chooses Anonymous vs. AnonymousShm before "
+                "extra_config is parsed, so set UMBP_STANDALONE_ADDRESS in the "
+                "process environment instead."
             )
+
+        # Worker identity. Distributed puts it on master_config; a standalone
+        # server running a distributed backend needs the same values to build
+        # each worker's external-KV identity.
+        def _resolve_node_address() -> str:
+            node_address = extra.get(
+                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
+            )
+            if node_address is None:
+                return _default_node_address()
+            return _select_rank_config_value(
+                node_address, unique_rank, "node_address", str
+            )
+
+        def _resolve_node_id(node_address: str) -> str:
+            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
+            if node_id is None:
+                return (
+                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
+                    f":pp{self.pp_rank}:tp{self.local_rank}"
+                )
+            return _select_rank_config_value(node_id, unique_rank, "node_id", str)
+
+        def _resolve_node_tags() -> List[str]:
+            raw_tags = extra.get("node_tags", extra.get("tags"))
+            if raw_tags is None:
+                raw_tags = _optional_env_str("UMBP_NODE_TAGS")
+            if raw_tags is None:
+                return []
+            if isinstance(raw_tags, str):
+                return [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+            return [str(tag) for tag in raw_tags]
 
         _warn_extra_config_scope(extra, distributed_enabled=bool(master_address))
         if master_address and UMBPDistributedConfig is not None:
@@ -497,33 +547,11 @@ class UMBPStore(HiCacheStorage):
             if "ssd_copy_worker_threads" not in extra:
                 cfg.copy_pipeline.worker_threads = 1
 
-            node_address = extra.get(
-                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
-            )
-            if node_address is None:
-                node_address = _default_node_address()
-            else:
-                node_address = _select_rank_config_value(
-                    node_address,
-                    unique_rank,
-                    "node_address",
-                    str,
-                )
+            node_address = _resolve_node_address()
             dist_cfg.master_config.node_address = node_address
-
-            node_id = extra.get("node_id", _optional_env_str("UMBP_NODE_ID"))
-            if node_id is None:
-                dist_cfg.master_config.node_id = (
-                    f"{node_address}:dp{dp_rank_hint if dp_rank_hint is not None else 0}"
-                    f":pp{self.pp_rank}:tp{self.local_rank}"
-                )
-            else:
-                dist_cfg.master_config.node_id = _select_rank_config_value(
-                    node_id,
-                    unique_rank,
-                    "node_id",
-                    str,
-                )
+            dist_cfg.master_config.node_id = _resolve_node_id(node_address)
+            if hasattr(dist_cfg.master_config, "tags"):
+                dist_cfg.master_config.tags = _resolve_node_tags()
 
             if "auto_heartbeat" in extra:
                 dist_cfg.master_config.auto_heartbeat = _strict_bool(
@@ -614,14 +642,17 @@ class UMBPStore(HiCacheStorage):
                 # would over-count by the indexer buffer that is never put to UMBP).
                 dummy = torch.zeros(mem_pool_host.page_size, dtype=torch.int64)
                 if self.is_mla_backend:
-                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                    meta = mem_pool_host.get_page_buffer_meta(dummy)
                 elif storage_config is not None and getattr(
                     storage_config, "should_split_heads", False
                 ):
                     sf = storage_config.tp_lcm_size // storage_config.tp_size
-                    _, esz = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
+                    meta = mem_pool_host.get_split_heads_page_buffer_meta(dummy, sf)
                 else:
-                    _, esz = mem_pool_host.get_page_buffer_meta(dummy)
+                    meta = mem_pool_host.get_page_buffer_meta(dummy)
+                # A hybrid logical anchor returns None here by design; leave
+                # dram_page_size at 0 and let the per-pool v2 sizes handle it.
+                esz = meta[1] if meta else None
                 page_byte_size = int(esz[0]) if esz else 0
 
             if (
@@ -685,6 +716,21 @@ class UMBPStore(HiCacheStorage):
                 standalone_cfg.startup_timeout_ms = int(startup_timeout_ms)
             if standalone_cfg.startup_timeout_ms <= 0:
                 raise ValueError("standalone_startup_timeout_ms must be > 0")
+            if all(
+                hasattr(standalone_cfg, field)
+                for field in ("worker_node_address", "worker_node_id", "tags")
+            ):
+                worker_node_address = _resolve_node_address()
+                standalone_cfg.worker_node_address = worker_node_address
+                standalone_cfg.worker_node_id = _resolve_node_id(worker_node_address)
+                standalone_cfg.tags = _resolve_node_tags()
+            else:
+                logger.warning(
+                    "UMBPStore standalone-process mode: installed mori does not "
+                    "expose worker identity on UMBPStandaloneProcessConfig; a "
+                    "distributed-backed standalone server cannot build per-worker "
+                    "external-KV identities."
+                )
             cfg.standalone_process = standalone_cfg
             logger.info(
                 "UMBPStore standalone-process mode: address=%s, auto_start=%s, "
@@ -855,6 +901,9 @@ class UMBPStore(HiCacheStorage):
         # their side pools are registered independently through the v2 API.
         self.registered_pools: dict = {}
         self._kv_anchor_is_logical = False
+        # Storage base pointers already handed to register_memory(); views and
+        # pools sharing one allocation must not be registered twice.
+        self._registered_regions: set = set()
 
         self.client = UMBPClient(cfg)
         if mem_pool_host is not None:
@@ -941,32 +990,116 @@ class UMBPStore(HiCacheStorage):
         # v2 path below.
         self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
         self._zero_copy_registered = False
+
+        # Before the logical-anchor early return: register_mem_host_pool_v2()
+        # is driven by the hybrid controller and needs this already set.
+        self._is_standalone_process = False
+        if self.client is not None:
+            deployment_mode = None
+            mode_enum = self._umbp_deployment_mode_enum
+            try:
+                deployment_mode = self.client.get_deployment_mode()
+                if mode_enum is not None:
+                    self._is_standalone_process = (
+                        deployment_mode == mode_enum.StandaloneProcess
+                    )
+            except Exception as exc:
+                if self._standalone_process_expected:
+                    raise RuntimeError(
+                        "UMBPStore expected standalone-process mode from "
+                        "UMBP_STANDALONE_ADDRESS, but get_deployment_mode() failed."
+                    ) from exc
+            if self._standalone_process_expected:
+                if mode_enum is None:
+                    raise RuntimeError(
+                        "UMBPStore expected standalone-process mode, but "
+                        "UMBPDeploymentMode is not exposed by mori.umbp."
+                    )
+                if deployment_mode != mode_enum.StandaloneProcess:
+                    raise RuntimeError(
+                        "UMBPStore expected standalone-process mode, but the "
+                        f"UMBP client reported deployment_mode={deployment_mode!r}."
+                    )
+
         if self._kv_anchor_is_logical:
             return
 
-        # In distributed mode, pre-register the entire host KV buffer with the
-        # underlying RDMA IOEngine so PoolClient can take the zero-copy path
-        # for batch_get_into_ptr / batch_put_from_ptr (skips the staging
-        # buffer memcpy + lock and removes the per-call `staging_buffer_size`
-        # cap).  Standalone returns true as no-op by IUMBPClient contract;
-        # we still gate on is_distributed() below to avoid a pointless call.
+        # Pre-register so PoolClient can take the zero-copy path for
+        # batch_get_into_ptr / batch_put_from_ptr. Plain local mode skips it.
         self._zero_copy_registered = self._register_host_buffer_for_zero_copy(
             mem_pool_host
         )
 
+    @staticmethod
+    def _pool_physical_buffers(host_pool: HostKVCache) -> List[Any]:
+        """Every host tensor of a pool that UMBP must be able to reach.
+
+        Side pools do not all keep their data in `kv_buffer`: mamba pools expose
+        a temporal buffer plus one per conv layer, the DSA indexer pool exposes
+        `index_k_with_scale_buffer`, and a layer-first pool can hand back a list.
+        """
+        getter = getattr(host_pool, "get_hybrid_pool_buffer", None)
+        buffers = getter() if getter is not None else None
+        if not buffers:
+            buffers = [getattr(host_pool, "kv_buffer", None)]
+        flat: List[Any] = []
+        for buffer in buffers:
+            if buffer is None:
+                continue
+            for tensor in buffer if isinstance(buffer, (list, tuple)) else [buffer]:
+                # A conv-only mamba pool allocates an empty temporal buffer;
+                # key generation already skips it via temporal_state_elem_size,
+                # and register_memory would reject the zero-length region.
+                # Test numel, not storage bytes: an empty view can sit on a
+                # non-empty allocation.
+                if tensor is not None and tensor.numel() > 0:
+                    flat.append(tensor)
+        return flat
+
+    @staticmethod
+    def _buffer_extent(buffer, allocator) -> tuple:
+        """Registerable (base pointer, size) of the allocation behind a tensor."""
+        storage = buffer.untyped_storage()
+        base = int(storage.data_ptr())
+        size = int(storage.nbytes())
+        # Hugepage-backed mmaps are rounded up to the hugepage boundary, and
+        # ibv_reg_mr on AINIC / ROCm needs whole hugepages covered.
+        mapped_size_fn = getattr(allocator, "mapped_size_for", None)
+        mapped_size = (
+            mapped_size_fn(base)
+            if mapped_size_fn is not None
+            else getattr(allocator, "mapped_size", 0)
+        )
+        return base, max(size, int(mapped_size or 0))
+
     def _register_host_buffer_for_zero_copy(self, host_pool: HostKVCache) -> bool:
-        """Register one contiguous host pool with UMBP's RDMA engine."""
+        """Register a pool's host buffers for zero-copy transfers.
+
+        Distributed registers them with the RDMA IOEngine, standalone-process
+        with the long-lived server by shm fd handoff. Returns False on any
+        skip/failure so the caller falls back to the staging-buffer path --
+        except in standalone-process mode, which has no fallback and raises:
+        an unregistered pointer makes batch_put_from_ptr / batch_get_into_ptr
+        return all-false silently.
+        """
         if self.client is None:
             return False
+        is_standalone_process = getattr(self, "_is_standalone_process", False)
         try:
             is_distributed = bool(self.client.is_distributed())
         except Exception:
             is_distributed = False
-        if not is_distributed:
+        if not (is_distributed or is_standalone_process):
             return False
         if not hasattr(self.client, "register_memory"):
             return False
         if getattr(self, "_disable_zero_copy_register", False):
+            if is_standalone_process:
+                raise RuntimeError(
+                    "disable_zero_copy_register is not supported in UMBP "
+                    "standalone-process mode: there is no staging-buffer "
+                    "fallback path."
+                )
             logger.info(
                 "UMBPStore: skipping host KV buffer RDMA registration because "
                 "disable_zero_copy_register=true (UMBP_DISABLE_ZERO_COPY_REGISTER). "
@@ -974,47 +1107,61 @@ class UMBPStore(HiCacheStorage):
                 "size is capped by distributed.staging_buffer_size."
             )
             return False
-        kv_buffer = getattr(host_pool, "kv_buffer", None)
-        if kv_buffer is None:
+        buffers = self._pool_physical_buffers(host_pool)
+        if not buffers:
+            if is_standalone_process:
+                raise RuntimeError(
+                    f"UMBPStore: {type(host_pool).__name__} exposes no host buffer "
+                    "to register; standalone-process mode has no fallback path."
+                )
             return False
-        try:
-            host_ptr = int(kv_buffer.data_ptr())
-            host_size = int(kv_buffer.numel() * kv_buffer.element_size())
-            # When the buffer is backed by hugepages the mmap region is
-            # rounded up to the hugepage boundary.  RDMA ibv_reg_mr on
-            # some NICs (AINIC / ROCm) requires the registered region to
-            # cover complete hugepages, so use the full mapped_size
-            # instead of the logical tensor size.
-            allocator = getattr(host_pool, "allocator", None)
-            mapped_size_fn = getattr(allocator, "mapped_size_for", None)
-            if mapped_size_fn is not None:
-                mapped_size = mapped_size_fn(host_ptr)
-            else:
-                mapped_size = getattr(allocator, "mapped_size", 0)
-            if mapped_size > host_size:
-                host_size = mapped_size
-            ok = bool(self.client.register_memory(host_ptr, host_size))
-        except Exception as exc:
-            logger.warning(
-                "UMBPStore: register_memory failed (%s); falling back to staging "
-                "buffer path. Per-transfer size will be capped by "
-                "distributed.staging_buffer_size.",
-                exc,
-            )
-            return False
-        if ok:
+
+        mode = "standalone-process" if is_standalone_process else "distributed"
+        allocator = getattr(host_pool, "allocator", None)
+        # A buffer already in _registered_regions counts as covered, so calling
+        # this twice stays idempotent instead of reporting failure.
+        covered = 0
+        for buffer in buffers:
+            try:
+                host_ptr, host_size = self._buffer_extent(buffer, allocator)
+                if host_ptr in self._registered_regions:
+                    covered += 1
+                    continue
+                ok = bool(self.client.register_memory(host_ptr, host_size))
+            except Exception as exc:
+                if is_standalone_process:
+                    raise RuntimeError(
+                        "UMBPStore: register_memory failed in standalone-process "
+                        f"mode and cannot fall back: {exc}"
+                    ) from exc
+                logger.warning(
+                    "UMBPStore: register_memory failed (%s); falling back to staging "
+                    "buffer path. Per-transfer size will be capped by "
+                    "distributed.staging_buffer_size.",
+                    exc,
+                )
+                return False
+            if not ok:
+                if is_standalone_process:
+                    raise RuntimeError(
+                        "UMBPStore: register_memory returned false in "
+                        "standalone-process mode; no fallback path exists."
+                    )
+                logger.warning(
+                    "UMBPStore: register_memory returned false; staying on staging "
+                    "buffer fallback path."
+                )
+                return False
+            self._registered_regions.add(host_ptr)
+            covered += 1
             logger.info(
-                "UMBPStore: registered host KV buffer for RDMA zero-copy "
-                "(ptr=0x%x, size=%d MB)",
+                "UMBPStore: registered host buffer for zero-copy "
+                "(ptr=0x%x, size=%d MB, mode=%s)",
                 host_ptr,
                 host_size // (1024 * 1024),
+                mode,
             )
-            return True
-        logger.warning(
-            "UMBPStore: register_memory returned false; staying on staging "
-            "buffer fallback path."
-        )
-        return False
+        return covered == len(buffers)
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
