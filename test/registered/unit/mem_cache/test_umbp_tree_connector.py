@@ -38,6 +38,20 @@ class _DeploymentMode(Enum):
     Distributed = 2
 
 
+def _assert_page_pointers_match_views(test, entry, indices):
+    """Verify precomputed row pointers against tensor-view data pointers."""
+    pointers, _ = entry.get_page_buffer_meta(indices)
+    test.assertEqual(
+        pointers,
+        [
+            buffer[row].data_ptr()
+            for row in entry.prepare_locations(indices)
+            for component in entry.components
+            for buffer in component
+        ],
+    )
+
+
 class TestUMBPTreeConnector(unittest.TestCase):
     page_size = 2
     num_layers = 3
@@ -98,10 +112,25 @@ class TestUMBPTreeConnector(unittest.TestCase):
             )
         )
 
+        self.freeze_gc_patcher = patch(
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.freeze_gc"
+        )
+        self.freeze_gc_mock = self.freeze_gc_patcher.start()
+        self.addCleanup(self.freeze_gc_patcher.stop)
+        self.event_patcher = patch(
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.device_module.Event",
+            side_effect=lambda: SimpleNamespace(
+                record=lambda: None, synchronize=lambda: None
+            ),
+        )
+        self.event_patcher.start()
+        self.addCleanup(self.event_patcher.stop)
+
         self.server_args = SimpleNamespace(
             hicache_storage_backend_extra_config=None,
             tp_size=1,
             model_path="test-model",
+            unified_tree_connector_load_strategy="layer_wise",
         )
         self.params = SimpleNamespace(
             page_size=self.page_size,
@@ -119,11 +148,14 @@ class TestUMBPTreeConnector(unittest.TestCase):
         for connector in self.connectors:
             connector.close()
 
-    def make_connector(self, extra_config=None, pool_group=None):
+    def make_connector(
+        self, extra_config=None, pool_group=None, load_strategy="layer_wise"
+    ):
         pool_group = pool_group or self.pool_group
         self.server_args.hicache_storage_backend_extra_config = (
             json.dumps(extra_config) if extra_config is not None else None
         )
+        self.server_args.unified_tree_connector_load_strategy = load_strategy
         with (
             patch(
                 "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._resolve_umbp_pool_group",
@@ -185,6 +217,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.assertEqual(transfer.keys, source.keys)
             self.assertTrue(torch.equal(transfer.host_indices, source.device_indices))
             self.assertIsNone(transfer.indices_from_pool)
+            _assert_page_pointers_match_views(
+                self, connector.pools[transfer.name], transfer.host_indices
+            )
 
     def test_resolver_accepts_deepseek_v4_pool(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -236,6 +271,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(
             _ordered_layers(group.entry_map[PoolName.DEEPSEEK_V4_C4]), [2, 0]
         )
+        probe = torch.arange(self.page_size, dtype=torch.int64)
+        for entry in group.entry_map.values():
+            _assert_page_pointers_match_views(self, entry, probe)
 
     def test_hybrid_linear_component_keys_match_qwen_and_kimi_layouts(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
@@ -269,6 +307,13 @@ class TestUMBPTreeConnector(unittest.TestCase):
             mamba,
             ["page_tp0_cp0_pp0_temporal", "page_tp0_cp0_pp0_conv_0"],
         )
+
+    def test_hybrid_linear_page_pointers_match_tensor_views(self):
+        probe = torch.arange(self.page_size, dtype=torch.int64)
+        for use_mla in (False, True):
+            group, _ = self._hybrid_linear_pool_group(use_mla=use_mla)
+            for entry in group.entry_map.values():
+                _assert_page_pointers_match_views(self, entry, probe)
 
     def test_connector_registers_mamba_layer_counter(self):
         pool_group, _ = self._hybrid_linear_pool_group(use_mla=False)
@@ -604,10 +649,28 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(seen, expected)
 
     def test_offload_success_produces_exactly_one_result(self):
-        connector = self.make_connector()
+        event_calls = []
 
-        self.assertTrue(connector.offload([self.transfer(pages=1)]))
-        self.wait_for_offloads(connector)
+        class _Event:
+            def record(self):
+                event_calls.append("record")
+
+            def synchronize(self):
+                event_calls.append("synchronize")
+
+        def put_after_event(keys, ptrs, sizes):
+            self.assertEqual(event_calls, ["record", "synchronize"])
+            return [True] * len(keys)
+
+        self.client.batch_put_from_ptr.side_effect = put_after_event
+        with patch(
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.device_module.Event",
+            _Event,
+        ):
+            connector = self.make_connector()
+
+            self.assertTrue(connector.offload([self.transfer(pages=1)]))
+            self.wait_for_offloads(connector)
 
         self.assertEqual(connector.num_completed_offloads(), 1)
         self.assertTrue(connector.pop_completed_offload())
@@ -625,7 +688,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertFalse(connector.pop_completed_offload())
         self.assertEqual(connector.num_completed_offloads(), 0)
 
-    def test_offload_exception_produces_exactly_one_false_result(self):
+    def test_offload_exceptions_produce_exactly_one_false_result(self):
         self.client.batch_put_from_ptr.side_effect = RuntimeError("put failed")
         connector = self.make_connector()
 
@@ -635,6 +698,29 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(connector.num_completed_offloads(), 1)
         self.assertFalse(connector.pop_completed_offload())
         self.assertEqual(connector.num_completed_offloads(), 0)
+
+        class _FailingEvent:
+            def record(self):
+                pass
+
+            def synchronize(self):
+                raise RuntimeError("event failed")
+
+        self.client.batch_put_from_ptr.reset_mock()
+        self.client.batch_put_from_ptr.side_effect = lambda keys, ptrs, sizes: [
+            True
+        ] * len(keys)
+        with patch(
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.device_module.Event",
+            _FailingEvent,
+        ):
+            connector = self.make_connector()
+            self.assertTrue(connector.offload([self.transfer(pages=1)]))
+            self.wait_for_offloads(connector)
+
+        self.assertEqual(connector.num_completed_offloads(), 1)
+        self.assertFalse(connector.pop_completed_offload())
+        self.client.batch_put_from_ptr.assert_not_called()
 
     def test_offload_results_are_fifo(self):
         def result_for_key(keys, ptrs, sizes):
@@ -788,6 +874,91 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.client.batch_get_into_ptr.call_count,
             self.num_layers * len(self.pools),
         )
+
+    def test_prefetch_loads_synchronously_on_worker(self):
+        caller_thread = threading.get_ident()
+        worker_threads = []
+
+        def record_worker(keys, ptrs, sizes):
+            worker_threads.append(threading.get_ident())
+            return [True] * len(keys)
+
+        self.client.batch_get_into_ptr.side_effect = record_worker
+        connector = self.make_connector(load_strategy="prefetch")
+        connector.layer_done_counter.update_producer = MagicMock(
+            wraps=connector.layer_done_counter.update_producer
+        )
+
+        self.assertTrue(connector.load("rid", [self.transfer(pages=3)]))
+
+        self.assertTrue(worker_threads)
+        self.assertEqual(set(worker_threads), {connector._load_thread.ident})
+        self.assertNotEqual(worker_threads[0], caller_thread)
+        self.assertFalse(connector._pending)
+        self.assertEqual(connector.start_layer_wise_loading(), -1)
+        connector.layer_done_counter.update_producer.assert_not_called()
+        self.assertEqual(connector._stats["load"], 1)
+        self.freeze_gc_mock.assert_called_once_with("UMBP connector")
+
+    def test_prefetch_chunks_aligned_object_triples_once(self):
+        connector = self.make_connector(load_strategy="prefetch")
+        transfer = self.transfer(pages=7)
+        expanded = connector.pool_group.resolve_transfers([transfer])
+        plans = connector._build_load_plans([expanded])
+        expected = [
+            triple for plan in plans for triple in zip(plan.keys, plan.ptrs, plan.sizes)
+        ]
+
+        with patch(
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
+            2,
+        ):
+            self.assertTrue(connector.load("rid", [transfer]))
+
+        calls = self.client.batch_get_into_ptr.call_args_list
+        actual = [
+            triple
+            for call in calls
+            for triple in zip(call.args[0], call.args[1], call.args[2])
+        ]
+        self.assertEqual(actual, expected)
+        self.assertEqual([len(call.args[0]) for call in calls], [6, 6, 6, 3] * 2)
+
+    def test_prefetch_failure_paths_finish_or_fail_before_enqueue(self):
+        self.client.batch_get_into_ptr.side_effect = lambda keys, ptrs, sizes: [
+            False
+        ] * len(keys)
+        connector = self.make_connector(load_strategy="prefetch")
+        self.assertFalse(connector.load("false", [self.transfer(pages=1)]))
+
+        self.client.batch_get_into_ptr.side_effect = RuntimeError("get failed")
+        connector = self.make_connector(load_strategy="prefetch")
+        self.assertFalse(connector.load("error", [self.transfer(pages=1)]))
+        self.assertTrue(connector._load_thread.is_alive())
+
+        self.client.batch_get_into_ptr.side_effect = lambda keys, ptrs, sizes: [
+            True
+        ] * len(keys)
+        connector = self.make_connector(load_strategy="prefetch")
+        with patch.object(
+            connector, "_build_load_plans", side_effect=ValueError("bad metadata")
+        ):
+            with self.assertRaisesRegex(ValueError, "bad metadata"):
+                connector.load("metadata", [self.transfer(pages=1)])
+        self.assertTrue(connector._load_queue.empty())
+
+    def test_load_and_offload_share_one_gc_freeze(self):
+        self.freeze_gc_mock.reset_mock()
+        connector = self.make_connector()
+
+        self.assertTrue(connector.load("rid", [self.transfer(pages=1)]))
+        counter = connector.start_layer_wise_loading()
+        connector.layer_done_counter.set_consumer(counter)
+        connector.layer_done_counter.wait_until(self.num_layers - 1)
+        self.assertTrue(connector.offload([self.transfer(pages=1)]))
+        self.wait_for_offloads(connector)
+
+        self.freeze_gc_mock.assert_called_once_with("UMBP connector")
 
     def test_background_load_uses_full_object_budget_per_call(self):
         connector = self.make_connector()

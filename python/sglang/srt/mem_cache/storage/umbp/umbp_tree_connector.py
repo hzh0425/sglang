@@ -23,8 +23,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
+from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; object batches contain CHUNK_PAGES * layers.
@@ -317,20 +319,24 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             self.storage.close()
             raise
 
+        self.load_strategy = server_args.unified_tree_connector_load_strategy
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
-        self._load_queue: Queue[tuple[int, list[_LayerObjectPlan]] | None] = Queue()
-        self._offload_queue: Queue[list[PoolTransfer] | None] = Queue()
+        self._gc_frozen = False
+        self._load_queue: Queue[tuple[int | Future, list[_LayerObjectPlan]] | None] = (
+            Queue()
+        )
+        self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._stats = {"lookup": 0, "load": 0, "offload": 0}
         self._load_thread = threading.Thread(
             target=self._load_thread_func,
             daemon=True,
-            name=f"umbp-layerwise-tp{tp_rank}",
+            name=f"umbp-{self.load_strategy}-tp{tp_rank}",
         )
         self._offload_thread = threading.Thread(
             target=self._offload_thread_func,
@@ -457,6 +463,14 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return False
+        if self.load_strategy == "prefetch":
+            self._freeze_gc_once()
+            plans = self._build_load_plans([expanded])
+            completed = Future()
+            self._load_queue.put((completed, plans))
+            success = completed.result()
+            self._stats["load"] += 1
+            return success
         if rid in self._pending:
             raise RuntimeError(f"UMBP load for rid={rid} is already queued.")
         self._pending[rid] = expanded
@@ -468,6 +482,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     def start_layer_wise_loading(self) -> int:
         if not self._pending:
             return -1
+        self._freeze_gc_once()
         pending = self._pending
         self._pending = {}
         plans = self._build_load_plans(list(pending.values()))
@@ -546,10 +561,45 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
-                counter_index, plans = task
-                self._run_layer_wise_batch(counter_index, plans)
+                completion, plans = task
+                if isinstance(completion, Future):
+                    try:
+                        success = self._run_prefetch_batch(plans)
+                    except BaseException:
+                        logger.exception("UMBP prefetch load failed")
+                        success = False
+                    completion.set_result(success)
+                else:
+                    self._run_layer_wise_batch(completion, plans)
             finally:
                 self._load_queue.task_done()
+
+    def _run_prefetch_batch(self, plans: list[_LayerObjectPlan]) -> bool:
+        max_objects_per_call = CHUNK_PAGES * self.num_layers
+        for plan in plans:
+            for start in range(0, len(plan.keys), max_objects_per_call):
+                end = start + max_objects_per_call
+                chunk_keys = plan.keys[start:end]
+                results = list(
+                    self.storage.client.batch_get_into_ptr(
+                        chunk_keys,
+                        plan.ptrs[start:end],
+                        plan.sizes[start:end],
+                    )
+                )
+                if len(results) != len(chunk_keys) or not all(results):
+                    logger.warning(
+                        "UMBP prefetch load failed: pool=%s "
+                        "object_range=[%d,%d) success=%d/%d returned=%d",
+                        plan.name,
+                        start,
+                        min(end, len(plan.keys)),
+                        sum(bool(value) for value in results),
+                        len(chunk_keys),
+                        len(results),
+                    )
+                    return False
+        return True
 
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_LayerObjectPlan]
@@ -591,7 +641,10 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
-        self._offload_queue.put(expanded)
+        self._freeze_gc_once()
+        ready_event = device_module.Event()
+        ready_event.record()
+        self._offload_queue.put((expanded, ready_event))
         return True
 
     def _offload_thread_func(self) -> None:
@@ -600,8 +653,9 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
+                expanded, ready_event = task
                 try:
-                    success = self._run_offload(task)
+                    success = self._run_offload(expanded, ready_event)
                 except BaseException:
                     logger.exception("UMBP offload failed")
                     success = False
@@ -609,8 +663,8 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             finally:
                 self._offload_queue.task_done()
 
-    def _run_offload(self, expanded: list[PoolTransfer]) -> bool:
-        self._wait_for_device()
+    def _run_offload(self, expanded: list[PoolTransfer], ready_event: object) -> bool:
+        ready_event.synchronize()
         for transfer in expanded:
             keys, component_count = self._object_keys_for_pages(
                 list(transfer.keys or []), transfer
@@ -651,24 +705,17 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self._stats["offload"] += 1
         return True
 
+    def _freeze_gc_once(self) -> None:
+        if self._gc_frozen:
+            return
+        freeze_gc("UMBP connector")
+        self._gc_frozen = True
+
     def num_completed_offloads(self) -> int:
         return self._offload_results.qsize()
 
     def pop_completed_offload(self) -> bool:
         return self._offload_results.get_nowait()
-
-    def _wait_for_device(self) -> None:
-        device = next(
-            (
-                buffer.device
-                for pool in self.pools.values()
-                for buffer in pool.get_hybrid_pool_buffer()
-                if buffer.device.type == "cuda"
-            ),
-            None,
-        )
-        if device is not None:
-            torch.cuda.synchronize(device)
 
     def reset(self) -> None:
         self._pending.clear()
