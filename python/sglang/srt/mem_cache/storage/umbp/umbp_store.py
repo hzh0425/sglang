@@ -1400,10 +1400,21 @@ class UMBPStore(HiCacheStorage):
         elif components is not None and len(components) == 1:
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
         elif components is not None and len(components) == 2:
-            suffixes = [
-                f"_{self.mha_suffix}_{pool_name}_k",
-                f"_{self.mha_suffix}_{pool_name}_v",
-            ]
+            # These branches serve the tree connector, whose pools are
+            # DevicePoolEntry. One key must name one stored object, and a
+            # packed entry puts both components of a page in a single object --
+            # emitting a k/v pair there would hand `batch_*_ranges` twice as
+            # many keys as range entries and shift every range by one object.
+            # Mooncake reaches the same layout by giving PoolName.KV a single
+            # suffix unconditionally.
+            suffixes = (
+                [f"_{self.mha_suffix}_{pool_name}"]
+                if host_pool.packed
+                else [
+                    f"_{self.mha_suffix}_{pool_name}_k",
+                    f"_{self.mha_suffix}_{pool_name}_v",
+                ]
+            )
         elif components is not None:
             raise ValueError(
                 f"Unsupported UMBP component count for pool {pool_name}: "
