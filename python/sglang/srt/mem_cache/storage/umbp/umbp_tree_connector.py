@@ -315,6 +315,21 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             raise
 
         self.load_strategy = server_args.unified_tree_connector_load_strategy
+        # How many consecutive layers one load RPC covers. An object is named
+        # on the wire once per call, so a group of G amortizes the per-object
+        # cost -- key transmission, key hashing, and the nested per-object
+        # vectors the server rebuilds -- across G layers, at the price of
+        # releasing layers to the forward pass G at a time. That cost dominates
+        # under concurrency: measured server-side, resolving keys to slots is
+        # 21% of a read batch while the copy itself is 74%, and 8 concurrent
+        # 32K restores spend ~2.5 ms of a 3 ms RPC outside the tier entirely.
+        #
+        # 8 is the measured optimum on both models and in both regimes, and the
+        # curve is flat enough on either side that one constant serves both:
+        # DeepSeek-V4 8-way at 32K goes 617 -> 404 ms from 1 to 8 and back up to
+        # 453 at 32, GLM-5.1 4-way goes 1332 -> 822. Past the optimum the
+        # coarser release starts to cost more than the amortization saves.
+        self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -587,6 +602,45 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         return ptrs, sizes, offsets
 
     @staticmethod
+    def _plans_covering(
+        by_layer: dict[int, list[_PoolRangePlan]], group: list[int]
+    ) -> list[_PoolRangePlan]:
+        """Plans touching any layer of the group, each listed once, in order."""
+        seen: set[int] = set()
+        plans = []
+        for logical_layer in group:
+            for plan in by_layer.get(logical_layer, ()):
+                if id(plan) in seen:
+                    continue
+                seen.add(id(plan))
+                plans.append(plan)
+        return plans
+
+    def _layer_group_ranges(self, plan: _PoolRangePlan, layers: list[int]):
+        """One group of layers' ranges, accumulated per object.
+
+        `_all_layer_ranges` for a slice of the layer stack. Returns None when
+        this pool covers none of the group, so the caller can skip the call.
+        """
+        ptrs: list[list[int]] = [[] for _ in plan.keys]
+        sizes: list[list[int]] = [[] for _ in plan.keys]
+        offsets: list[list[int]] = [[] for _ in plan.keys]
+        covered = 0
+        for logical_layer in layers:
+            meta = self._layer_ranges(plan, logical_layer)
+            if meta is None:
+                continue
+            covered += 1
+            layer_ptrs, layer_sizes, layer_offsets = meta
+            for index in range(len(plan.keys)):
+                ptrs[index].extend(layer_ptrs[index])
+                sizes[index].extend(layer_sizes[index])
+                offsets[index].extend(layer_offsets[index])
+        if covered == 0:
+            return None
+        return ptrs, sizes, offsets
+
+    @staticmethod
     def _entries_per_call(sizes: list[list[int]]) -> int:
         """Objects per RPC, budgeted by the ranges they actually carry.
 
@@ -636,9 +690,15 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 for logical_layer in self.pool_layers[plan.name]:
                     by_layer[logical_layer].append(plan)
 
-            for logical_layer in range(self.num_layers):
-                for plan in by_layer.get(logical_layer, ()):
-                    meta = self._layer_ranges(plan, logical_layer)
+            for group_start in range(0, self.num_layers, self.layer_group):
+                group = list(
+                    range(
+                        group_start,
+                        min(group_start + self.layer_group, self.num_layers),
+                    )
+                )
+                for plan in self._plans_covering(by_layer, group):
+                    meta = self._layer_group_ranges(plan, group)
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
@@ -655,13 +715,21 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                             )
                         )
                         if len(results) != len(chunk_keys) or not all(results):
+                            where = (
+                                f"layer={group[0]}"
+                                if len(group) == 1
+                                else f"layers={group[0]}..{group[-1]}"
+                            )
                             raise RuntimeError(
-                                f"UMBP get failed for pool={plan.name}, "
-                                f"layer={logical_layer}: "
+                                f"UMBP get failed for pool={plan.name}, {where}: "
                                 f"success={sum(bool(value) for value in results)}/"
                                 f"{len(chunk_keys)}."
                             )
-                self.layer_done_counter.complete(counter_index, logical_layer)
+                # Only now is every layer in the group readable, so they are
+                # released together. A group wider than 1 trades overlap
+                # granularity for fewer times each object is named on the wire.
+                for logical_layer in group:
+                    self.layer_done_counter.complete(counter_index, logical_layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("UMBP layer-wise load batch failed")

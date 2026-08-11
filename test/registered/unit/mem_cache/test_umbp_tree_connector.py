@@ -511,6 +511,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
     def test_layerwise_load_completes_logical_layers_without_objects(self):
         connector = UMBPTreeConnector.__new__(UMBPTreeConnector)
         connector.num_layers = 3
+        connector.layer_group = 1
         connector.pool_layers = {PoolName.KV: [0, 2]}
         connector.storage = self.storage
         connector._trace_perf = False
@@ -926,6 +927,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
     def test_background_load_completes_each_layer(self):
         connector = self.make_connector()
+        # The finest granularity, one call per layer. Grouping is covered by
+        # test_layer_group_folds_layers_into_one_call_per_object.
+        connector.layer_group = 1
         self.assertTrue(connector.load("rid", [self.transfer(pages=3)]))
         counter = connector.start_layer_wise_loading()
         connector.layer_done_counter.set_consumer(counter)
@@ -1029,6 +1033,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
     def test_background_load_uses_full_object_budget_per_call(self):
         connector = self.make_connector()
+        connector.layer_group = 1
         self.assertTrue(connector.load("rid", [self.transfer(pages=7)]))
         # Layer-wise puts a single range on an object, so a budget of 2 ranges
         # is a budget of 2 objects.
@@ -1062,6 +1067,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         dominated the restore.
         """
         connector = self.make_connector()
+        connector.layer_group = 1  # the budget, not the group, is under test
         pages = 7
         self.assertTrue(connector.load("rid", [self.transfer(pages=pages)]))
         counter = connector.start_layer_wise_loading()
@@ -1073,8 +1079,67 @@ class TestUMBPTreeConnector(unittest.TestCase):
         for call in calls:
             self.assertEqual(len(call.args[0]), pages)
 
+    def test_layer_group_folds_layers_into_one_call_per_object(self):
+        """A group of G layers must cost one call, not G, and still release all G.
+
+        Naming an object on the wire is what a load pays per call -- key bytes,
+        key hashing, and the per-object vectors the server rebuilds -- and under
+        concurrency that is most of the RPC. Grouping amortizes it, but only if
+        every layer in the group still completes: the forward pass waits on each
+        one individually.
+        """
+        connector = self.make_connector()
+        group = 2
+        connector.layer_group = group
+        pages = 3
+        self.assertTrue(connector.load("rid", [self.transfer(pages=pages)]))
+        counter = connector.start_layer_wise_loading()
+        connector.layer_done_counter.set_consumer(counter)
+        # Completing every layer is the property the forward thread depends on;
+        # waiting on the last one would hang if any were skipped.
+        for layer in range(self.num_layers):
+            connector.layer_done_counter.wait_until(layer)
+
+        # 3 layers in groups of 2 is a ragged split, [0,1] then [2], which is
+        # the normal case: no model's layer count divides by the group size.
+        group_sizes = [
+            min(group, self.num_layers - start)
+            for start in range(0, self.num_layers, group)
+        ]
+        self.assertEqual(group_sizes, [2, 1])
+        calls = self.client.batch_get_ranges_into_ptr.call_args_list
+        self.assertEqual(len(calls), len(group_sizes) * len(self.pools))
+        for call, expected_ranges in zip(
+            calls, [size for size in group_sizes for _ in self.pools]
+        ):
+            self.assertEqual(len(call.args[0]), pages)
+            for ranges in call.args[1]:
+                self.assertEqual(len(ranges), expected_ranges)
+
+    def test_layer_group_reads_the_same_bytes_as_ungrouped(self):
+        """Grouping must not disturb which range lands at which pointer."""
+        connector = self.make_connector()
+        transfer = self.transfer(pages=3)
+
+        def ranges_for(layer_group):
+            self.client.batch_get_ranges_into_ptr.reset_mock()
+            connector.layer_group = layer_group
+            self.assertTrue(connector.load(f"rid{layer_group}", [transfer]))
+            counter = connector.start_layer_wise_loading()
+            connector.layer_done_counter.set_consumer(counter)
+            connector.layer_done_counter.wait_until(self.num_layers - 1)
+            triples = set()
+            for call in self.client.batch_get_ranges_into_ptr.call_args_list:
+                for key, ptrs, sizes, offsets in zip(*call.args[:4]):
+                    triples.update(zip([key] * len(ptrs), ptrs, sizes, offsets))
+            return triples
+
+        self.assertEqual(ranges_for(2), ranges_for(1))
+
     def test_background_load_failure_reaches_consumer(self):
         connector = self.make_connector()
+        # One call per layer, so the failure names a single layer.
+        connector.layer_group = 1
         call_index = 0
 
         def fail_second_layer(keys, *args):
