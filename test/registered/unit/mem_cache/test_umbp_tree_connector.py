@@ -17,10 +17,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolGroup,
 )
 from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
+    RANGES_PER_CALL,
     LayerWiseLoadCounter,
     UMBPTreeConnector,
-    _LayerObjectPlan,
+    _object_sizes_per_page,
     _ordered_layers,
+    _PoolRangePlan,
     _resolve_umbp_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
@@ -92,15 +94,15 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.client = MagicMock()
         self.client.is_distributed.return_value = True
-        self.client.get_deployment_mode.return_value = _DeploymentMode.Distributed
+        self.client.get_deployment_mode.return_value = _DeploymentMode.StandaloneProcess
         self.client.register_memory.return_value = True
         self.client.batch_exists.side_effect = lambda keys: [True] * len(keys)
-        self.client.batch_put_from_ptr.side_effect = lambda keys, ptrs, sizes: (
-            [True] * len(keys)
-        )
-        self.client.batch_get_into_ptr.side_effect = lambda keys, ptrs, sizes: (
-            [True] * len(keys)
-        )
+        self.client.batch_put_ranges_from_ptr.side_effect = lambda keys, *args: [
+            True
+        ] * len(keys)
+        self.client.batch_get_ranges_into_ptr.side_effect = lambda keys, *args: [
+            True
+        ] * len(keys)
 
         self.storage = MagicMock()
         self.storage.client = self.client
@@ -191,20 +193,32 @@ class TestUMBPTreeConnector(unittest.TestCase):
         transfer = connector.pool_group.resolve_transfers([self.transfer(pages=2)])[0]
 
         keys = connector._object_keys(transfer)
-        ptrs, sizes = connector.pools[transfer.name].get_page_buffer_meta(
-            transfer.host_indices
-        )
+        entry = connector.pools[transfer.name]
+        locations = entry.prepare_locations(transfer.host_indices)
 
-        self.assertEqual(
-            keys,
-            [
-                f"page-{page}_rank_kv_L{layer}"
-                for page in range(2)
-                for layer in range(self.num_layers)
-            ],
-        )
-        self.assertEqual(len(keys), len(ptrs))
-        self.assertEqual(len(keys), len(sizes))
+        # One object per page now; the layer lives inside it as a byte range.
+        self.assertEqual(keys, [f"page-{page}_rank_kv" for page in range(2)])
+
+        # `batch_*_ranges` pairs keys with range entries positionally, so the
+        # two must stay the same length for every layer. A mismatch here is the
+        # shape that silently shifts every range by one object.
+        for layer in range(self.num_layers):
+            ptrs, sizes, offsets = entry.get_prepared_layer_range_meta(locations, layer)
+            self.assertEqual(len(ptrs), len(keys))
+            self.assertEqual(len(sizes), len(keys))
+            self.assertEqual(len(offsets), len(keys))
+
+        # Offsets must tile the object exactly, in layer order, and the object
+        # size the connector declares must match that tiling -- deriving it
+        # from the emitted ranges instead would hide a dropped trailing layer.
+        per_page = _object_sizes_per_page(entry)
+        self.assertEqual(len(per_page), 1)
+        cursor = 0
+        for layer in range(self.num_layers):
+            _, sizes, offsets = entry.get_prepared_layer_range_meta(locations, layer)
+            self.assertEqual(offsets[0], [cursor])
+            cursor += sizes[0][0]
+        self.assertEqual(cursor, per_page[0])
 
     def test_dsa_transfer_resolution_matches_legacy_expansion(self):
         connector = self.make_connector()
@@ -295,11 +309,13 @@ class TestUMBPTreeConnector(unittest.TestCase):
         kimi_kv, kimi_multiplier = keys_for(kimi_group, PoolName.KV)
         mamba, mamba_multiplier = keys_for(qwen_group, PoolName.MAMBA)
 
-        self.assertEqual(qwen_multiplier, 2)
-        self.assertEqual(
-            qwen_kv,
-            ["page_tp0_cp0_pp0_kv_k", "page_tp0_cp0_pp0_kv_v"],
-        )
+        # Qwen's KV pool has separate k and v buffers, but the entry is packed,
+        # so a page is one object and gets one key -- same layout Mooncake
+        # reaches by giving PoolName.KV a single suffix unconditionally. MAMBA
+        # is the one entry built with packed=False, so it keeps one key per
+        # component.
+        self.assertEqual(qwen_multiplier, 1)
+        self.assertEqual(qwen_kv, ["page_tp0_cp0_pp0_kv"])
         self.assertEqual(kimi_multiplier, 1)
         self.assertEqual(kimi_kv, ["page_tp0_cp0_pp0_kv"])
         self.assertEqual(mamba_multiplier, 2)
@@ -307,6 +323,29 @@ class TestUMBPTreeConnector(unittest.TestCase):
             mamba,
             ["page_tp0_cp0_pp0_temporal", "page_tp0_cp0_pp0_conv_0"],
         )
+
+    def test_range_budget_counts_ranges_not_layers(self):
+        """The per-RPC budget is in ranges, so it must be read off the ranges.
+
+        A packed pool with two components puts two ranges on an object per
+        layer, so deriving the budget from the layer count would overshoot it by
+        the component count and could push a long-context request past gRPC's
+        message limit. Qwen's KV pool is exactly that shape: separate k and v
+        buffers, one packed object.
+        """
+        group, _ = self._hybrid_linear_pool_group(use_mla=False)
+        entry = group.entry_map[PoolName.KV]
+        self.assertTrue(entry.packed)
+        self.assertEqual(len(entry.components), 2)
+
+        layer = next(iter(entry.layer_mapping))
+        _, sizes, _ = entry.get_prepared_layer_range_meta([0, 1], layer=layer)
+        # One layer, one packed object: two ranges, not one.
+        self.assertEqual([len(entry_sizes) for entry_sizes in sizes], [2, 2])
+
+        budget = UMBPTreeConnector._entries_per_call(sizes)
+        self.assertEqual(budget, RANGES_PER_CALL // 2)
+        self.assertLessEqual(budget * len(sizes[0]), RANGES_PER_CALL)
 
     def test_hybrid_linear_page_pointers_match_tensor_views(self):
         probe = torch.arange(self.page_size, dtype=torch.int64)
@@ -365,23 +404,33 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.assertEqual(
             kv_keys,
-            ["page_tp0_cp0_pp0_kv_k_L3", "page_tp0_cp0_pp0_kv_v_L3"],
+            ["page_tp0_cp0_pp0_kv"],
         )
-        self.assertEqual((len(kv_keys), len(kv_ptrs), len(kv_sizes)), (2, 2, 2))
+        del kv_ptrs, kv_sizes
         self.assertEqual(
             mamba_keys,
             [
-                "page_tp0_cp0_pp0_temporal_L0",
-                "page_tp0_cp0_pp0_temporal_L1",
-                "page_tp0_cp0_pp0_temporal_L2",
-                "page_tp0_cp0_pp0_conv_0_L0",
-                "page_tp0_cp0_pp0_conv_0_L1",
-                "page_tp0_cp0_pp0_conv_0_L2",
+                "page_tp0_cp0_pp0_temporal",
+                "page_tp0_cp0_pp0_conv_0",
             ],
         )
-        self.assertEqual(
-            (len(mamba_keys), len(mamba_ptrs), len(mamba_sizes)), (6, 6, 6)
-        )
+        del mamba_ptrs, mamba_sizes
+        # MAMBA is the one pool built with packed=False, so it keeps one object
+        # per component. Both pools must still pair one key to one range entry
+        # per layer -- that equality is what `batch_*_ranges` relies on.
+        for name in (PoolName.KV, PoolName.MAMBA):
+            entry = connector.pools[name]
+            locations = entry.prepare_locations(by_name[name].host_indices)
+            keys = connector._object_keys(by_name[name])
+            self.assertEqual(
+                len(keys),
+                len(locations) * (1 if entry.packed else len(entry.components)),
+            )
+            for layer in connector.pool_layers[name]:
+                meta = entry.get_prepared_layer_range_meta(locations, layer)
+                if meta is None:
+                    continue
+                self.assertEqual(len(meta[0]), len(keys))
 
     def _hybrid_linear_pool_group(self, *, use_mla):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -449,25 +498,36 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         plans = connector._build_load_plans([[kv_transfer, indexer_transfer]])
 
+        # One object per page per pool, and the rows the ranges are built from
+        # must stay in step with the keys.
         self.assertEqual(
-            {plan.name: plan.logical_pages for plan in plans},
+            {plan.name: len(plan.keys) for plan in plans},
             {PoolName.KV: 2, PoolName.INDEXER: 1},
         )
+        for plan in plans:
+            self.assertEqual(plan.entries_per_page, 1)
+            self.assertEqual(len(plan.locations), len(plan.keys))
 
     def test_layerwise_load_completes_logical_layers_without_objects(self):
         connector = UMBPTreeConnector.__new__(UMBPTreeConnector)
         connector.num_layers = 3
         connector.pool_layers = {PoolName.KV: [0, 2]}
         connector.storage = self.storage
+        connector._trace_perf = False
+        connector._traced = 0
+        connector._trace_budget = 0
+        connector._lookup_traced = 0
+        connector._start_traced = 0
+        connector._exists_build_ms = 0.0
+        connector._exists_rpc_ms = 0.0
+        connector._exists_keys = 0
         connector.layer_done_counter = LayerWiseLoadCounter(connector.num_layers)
-        plan = _LayerObjectPlan(
+        connector.pools = {PoolName.KV: self.pools[PoolName.KV]}
+        plan = _PoolRangePlan(
             name=PoolName.KV,
-            keys=["page_L0", "page_L2"],
-            ptrs=[100, 200],
-            sizes=[8, 8],
-            logical_pages=1,
-            component_count=1,
-            pool_layer_count=2,
+            keys=["page"],
+            locations=[0],
+            entries_per_page=1,
         )
         counter = connector.layer_done_counter.update_producer()
         connector.layer_done_counter.set_consumer(counter)
@@ -475,18 +535,17 @@ class TestUMBPTreeConnector(unittest.TestCase):
         connector._run_layer_wise_batch(counter, [plan])
 
         connector.layer_done_counter.wait_until(2)
-        self.assertEqual(self.client.batch_get_into_ptr.call_count, 2)
+        # Layers 0 and 2 belong to the pool; layer 1 has no objects and must
+        # still complete so the forward thread is released.
+        self.assertEqual(self.client.batch_get_ranges_into_ptr.call_count, 2)
 
     def test_lookup_stops_at_first_partial_page_across_chunks(self):
         connector = self.make_connector()
-        # Per pool: first two pages complete, then one complete page plus one
-        # layer of the fourth page. Both pools therefore expose 3 pages.
-        partial = [True, True, True, True, False, False]
+        # One object per page now, so a chunk holds far more pages than before
+        # and all four fit in one probe per pool: pages 1-3 present, page 4 not.
         self.client.batch_exists.side_effect = [
-            [True] * 6,
-            partial,
-            [True] * 6,
-            partial,
+            [True, True, True, False],
+            [True, True, True, False],
         ]
         with patch(
             "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
@@ -495,7 +554,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
             hit = connector.lookup("rid", [self.transfer(pages=4)])
 
         self.assertEqual(hit, [1, 2, 3])
-        self.assertEqual(self.client.batch_exists.call_count, 4)
+        self.assertEqual(self.client.batch_exists.call_count, 2)
 
     def test_trailing_hit_policy_returns_sparse_valid_prefixes(self):
         transfer = PoolTransfer(
@@ -533,8 +592,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
             for call in self.client.batch_exists.call_args_list
             for key in call.args[0]
         ]
-        self.assertIn("p0_rank_swa_L0", queried)
-        self.assertIn("p3_rank_swa_L0", queried)
+        self.assertIn("p0_rank_swa", queried)
+        self.assertIn("p3_rank_swa", queried)
 
     def test_offload_allows_partial_hybrid_sources(self):
         connector = self.make_connector(pool_group=self._hybrid_pool_group())
@@ -550,7 +609,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertTrue(connector.pop_completed_offload())
         sent_keys = [
             key
-            for call in self.client.batch_put_from_ptr.call_args_list
+            for call in self.client.batch_put_ranges_from_ptr.call_args_list
             for key in call.args[0]
         ]
         self.assertTrue(sent_keys)
@@ -586,40 +645,34 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
     def test_offload_is_chunked_on_logical_page_boundaries(self):
         connector = self.make_connector()
+        # Offload puts one range per layer on an object, so a budget of
+        # 2 * num_layers ranges is a budget of 2 objects.
         with patch(
-            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
-            2,
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.RANGES_PER_CALL",
+            2 * self.num_layers,
         ):
             self.assertTrue(connector.offload([self.transfer(pages=5)]))
             self.wait_for_offloads(connector)
 
-        # 3 chunks per pool, and every non-tail chunk contains 2 * L objects.
-        calls = self.client.batch_put_from_ptr.call_args_list
+        # 3 chunks per pool, 2 objects each. A chunk boundary may
+        # fall between objects but never inside one: the tier requires an
+        # object's ranges to tile it exactly, so a split object could never be
+        # published.
+        calls = self.client.batch_put_ranges_from_ptr.call_args_list
         self.assertEqual(len(calls), 6)
-        self.assertEqual([len(call.args[0]) for call in calls], [6, 6, 3, 6, 6, 3])
+        self.assertEqual([len(call.args[0]) for call in calls], [2, 2, 1, 2, 2, 1])
+        for call in calls:
+            for object_size, sizes in zip(call.args[1], call.args[3]):
+                self.assertEqual(sum(sizes), object_size)
 
-    def test_offload_sends_objects_in_device_address_order(self):
-        """Offload must go out sorted by GPU address.
-
-        The storage tier allocates slots in arrival order, so this send order is
-        what makes a later layer-wise load able to coalesce. See
-        UMBP_STANDALONE_PROCESS_DESIGN.md 11.2.
-        """
-        connector = self.make_connector()
-        self.assertTrue(connector.offload([self.transfer(pages=3)]))
-        self.wait_for_offloads(connector)
-
-        for call in self.client.batch_put_from_ptr.call_args_list:
-            ptrs = call.args[1]
-            self.assertEqual(
-                ptrs, sorted(ptrs), "offload batch is not in device-address order"
-            )
-
-    def test_offload_reorder_keeps_key_pointer_pairing(self):
-        """The permutation must move keys, pointers and sizes together.
+    def test_offload_keeps_key_range_and_object_size_pairing(self):
+        """Every key must leave with its own ranges and its own declared size.
 
         Desyncing them would store one object's bytes under another object's
-        key -- silent corruption that no return value would reveal.
+        key -- silent corruption that no return value would reveal. There is no
+        longer a sort to disturb the pairing (a page object spans every layer
+        buffer, so it has no single device address to sort by), but chunking
+        still slices five parallel lists.
         """
         connector = self.make_connector()
 
@@ -627,24 +680,33 @@ class TestUMBPTreeConnector(unittest.TestCase):
         for transfer in connector.pool_group.resolve_transfers(
             [self.transfer(pages=3)]
         ):
-            keys = connector._object_keys(transfer)
-            ptrs, sizes = connector.pools[transfer.name].get_page_buffer_meta(
-                transfer.host_indices
-            )
-            for key, ptr, size in zip(keys, ptrs, sizes):
-                expected[key] = (ptr, size)
+            plan = connector._build_load_plans([[transfer]])[0]
+            ptrs, sizes, offsets = connector._all_layer_ranges(plan)
+            for index, key in enumerate(plan.keys):
+                expected[key] = (ptrs[index], sizes[index], offsets[index])
 
-        self.client.batch_put_from_ptr.reset_mock()
+        self.client.batch_put_ranges_from_ptr.reset_mock()
         self.assertTrue(connector.offload([self.transfer(pages=3)]))
         self.wait_for_offloads(connector)
 
         seen = {}
-        for call in self.client.batch_put_from_ptr.call_args_list:
-            keys, ptrs, sizes = call.args[0], call.args[1], call.args[2]
+        for call in self.client.batch_put_ranges_from_ptr.call_args_list:
+            keys, object_sizes = call.args[0], call.args[1]
+            ptrs, sizes, offsets = call.args[2], call.args[3], call.args[4]
+            self.assertEqual(len(keys), len(object_sizes))
             self.assertEqual(len(keys), len(ptrs))
             self.assertEqual(len(keys), len(sizes))
-            for key, ptr, size in zip(keys, ptrs, sizes):
-                seen[key] = (ptr, size)
+            self.assertEqual(len(keys), len(offsets))
+            for index, key in enumerate(keys):
+                seen[key] = (ptrs[index], sizes[index], offsets[index])
+                # The declared object size must match the tiling, or the tier's
+                # exact-tiling check -- the only write-time guard against a
+                # dropped trailing layer -- has nothing to compare against.
+                self.assertEqual(
+                    object_sizes[index],
+                    max(o + z for o, z in zip(offsets[index], sizes[index])),
+                )
+                self.assertEqual(sum(sizes[index]), object_sizes[index])
 
         self.assertEqual(seen, expected)
 
@@ -658,11 +720,11 @@ class TestUMBPTreeConnector(unittest.TestCase):
             def synchronize(self):
                 event_calls.append("synchronize")
 
-        def put_after_event(keys, ptrs, sizes):
+        def put_after_event(keys, *args):
             self.assertEqual(event_calls, ["record", "synchronize"])
             return [True] * len(keys)
 
-        self.client.batch_put_from_ptr.side_effect = put_after_event
+        self.client.batch_put_ranges_from_ptr.side_effect = put_after_event
         with patch(
             "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.device_module.Event",
             _Event,
@@ -677,8 +739,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(connector.num_completed_offloads(), 0)
 
     def test_offload_failure_produces_exactly_one_false_result(self):
-        self.client.batch_put_from_ptr.return_value = [False]
-        self.client.batch_put_from_ptr.side_effect = None
+        self.client.batch_put_ranges_from_ptr.return_value = [False]
+        self.client.batch_put_ranges_from_ptr.side_effect = None
         connector = self.make_connector()
 
         self.assertTrue(connector.offload([self.transfer(pages=1)]))
@@ -689,7 +751,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(connector.num_completed_offloads(), 0)
 
     def test_offload_exceptions_produce_exactly_one_false_result(self):
-        self.client.batch_put_from_ptr.side_effect = RuntimeError("put failed")
+        self.client.batch_put_ranges_from_ptr.side_effect = RuntimeError("put failed")
         connector = self.make_connector()
 
         self.assertTrue(connector.offload([self.transfer(pages=1)]))
@@ -706,8 +768,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
             def synchronize(self):
                 raise RuntimeError("event failed")
 
-        self.client.batch_put_from_ptr.reset_mock()
-        self.client.batch_put_from_ptr.side_effect = lambda keys, ptrs, sizes: [
+        self.client.batch_put_ranges_from_ptr.reset_mock()
+        self.client.batch_put_ranges_from_ptr.side_effect = lambda keys, *args: [
             True
         ] * len(keys)
         with patch(
@@ -720,13 +782,13 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.assertEqual(connector.num_completed_offloads(), 1)
         self.assertFalse(connector.pop_completed_offload())
-        self.client.batch_put_from_ptr.assert_not_called()
+        self.client.batch_put_ranges_from_ptr.assert_not_called()
 
     def test_offload_results_are_fifo(self):
-        def result_for_key(keys, ptrs, sizes):
+        def result_for_key(keys, *args):
             return [not keys[0].startswith("fail-")] * len(keys)
 
-        self.client.batch_put_from_ptr.side_effect = result_for_key
+        self.client.batch_put_ranges_from_ptr.side_effect = result_for_key
         connector = self.make_connector()
         success = self.transfer(pages=1)
         success.keys = ["success-page"]
@@ -832,13 +894,13 @@ class TestUMBPTreeConnector(unittest.TestCase):
         reset_started = threading.Event()
         reset_done = threading.Event()
 
-        def blocked_put(keys, ptrs, sizes):
+        def blocked_put(keys, *args):
             worker_started.set()
             if not release_worker.wait(timeout=5):
                 raise TimeoutError("test did not release offload worker")
             return [True] * len(keys)
 
-        self.client.batch_put_from_ptr.side_effect = blocked_put
+        self.client.batch_put_ranges_from_ptr.side_effect = blocked_put
         connector = self.make_connector()
         self.assertTrue(connector.offload([self.transfer(pages=1)]))
         self.assertTrue(worker_started.wait(timeout=5))
@@ -871,7 +933,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         # One get per layer and pool at this size.
         self.assertEqual(
-            self.client.batch_get_into_ptr.call_count,
+            self.client.batch_get_ranges_into_ptr.call_count,
             self.num_layers * len(self.pools),
         )
 
@@ -879,11 +941,11 @@ class TestUMBPTreeConnector(unittest.TestCase):
         caller_thread = threading.get_ident()
         worker_threads = []
 
-        def record_worker(keys, ptrs, sizes):
+        def record_worker(keys, *args):
             worker_threads.append(threading.get_ident())
             return [True] * len(keys)
 
-        self.client.batch_get_into_ptr.side_effect = record_worker
+        self.client.batch_get_ranges_into_ptr.side_effect = record_worker
         connector = self.make_connector(load_strategy="prefetch")
         connector.layer_done_counter.update_producer = MagicMock(
             wraps=connector.layer_done_counter.update_producer
@@ -905,38 +967,43 @@ class TestUMBPTreeConnector(unittest.TestCase):
         transfer = self.transfer(pages=7)
         expanded = connector.pool_group.resolve_transfers([transfer])
         plans = connector._build_load_plans([expanded])
-        expected = [
-            triple for plan in plans for triple in zip(plan.keys, plan.ptrs, plan.sizes)
-        ]
+        expected = []
+        for plan in plans:
+            ptrs, sizes, offsets = connector._all_layer_ranges(plan)
+            expected.extend(zip(plan.keys, ptrs, sizes, offsets))
 
         with patch(
-            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
-            2,
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.RANGES_PER_CALL",
+            2 * self.num_layers,
         ):
             self.assertTrue(connector.load("rid", [transfer]))
 
-        calls = self.client.batch_get_into_ptr.call_args_list
+        calls = self.client.batch_get_ranges_into_ptr.call_args_list
         actual = [
-            triple
+            item
             for call in calls
-            for triple in zip(call.args[0], call.args[1], call.args[2])
+            for item in zip(call.args[0], call.args[1], call.args[2], call.args[3])
         ]
+        # Chunking must not disturb the key-to-range pairing, and prefetch reads
+        # every layer of an object in the one call that covers it.
         self.assertEqual(actual, expected)
-        self.assertEqual([len(call.args[0]) for call in calls], [6, 6, 6, 3] * 2)
+        self.assertEqual([len(call.args[0]) for call in calls], [2, 2, 2, 1] * 2)
+        for _, ranges, _, _ in actual:
+            self.assertEqual(len(ranges), self.num_layers)
 
     def test_prefetch_failure_paths_finish_or_fail_before_enqueue(self):
-        self.client.batch_get_into_ptr.side_effect = lambda keys, ptrs, sizes: [
+        self.client.batch_get_ranges_into_ptr.side_effect = lambda keys, *args: [
             False
         ] * len(keys)
         connector = self.make_connector(load_strategy="prefetch")
         self.assertFalse(connector.load("false", [self.transfer(pages=1)]))
 
-        self.client.batch_get_into_ptr.side_effect = RuntimeError("get failed")
+        self.client.batch_get_ranges_into_ptr.side_effect = RuntimeError("get failed")
         connector = self.make_connector(load_strategy="prefetch")
         self.assertFalse(connector.load("error", [self.transfer(pages=1)]))
         self.assertTrue(connector._load_thread.is_alive())
 
-        self.client.batch_get_into_ptr.side_effect = lambda keys, ptrs, sizes: [
+        self.client.batch_get_ranges_into_ptr.side_effect = lambda keys, *args: [
             True
         ] * len(keys)
         connector = self.make_connector(load_strategy="prefetch")
@@ -963,35 +1030,61 @@ class TestUMBPTreeConnector(unittest.TestCase):
     def test_background_load_uses_full_object_budget_per_call(self):
         connector = self.make_connector()
         self.assertTrue(connector.load("rid", [self.transfer(pages=7)]))
+        # Layer-wise puts a single range on an object, so a budget of 2 ranges
+        # is a budget of 2 objects.
         with patch(
-            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.CHUNK_PAGES",
+            "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector.RANGES_PER_CALL",
             2,
         ):
             counter = connector.start_layer_wise_loading()
             connector.layer_done_counter.set_consumer(counter)
             connector.layer_done_counter.wait_until(self.num_layers - 1)
 
-        # max_objects_per_call = CHUNK_PAGES * layers = 6. Each layer/pool
-        # therefore transfers 7 objects as [6, 1], rather than [2, 2, 2, 1].
-        calls = self.client.batch_get_into_ptr.call_args_list
-        self.assertEqual(len(calls), self.num_layers * len(self.pools) * 2)
+        # 7 pages go out as [2, 2, 2, 1] per layer and pool.
+        calls = self.client.batch_get_ranges_into_ptr.call_args_list
+        self.assertEqual(len(calls), self.num_layers * len(self.pools) * 4)
         self.assertEqual(
             [len(call.args[0]) for call in calls],
-            [6, 1] * (self.num_layers * len(self.pools)),
+            [2, 2, 2, 1] * (self.num_layers * len(self.pools)),
         )
+        # Every key carries exactly one range per layer for these pools.
+        for call in calls:
+            for ranges in call.args[1]:
+                self.assertEqual(len(ranges), 1)
+
+    def test_background_load_does_not_split_a_load_that_fits_the_budget(self):
+        """Layer-wise loading must spend its whole range budget on objects.
+
+        A layer-wise call carries one range per object, so the number of
+        objects it may hold is the budget itself. Budgeting it in pages instead
+        divided that by the layer count and split every load into that many
+        more round trips -- on GLM-5.1, 1248 RPCs where 156 sufficed, which
+        dominated the restore.
+        """
+        connector = self.make_connector()
+        pages = 7
+        self.assertTrue(connector.load("rid", [self.transfer(pages=pages)]))
+        counter = connector.start_layer_wise_loading()
+        connector.layer_done_counter.set_consumer(counter)
+        connector.layer_done_counter.wait_until(self.num_layers - 1)
+
+        calls = self.client.batch_get_ranges_into_ptr.call_args_list
+        self.assertEqual(len(calls), self.num_layers * len(self.pools))
+        for call in calls:
+            self.assertEqual(len(call.args[0]), pages)
 
     def test_background_load_failure_reaches_consumer(self):
         connector = self.make_connector()
         call_index = 0
 
-        def fail_second_layer(keys, ptrs, sizes):
+        def fail_second_layer(keys, *args):
             nonlocal call_index
             call_index += 1
             if call_index == 3:
                 return [False] * len(keys)
             return [True] * len(keys)
 
-        self.client.batch_get_into_ptr.side_effect = fail_second_layer
+        self.client.batch_get_ranges_into_ptr.side_effect = fail_second_layer
         self.assertTrue(connector.load("rid", [self.transfer(pages=2)]))
         counter = connector.start_layer_wise_loading()
         connector.layer_done_counter.set_consumer(counter)
@@ -1031,12 +1124,18 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.assertEqual(connector.deployment_mode, _DeploymentMode.StandaloneProcess)
 
-    def test_rejects_local_deployment_mode(self):
-        self.client.is_distributed.return_value = False
-        self.client.get_deployment_mode.return_value = _DeploymentMode.Local
+    def test_rejects_deployment_modes_without_ranged_io(self):
+        """Page-granular objects need ranged multi-buffer I/O.
 
-        with self.assertRaisesRegex(ValueError, "Distributed or StandaloneProcess"):
-            self.make_connector()
+        Only the StandaloneProcess client implements it; DistributedClient
+        answers all-false. Coming up and then failing every load would look
+        like a cache that never hits, so refuse at startup instead.
+        """
+        for mode in (_DeploymentMode.Local, _DeploymentMode.Distributed):
+            with self.subTest(mode=mode):
+                self.client.get_deployment_mode.return_value = mode
+                with self.assertRaisesRegex(ValueError, "StandaloneProcess"):
+                    self.make_connector()
 
     def test_standalone_close_deregisters_before_storage_close(self):
         self.client.is_distributed.return_value = False

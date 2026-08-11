@@ -29,8 +29,18 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
-# This is a logical-page count; object batches contain CHUNK_PAGES * layers.
+# This is a logical-page count; existence queries carry keys only, no ranges.
 CHUNK_PAGES = 64
+
+# The same limit for the data plane, but counted in ranges rather than pages,
+# because the two load strategies put very different numbers of ranges on one
+# object: layer-wise sends one, prefetch sends one per layer. Budgeting the
+# data plane in pages therefore split a layer-wise load into `num_layers` times
+# more RPCs than the message size required -- on GLM-5.1 that was 1248 round
+# trips where 156 would do, and at ~0.34 ms each it was the largest single cost
+# of a restore. 8192 ranges is ~1.5 MB of request in the worst case observed,
+# against gRPC's 4 MB default.
+RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
 
 def _ordered_layers(entry) -> list[int]:
@@ -107,54 +117,36 @@ class LayerWiseLoadCounter:
 
 
 @dataclass
-class _LayerObjectPlan:
+class _PoolRangePlan:
+    """One pool's share of a load: the objects to touch and where they live.
+
+    An object is a whole page (or a page's component, when the pool is not
+    packed), holding every layer back to back. A layer is addressed as a byte
+    range inside it, so this plan carries no per-layer state -- the ranges come
+    from `get_prepared_layer_range_meta` at the moment they are needed, which
+    keeps the reader and the writer on one source of truth.
+    """
+
     name: PoolName
     keys: list[str]
-    ptrs: list[int]
-    sizes: list[int]
-    logical_pages: int
-    component_count: int
-    pool_layer_count: int
-
-    def layer_meta(self, layer: int):
-        return (
-            self.keys[layer :: self.pool_layer_count],
-            self.ptrs[layer :: self.pool_layer_count],
-            self.sizes[layer :: self.pool_layer_count],
-        )
+    locations: list[int]
+    entries_per_page: int
 
 
-def _sort_by_device_address(
-    keys: list[str], ptrs: list[int], sizes: list[int]
-) -> tuple[list[str], list[int], list[int]]:
-    """Reorder an offload batch so objects go out in GPU-address order.
+def _object_sizes_per_page(entry) -> list[int]:
+    """Byte size of each object one page contributes, in key order.
 
-    The storage tier allocates slots in the order objects arrive, so the send
-    order decides the storage-side layout. Objects are built page-major
-    (`_object_keys` / `get_page_buffer_meta`), which scatters one layer's pages
-    across the tier with a stride of `num_layers`; the layer-wise load then
-    reads exactly that strided set and cannot coalesce anything, even though
-    its GPU side is ~98% contiguous.
-
-    Sorting by GPU address groups objects by layer buffer and orders pages
-    within each layer, so the tier's slots end up mirroring the GPU layout and
-    both sides of a later load become contiguous.
-
-    Sorting by address rather than building an explicit layer-major permutation
-    keeps this adaptive to the real allocation layout. The key strings are
-    unchanged and travel with their pointers -- `lookup` builds its own
-    page-major query list, which must stay page-major because
-    `batch_exists_consecutive` counts an object prefix and the caller divides
-    that by `num_layers` to get whole pages.
+    Derived from the pool layout, never from the ranges a request happens to
+    emit. Deriving it from the emitted ranges would defeat the tier's tiling
+    check: a range builder that dropped its last layer would also shrink the
+    declared size, the two would agree, and a truncated object would be
+    published.
     """
-    if len(keys) < 2:
-        return keys, ptrs, sizes
-    order = sorted(range(len(ptrs)), key=ptrs.__getitem__)
-    return (
-        [keys[i] for i in order],
-        [ptrs[i] for i in order],
-        [sizes[i] for i in order],
-    )
+    if entry.packed:
+        return [
+            sum(size for component in entry.buffer_meta for _, _, size in component)
+        ]
+    return [sum(size for _, _, size in component) for component in entry.buffer_meta]
 
 
 def _config_bool(value: Any, key: str) -> bool:
@@ -293,13 +285,16 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             client = self.storage.client
             mode = client.get_deployment_mode()
             mode_type = type(mode)
-            if mode not in {
-                mode_type.Distributed,
-                mode_type.StandaloneProcess,
-            }:
+            # Objects hold every layer and a layer is read back as a byte
+            # range, which needs mori's ranged multi-buffer I/O. Only the
+            # StandaloneProcess client implements it today; DistributedClient
+            # returns all-false. Refuse at startup rather than come up and fail
+            # every load -- the latter is far harder to diagnose.
+            if mode != mode_type.StandaloneProcess:
                 raise ValueError(
-                    "Direct UMBP supports only Distributed or StandaloneProcess "
-                    f"deployment modes, got {mode!r}."
+                    "Direct UMBP requires the StandaloneProcess deployment mode: "
+                    "page-granular objects need ranged multi-buffer I/O, which "
+                    f"the {mode!r} client does not implement yet."
                 )
             self.deployment_mode = mode
             self._standalone_process_mode = mode == mode_type.StandaloneProcess
@@ -327,7 +322,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[tuple[int | Future, list[_LayerObjectPlan]] | None] = (
+        self._load_queue: Queue[tuple[int | Future, list[_PoolRangePlan]] | None] = (
             Queue()
         )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
@@ -370,30 +365,27 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
             page_keys, transfer
         )
-        component_count = len(self.pools[transfer.name].components)
-        if multiplier != component_count:
+        entry = self.pools[transfer.name]
+        # One key names one stored object, and a packed entry stores a whole
+        # page as one object regardless of how many components it has.
+        entries_per_page = 1 if entry.packed else len(entry.components)
+        if multiplier != entries_per_page:
             raise ValueError(
-                f"UMBP pool {transfer.name} produced {multiplier} key components "
-                f"for {component_count} buffer components."
+                f"UMBP pool {transfer.name} produced {multiplier} keys per page "
+                f"but its layout yields {entries_per_page} objects per page "
+                f"(packed={entry.packed}, components={len(entry.components)})."
             )
-        layers = self.pool_layers[transfer.name]
-        return (
-            [
-                f"{component_key}_L{logical_layer}"
-                for component_key in component_keys
-                for logical_layer in layers
-            ],
-            multiplier,
-        )
+        # No layer suffix: one object per page (or per page component) holds
+        # every layer, and a layer is read back as a byte range inside it.
+        return component_keys, multiplier
 
     def _object_keys(self, transfer: PoolTransfer) -> list[str]:
         keys, _ = self._object_keys_for_pages(list(transfer.keys or []), transfer)
         return keys
 
     def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
-        component_count = len(self.pools[transfer.name].components)
-        pool_layer_count = len(self.pool_layers[transfer.name])
-        objects_per_page = component_count * pool_layer_count
+        entry = self.pools[transfer.name]
+        objects_per_page = 1 if entry.packed else len(entry.components)
         max_objects = CHUNK_PAGES * self.num_layers
         pages_per_call = max(1, max_objects // objects_per_page)
 
@@ -493,7 +485,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
     def _build_load_plans(
         self, request_transfers: list[list[PoolTransfer]]
-    ) -> list[_LayerObjectPlan]:
+    ) -> list[_PoolRangePlan]:
         grouped: dict[PoolName, list[PoolTransfer]] = {}
         for transfers in request_transfers:
             for transfer in transfers:
@@ -501,59 +493,57 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
         plans = []
         for name, transfers in grouped.items():
+            entry = self.pools[name]
+            entries_per_page = 1 if entry.packed else len(entry.components)
             keys: list[str] = []
-            ptrs: list[int] = []
-            sizes: list[int] = []
-            logical_pages = 0
-            component_count = None
+            locations: list[int] = []
             for transfer in transfers:
                 page_keys = list(transfer.keys or [])
                 transfer_keys, multiplier = self._object_keys_for_pages(
                     page_keys, transfer
                 )
-                transfer_ptrs, transfer_sizes = self.pools[name].get_page_buffer_meta(
-                    transfer.host_indices
-                )
-                if not len(transfer_keys) == len(transfer_ptrs) == len(transfer_sizes):
+                # The key scheme and the object layout are decided in different
+                # files, and `batch_*_ranges` pairs them positionally. Check the
+                # equality here so a mismatch is loud instead of silently
+                # shifting every range by one object.
+                if multiplier != entries_per_page:
                     raise ValueError(
-                        f"Layer-wise UMBP metadata mismatch for pool {name}: "
-                        f"keys={len(transfer_keys)} ptrs={len(transfer_ptrs)} "
-                        f"sizes={len(transfer_sizes)}."
+                        f"UMBP pool {name} emits {multiplier} keys per page but "
+                        f"its layout yields {entries_per_page} objects per page "
+                        f"(packed={entry.packed})."
+                    )
+                if len(transfer_keys) != len(page_keys) * entries_per_page:
+                    raise ValueError(
+                        f"UMBP pool {name} key count mismatch: "
+                        f"keys={len(transfer_keys)} pages={len(page_keys)}."
                     )
                 keys.extend(transfer_keys)
-                ptrs.extend(transfer_ptrs)
-                sizes.extend(transfer_sizes)
-                logical_pages += len(page_keys)
-                if component_count is None:
-                    component_count = multiplier
-                elif component_count != multiplier:
-                    raise ValueError(
-                        f"UMBP pool {name} changed component count within one load."
-                    )
-            pool_layer_count = len(self.pool_layers[name])
-            component_count = component_count or 0
-            expected = logical_pages * component_count * pool_layer_count
-            if not len(keys) == len(ptrs) == len(sizes) == expected:
+                locations.extend(entry.prepare_locations(transfer.host_indices))
+            if len(keys) != len(locations) * entries_per_page:
                 raise ValueError(
-                    f"Layer-wise UMBP plan mismatch for pool {name}: "
-                    f"keys={len(keys)} ptrs={len(ptrs)} sizes={len(sizes)} "
-                    f"expected={expected}."
+                    f"UMBP pool {name} plan mismatch: keys={len(keys)} "
+                    f"rows={len(locations)} per_page={entries_per_page}."
                 )
-            plans.append(
-                _LayerObjectPlan(
-                    name,
-                    keys,
-                    ptrs,
-                    sizes,
-                    logical_pages,
-                    component_count,
-                    pool_layer_count,
-                )
-            )
+            plans.append(_PoolRangePlan(name, keys, locations, entries_per_page))
 
         if not plans or not plans[0].keys:
             raise ValueError("Layer-wise UMBP load has no object keys.")
         return plans
+
+    def _layer_ranges(self, plan: _PoolRangePlan, logical_layer: int):
+        """(ptrs, sizes, offsets) for one layer, one nested list per object."""
+        meta = self.pools[plan.name].get_prepared_layer_range_meta(
+            plan.locations, logical_layer
+        )
+        if meta is None:
+            return None
+        ptrs, sizes, offsets = meta
+        if not len(ptrs) == len(sizes) == len(offsets) == len(plan.keys):
+            raise ValueError(
+                f"UMBP pool {plan.name} layer {logical_layer} produced "
+                f"{len(ptrs)} range entries for {len(plan.keys)} keys."
+            )
+        return ptrs, sizes, offsets
 
     def _load_thread_func(self) -> None:
         while True:
@@ -574,17 +564,53 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             finally:
                 self._load_queue.task_done()
 
-    def _run_prefetch_batch(self, plans: list[_LayerObjectPlan]) -> bool:
-        max_objects_per_call = CHUNK_PAGES * self.num_layers
+    def _all_layer_ranges(self, plan: _PoolRangePlan):
+        """Every layer's ranges, accumulated per object.
+
+        Used by the two paths that touch a whole object at once: prefetch, and
+        offload -- where the tier requires one call to carry ranges that tile
+        the object exactly, so an object's ranges must never be split across
+        calls.
+        """
+        ptrs: list[list[int]] = [[] for _ in plan.keys]
+        sizes: list[list[int]] = [[] for _ in plan.keys]
+        offsets: list[list[int]] = [[] for _ in plan.keys]
+        for logical_layer in self.pool_layers[plan.name]:
+            meta = self._layer_ranges(plan, logical_layer)
+            if meta is None:
+                continue
+            layer_ptrs, layer_sizes, layer_offsets = meta
+            for index in range(len(plan.keys)):
+                ptrs[index].extend(layer_ptrs[index])
+                sizes[index].extend(layer_sizes[index])
+                offsets[index].extend(layer_offsets[index])
+        return ptrs, sizes, offsets
+
+    @staticmethod
+    def _entries_per_call(sizes: list[list[int]]) -> int:
+        """Objects per RPC, budgeted by the ranges they actually carry.
+
+        Counted from the ranges that were built, not from the layer count. A
+        packed pool puts one range per component per layer on an object, so a
+        packed K/V pool carries twice what the layer count suggests and the
+        budget would be overshot by that factor.
+        """
+        ranges_per_object = max((len(entry) for entry in sizes), default=1)
+        return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
+
+    def _run_prefetch_batch(self, plans: list[_PoolRangePlan]) -> bool:
         for plan in plans:
-            for start in range(0, len(plan.keys), max_objects_per_call):
-                end = start + max_objects_per_call
+            ptrs, sizes, offsets = self._all_layer_ranges(plan)
+            step = self._entries_per_call(sizes)
+            for start in range(0, len(plan.keys), step):
+                end = start + step
                 chunk_keys = plan.keys[start:end]
                 results = list(
-                    self.storage.client.batch_get_into_ptr(
+                    self.storage.client.batch_get_ranges_into_ptr(
                         chunk_keys,
-                        plan.ptrs[start:end],
-                        plan.sizes[start:end],
+                        ptrs[start:end],
+                        sizes[start:end],
+                        offsets[start:end],
                     )
                 )
                 if len(results) != len(chunk_keys) or not all(results):
@@ -602,27 +628,30 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         return True
 
     def _run_layer_wise_batch(
-        self, counter_index: int, plans: list[_LayerObjectPlan]
+        self, counter_index: int, plans: list[_PoolRangePlan]
     ) -> None:
         try:
-            by_layer: dict[int, list[tuple[_LayerObjectPlan, int]]] = defaultdict(list)
+            by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
-                for local_layer, logical_layer in enumerate(
-                    self.pool_layers[plan.name]
-                ):
-                    by_layer[logical_layer].append((plan, local_layer))
+                for logical_layer in self.pool_layers[plan.name]:
+                    by_layer[logical_layer].append(plan)
 
-            max_objects_per_call = CHUNK_PAGES * self.num_layers
             for logical_layer in range(self.num_layers):
-                for plan, local_layer in by_layer.get(logical_layer, ()):
-                    keys, ptrs, sizes = plan.layer_meta(local_layer)
-                    for start in range(0, len(keys), max_objects_per_call):
-                        chunk_keys = keys[start : start + max_objects_per_call]
+                for plan in by_layer.get(logical_layer, ()):
+                    meta = self._layer_ranges(plan, logical_layer)
+                    if meta is None:
+                        continue
+                    ptrs, sizes, offsets = meta
+                    step = self._entries_per_call(sizes)
+                    for start in range(0, len(plan.keys), step):
+                        end = start + step
+                        chunk_keys = plan.keys[start:end]
                         results = list(
-                            self.storage.client.batch_get_into_ptr(
+                            self.storage.client.batch_get_ranges_into_ptr(
                                 chunk_keys,
-                                ptrs[start : start + max_objects_per_call],
-                                sizes[start : start + max_objects_per_call],
+                                ptrs[start:end],
+                                sizes[start:end],
+                                offsets[start:end],
                             )
                         )
                         if len(results) != len(chunk_keys) or not all(results):
@@ -666,27 +695,42 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     def _run_offload(self, expanded: list[PoolTransfer], ready_event: object) -> bool:
         ready_event.synchronize()
         for transfer in expanded:
-            keys, component_count = self._object_keys_for_pages(
-                list(transfer.keys or []), transfer
-            )
-            ptrs, sizes = self.pools[transfer.name].get_page_buffer_meta(
-                transfer.host_indices
-            )
-            if not len(keys) == len(ptrs) == len(sizes):
+            plan = self._build_load_plans([[transfer]])[0]
+            entry = self.pools[transfer.name]
+            # From the pool layout, never from the ranges below: see
+            # _object_sizes_per_page.
+            per_page = _object_sizes_per_page(entry)
+            if len(per_page) != plan.entries_per_page:
                 raise ValueError(
-                    f"UMBP offload metadata mismatch for pool {transfer.name}."
+                    f"UMBP pool {transfer.name} declares {len(per_page)} object "
+                    f"sizes per page but yields {plan.entries_per_page} objects."
                 )
-            keys, ptrs, sizes = _sort_by_device_address(keys, ptrs, sizes)
-            chunk_objects = (
-                CHUNK_PAGES * len(self.pool_layers[transfer.name]) * component_count
-            )
-            for start in range(0, len(keys), chunk_objects):
-                chunk_keys = keys[start : start + chunk_objects]
+            object_sizes = [
+                per_page[index % plan.entries_per_page]
+                for index in range(len(plan.keys))
+            ]
+            ptrs, sizes, offsets = self._all_layer_ranges(plan)
+
+            # Objects go out in page order, which is what makes the tier's slot
+            # layout mirror the device layout and lets `dram_tier.cpp` collapse
+            # a whole layer into one strided submission. The old explicit sort
+            # by device address is gone with the per-layer objects it sorted:
+            # an object now spans every layer buffer, so it has no single
+            # device address to sort by.
+
+            # An object's ranges must tile it exactly, so a chunk boundary may
+            # fall between objects but never inside one.
+            step = self._entries_per_call(sizes)
+            for start in range(0, len(plan.keys), step):
+                end = start + step
+                chunk_keys = plan.keys[start:end]
                 results = list(
-                    self.storage.client.batch_put_from_ptr(
+                    self.storage.client.batch_put_ranges_from_ptr(
                         chunk_keys,
-                        ptrs[start : start + chunk_objects],
-                        sizes[start : start + chunk_objects],
+                        object_sizes[start:end],
+                        ptrs[start:end],
+                        sizes[start:end],
+                        offsets[start:end],
                     )
                 )
                 if len(results) != len(chunk_keys) or not all(results):
@@ -695,7 +739,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                         "success=%d/%d returned=%d",
                         transfer.name,
                         start,
-                        min(start + chunk_objects, len(keys)),
+                        min(end, len(plan.keys)),
                         sum(bool(value) for value in results),
                         len(chunk_keys),
                         len(results),
