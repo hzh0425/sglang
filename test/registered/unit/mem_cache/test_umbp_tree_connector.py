@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
     DevicePoolGroup,
 )
+from sglang.srt.mem_cache.storage.umbp import umbp_tree_connector
 from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
     RANGES_PER_CALL,
     LayerWiseLoadCounter,
@@ -137,6 +138,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.server_args = SimpleNamespace(
             hicache_storage_backend_extra_config=None,
             tp_size=1,
+            pp_size=1,
+            attn_cp_size=1,
+            enable_dp_attention=False,
             model_path="test-model",
             unified_tree_connector_load_strategy="layer_wise",
         )
@@ -157,7 +161,12 @@ class TestUMBPTreeConnector(unittest.TestCase):
             connector.close()
 
     def make_connector(
-        self, extra_config=None, pool_group=None, load_strategy="layer_wise"
+        self,
+        extra_config=None,
+        pool_group=None,
+        load_strategy="layer_wise",
+        *,
+        split_verified=True,
     ):
         pool_group = pool_group or self.pool_group
         self.server_args.hicache_storage_backend_extra_config = (
@@ -172,6 +181,11 @@ class TestUMBPTreeConnector(unittest.TestCase):
             patch(
                 "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._parse_storage_extra_config",
                 return_value=dict(extra_config or {}),
+            ),
+            patch.object(
+                umbp_tree_connector,
+                "_is_verified_split_kvcache",
+                return_value=split_verified,
             ),
         ):
             connector = UMBPTreeConnector(
@@ -1142,6 +1156,359 @@ class TestUMBPTreeConnector(unittest.TestCase):
 
         self.assertEqual(ranges_for(2), ranges_for(1))
 
+    def test_split_windows_cover_every_page_exactly_once(self):
+        for num_pages in (1, 2, 7, 8, 9, 16, 17, 63, 64, 1024, 2048):
+            for tp_size in (2, 4, 8):
+                windows = umbp_tree_connector._split_windows(num_pages, tp_size)
+                where = (num_pages, tp_size, windows)
+                self.assertEqual(len(windows), tp_size)
+                slot = -(-num_pages // tp_size)
+                self.assertEqual(
+                    max(end - start for start, end in windows), slot, where
+                )
+                covered = [page for start, end in windows for page in range(start, end)]
+                self.assertEqual(covered, list(range(num_pages)), where)
+
+    def _split_reads_per_rank(self, pages, tp_size, min_pages=4):
+        """(key, ptr, size, offset) quadruples each rank would read."""
+        per_rank = {}
+        with (
+            patch.object(umbp_tree_connector, "SPLIT_LOAD", True),
+            patch.object(umbp_tree_connector, "SPLIT_MIN_PAGES", min_pages),
+        ):
+            self.server_args.tp_size = tp_size
+            for rank in range(tp_size):
+                connector = self.make_connector()
+                connector._tp_rank = rank
+                connector._split_pg = object()
+                connector._split_world = tp_size
+                exchanged = []
+                connector._exchange_group = lambda state, index: exchanged.append(index)
+                self.client.batch_get_ranges_into_ptr.reset_mock()
+
+                self.assertTrue(connector.load(f"rid{rank}", [self.transfer(pages)]))
+                counter = connector.start_layer_wise_loading()
+                connector.layer_done_counter.set_consumer(counter)
+                for layer in range(self.num_layers):
+                    connector.layer_done_counter.wait_until(layer)
+
+                quadruples = set()
+                for call in self.client.batch_get_ranges_into_ptr.call_args_list:
+                    for key, ptrs, sizes, offsets in zip(*call.args[:4]):
+                        quadruples.update(zip([key] * len(ptrs), ptrs, sizes, offsets))
+                per_rank[rank] = (quadruples, exchanged)
+        return per_rank
+
+    def _make_split_state(self, *, pages=8, tp_size=2, layer_group=None):
+        with (
+            patch.object(umbp_tree_connector, "SPLIT_LOAD", True),
+            patch.object(umbp_tree_connector, "SPLIT_MIN_PAGES", 4),
+        ):
+            self.server_args.tp_size = tp_size
+            connector = self.make_connector()
+            connector._split_pg = object()
+            connector._split_world = tp_size
+            if layer_group is not None:
+                connector.layer_group = layer_group
+            plans = connector._build_load_plans(
+                [connector.pool_group.resolve_transfers([self.transfer(pages)])],
+                split=True,
+            )
+        self.assertTrue(any(plan.split for plan in plans))
+        state = {
+            "plans": plans,
+            "groups": connector._layer_groups(),
+            "exchanged": -1,
+            "failure": None,
+            "rows": {},
+        }
+        return connector, plans, state
+
+    def test_split_load_reads_each_range_on_exactly_one_rank(self):
+        tp_size, pages = 4, 16
+        self.server_args.tp_size = tp_size
+        connector = self.make_connector()
+        self.client.batch_get_ranges_into_ptr.reset_mock()
+        self.assertTrue(connector.load("whole", [self.transfer(pages)]))
+        counter = connector.start_layer_wise_loading()
+        connector.layer_done_counter.set_consumer(counter)
+        for layer in range(self.num_layers):
+            connector.layer_done_counter.wait_until(layer)
+        unsplit = set()
+        for call in self.client.batch_get_ranges_into_ptr.call_args_list:
+            for key, ptrs, sizes, offsets in zip(*call.args[:4]):
+                unsplit.update(zip([key] * len(ptrs), ptrs, sizes, offsets))
+        self.assertTrue(unsplit)
+
+        per_rank = self._split_reads_per_rank(pages, tp_size)
+        shares = [quadruples for quadruples, _ in per_rank.values()]
+        self.assertEqual(set().union(*shares), unsplit)
+        self.assertEqual(sum(len(share) for share in shares), len(unsplit))
+        for share, exchanged in per_rank.values():
+            self.assertEqual(len(share), len(unsplit) // tp_size)
+            self.assertEqual(exchanged, [0])
+
+        uneven = self._split_reads_per_rank(9, 8)
+        empty = [rank for rank, (share, _) in uneven.items() if not share]
+        self.assertEqual(empty, [5, 6, 7])
+        for rank in empty:
+            self.assertEqual(uneven[rank][1], [0])
+
+    def _sparse_layer_pool_group(self):
+        """Two pools with different layer sets, matching DeepSeek-V4's shape."""
+        self.sparse_kv = [torch.zeros((16, 4), dtype=torch.uint8) for _ in range(3)]
+        self.sparse_c4 = [torch.zeros((8, 6), dtype=torch.uint8) for _ in range(2)]
+        return DevicePoolGroup(
+            [
+                DevicePoolEntry(
+                    name=PoolName.KV,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[self.sparse_kv],
+                    layer_mapping={0: 0, 1: 1, 2: 2},
+                    page_size=self.page_size,
+                    rows_are_pages=False,
+                ),
+                DevicePoolEntry(
+                    name=PoolName.DEEPSEEK_V4_C4,
+                    indices_from_pool=PoolName.KV,
+                    device_pool=None,
+                    components=[self.sparse_c4],
+                    layer_mapping={2: 0, 0: 1},
+                    page_size=self.page_size,
+                    rows_are_pages=True,
+                ),
+            ],
+            num_layers=3,
+            page_size=self.page_size,
+        )
+
+    def test_split_exchange_reconstructs_every_byte(self):
+        self._assert_split_exchange_reconstructs(self.pool_group)
+
+    def test_split_exchange_reconstructs_every_byte_with_sparse_layers(self):
+        group = self._sparse_layer_pool_group()
+        self.assertEqual(
+            _ordered_layers(group.entry_map[PoolName.DEEPSEEK_V4_C4]), [2, 0]
+        )
+        self.assertIsNone(group.entry_map[PoolName.DEEPSEEK_V4_C4].layer_mapping.get(1))
+        self._assert_split_exchange_reconstructs(group)
+
+    def _assert_split_exchange_reconstructs(self, pool_group):
+        """Compare a simulated allgather against a byte-exact reference pool."""
+        tp_size, pages = 4, 8
+        for patcher in (
+            patch.object(umbp_tree_connector, "SPLIT_LOAD", True),
+            patch.object(umbp_tree_connector, "SPLIT_MIN_PAGES", 4),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.server_args.tp_size = tp_size
+        connector = self.make_connector(pool_group=pool_group)
+        connector._split_pg = object()
+        connector._split_world = tp_size
+        transfer = self.transfer(pages)
+        buffers = [
+            buffer
+            for entry in pool_group.entries
+            for component in entry.components
+            for buffer in component
+        ]
+
+        reference = {}
+        for index, buffer in enumerate(buffers):
+            buffer.copy_(
+                torch.arange(buffer.numel(), dtype=torch.int64)
+                .remainder(251)
+                .add(index + 1)
+                .remainder(251)
+                .add(1)
+                .to(torch.uint8)
+                .view(buffer.shape)
+            )
+            reference[id(buffer)] = buffer.clone()
+
+        def blank_the_peers(state, rank):
+            for buffer in buffers:
+                buffer.copy_(reference[id(buffer)])
+            for plan in state["plans"]:
+                for logical_layer in state["groups"][0]:
+                    geometry = connector._split_pool_geometry(plan, logical_layer)
+                    for tensor, _, row_span in geometry or ():
+                        for peer in range(tp_size):
+                            if peer == rank:
+                                continue
+                            rows = connector._split_rows(
+                                plan, peer, row_span, tensor.device, state["rows"]
+                            )
+                            if rows.numel():
+                                tensor.index_fill_(0, rows, 0)
+
+        def plans_for(rank):
+            connector._tp_rank = rank
+            plans = connector._build_load_plans(
+                [connector.pool_group.resolve_transfers([transfer])], split=True
+            )
+            self.assertTrue(all(plan.split for plan in plans))
+            return {
+                "plans": plans,
+                "groups": connector._layer_groups(),
+                "exchanged": -1,
+                "failure": None,
+                "rows": {},
+            }
+
+        sends = {}
+        for rank in range(tp_size):
+            state = plans_for(rank)
+            blank_the_peers(state, rank)
+            with (
+                patch.object(torch.distributed, "all_reduce"),
+                patch.object(
+                    torch.distributed,
+                    "all_gather_into_tensor",
+                    side_effect=lambda out, inp, group=None, r=rank: sends.setdefault(
+                        r, inp.clone()
+                    ),
+                ),
+            ):
+                connector._exchange_group(state, 0)
+        self.assertEqual(len(sends), tp_size)
+
+        for rank in range(tp_size):
+            state = plans_for(rank)
+            blank_the_peers(state, rank)
+            gathered = torch.cat([sends[peer] for peer in range(tp_size)])
+
+            def deliver(out, inp, group=None):
+                out.copy_(gathered[: out.numel()])
+
+            with (
+                patch.object(torch.distributed, "all_reduce"),
+                patch.object(
+                    torch.distributed, "all_gather_into_tensor", side_effect=deliver
+                ),
+            ):
+                connector._exchange_group(state, 0)
+
+            for buffer in buffers:
+                self.assertTrue(
+                    torch.equal(buffer, reference[id(buffer)]),
+                    f"rank {rank} did not reconstruct every byte",
+                )
+
+    def test_split_local_preparation_failure_aborts_every_rank(self):
+        connector, _, state = self._make_split_state()
+        connector._split_reserve = MagicMock(
+            side_effect=(
+                torch.cuda.OutOfMemoryError("no room for staging")
+                if hasattr(torch.cuda, "OutOfMemoryError")
+                else RuntimeError("no room for staging")
+            )
+        )
+
+        reduced = {}
+
+        def record(tensor, op=None, group=None):
+            reduced["ok"] = int(tensor[0])
+
+        with (
+            patch.object(torch.distributed, "all_reduce", side_effect=record),
+            patch.object(torch.distributed, "all_gather_into_tensor") as gathered,
+        ):
+            with self.assertRaises(RuntimeError):
+                connector._exchange_group(state, 0)
+            gathered.assert_not_called()
+
+        self.assertEqual(reduced["ok"], 0)
+
+    def test_split_loader_failure_reaches_agreement(self):
+        connector, plans, state = self._make_split_state(layer_group=1)
+        counter = connector.layer_done_counter.update_producer()
+        connector._split_state[counter] = state
+        self.client.batch_get_ranges_into_ptr.side_effect = lambda keys, *args: [
+            False
+        ] * len(keys)
+        connector._run_layer_wise_batch(counter, plans)
+        connector.layer_done_counter.set_consumer(counter)
+
+        reduced = {}
+
+        def record(tensor, op=None, group=None):
+            reduced["ok"] = int(tensor[0])
+
+        with (
+            patch.object(torch.distributed, "all_reduce", side_effect=record),
+            patch.object(torch.distributed, "all_gather_into_tensor") as gathered,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "layer-wise KV load failed"):
+                connector.layer_done_counter.wait_until(0)
+            gathered.assert_not_called()
+
+        self.assertEqual(reduced["ok"], 0)
+
+    def test_split_scope(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+        from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
+            HybridLinearKVPool,
+        )
+
+        for cls in (DSATokenToKVPool, DeepSeekV4TokenToKVPool):
+            self.assertTrue(
+                umbp_tree_connector._is_verified_split_kvcache(cls.__new__(cls))
+            )
+        self.assertFalse(
+            umbp_tree_connector._is_verified_split_kvcache(
+                HybridLinearKVPool.__new__(HybridLinearKVPool)
+            )
+        )
+
+        with patch.object(umbp_tree_connector, "SPLIT_LOAD", True):
+            self.server_args.tp_size = 2
+            with self.assertRaisesRegex(ValueError, "verified DSA"):
+                self.make_connector(split_verified=False)
+            connector = self.make_connector(
+                load_strategy="prefetch", split_verified=False
+            )
+            self.assertFalse(connector._split_load)
+
+            for field, value, message in (
+                ("attn_cp_size", 2, "attention CP"),
+                ("enable_dp_attention", True, "DP attention"),
+                ("pp_size", 2, "pipeline parallelism"),
+            ):
+                with self.subTest(field=field):
+                    original = getattr(self.server_args, field)
+                    setattr(self.server_args, field, value)
+                    try:
+                        with self.assertRaisesRegex(ValueError, message):
+                            self.make_connector()
+                    finally:
+                        setattr(self.server_args, field, original)
+
+    def test_offload_writes_every_page_when_split_is_on(self):
+        """The split flag must never filter the shared offload plan builder."""
+        pages = 8
+        with (
+            patch.object(umbp_tree_connector, "SPLIT_LOAD", True),
+            patch.object(umbp_tree_connector, "SPLIT_MIN_PAGES", 4),
+        ):
+            self.server_args.tp_size = 4
+            connector = self.make_connector()
+            self.assertTrue(connector._split_load)
+            self.client.batch_put_ranges_from_ptr.reset_mock()
+            self.assertTrue(connector.offload([self.transfer(pages)]))
+            self.wait_for_offloads(connector)
+
+        self.assertTrue(connector.pop_completed_offload())
+        written = set()
+        for call in self.client.batch_put_ranges_from_ptr.call_args_list:
+            written.update(call.args[0])
+        self.assertEqual(len(written), pages * len(self.pools))
+
     def test_background_load_failure_reaches_consumer(self):
         connector = self.make_connector()
         # One call per layer, so the failure names a single layer.
@@ -1210,7 +1577,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
     def test_rejects_standalone_server_without_ranged_capability(self):
         self.client.supports_ranged_io.return_value = False
 
-        with self.assertRaisesRegex(ValueError, "ranged multi-buffer I/O"):
+        with self.assertRaisesRegex(
+            ValueError, "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES"
+        ):
             self.make_connector()
 
         self.storage.close.assert_called_once()

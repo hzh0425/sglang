@@ -44,6 +44,16 @@ CHUNK_PAGES = 64
 # against gRPC's 4 MB default.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
+# Split replicated KV reads across the attention TP group. This is experimental
+# and intentionally opt-in.
+SPLIT_LOAD = os.getenv("UMBP_LOAD_SPLIT", "0").strip().lower() not in {
+    "",
+    "0",
+    "false",
+    "off",
+}
+SPLIT_MIN_PAGES = int(os.getenv("UMBP_LOAD_SPLIT_MIN_PAGES", "16"))
+
 
 def _ordered_layers(entry) -> list[int]:
     component_lengths = {len(component) for component in entry.components}
@@ -74,14 +84,22 @@ def _resolve_umbp_pool_group(
     return resolve_hybrid_device_pool_group(kvcache, page_size, req_to_token_pool)
 
 
+def _is_verified_split_kvcache(kvcache: Any) -> bool:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    return isinstance(kvcache, (DSATokenToKVPool, DeepSeekV4TokenToKVPool))
+
+
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
-    def __init__(self, num_layers: int):
+    def __init__(self, num_layers: int, on_group_ready=None):
         self.num_layers = num_layers
         self._producer_index = -1
         self.consumer_index = -1
         self._futures: dict[int, list[Future]] = {}
+        self._on_group_ready = on_group_ready
 
     def update_producer(self) -> int:
         self._producer_index += 1
@@ -106,6 +124,8 @@ class LayerWiseLoadCounter:
             return
         try:
             futures[threshold].result()
+            if self._on_group_ready is not None:
+                self._on_group_ready(index, threshold)
         except BaseException as error:
             raise RuntimeError("UMBP layer-wise KV load failed.") from error
         finally:
@@ -127,12 +147,29 @@ class _PoolRangePlan:
     range inside it, so this plan carries no per-layer state -- the ranges come
     from `get_prepared_layer_range_meta` at the moment they are needed, which
     keeps the reader and the writer on one source of truth.
+
+    For split loads, ``keys`` and ``locations`` contain only this rank's share.
     """
 
     name: PoolName
     keys: list[str]
     locations: list[int]
     entries_per_page: int
+    all_locations: list[int] | None = None
+    windows: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def split(self) -> bool:
+        return bool(self.windows)
+
+
+def _split_windows(num_pages: int, tp_size: int) -> tuple[tuple[int, int], ...]:
+    """Return contiguous equal-width page windows, one per rank."""
+    width = -(-num_pages // tp_size)
+    return tuple(
+        (min(rank * width, num_pages), min((rank + 1) * width, num_pages))
+        for rank in range(tp_size)
+    )
 
 
 def _object_sizes_per_page(entry) -> list[int]:
@@ -187,7 +224,43 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         _storage=None,
     ):
         self.page_size = params.page_size
+        self.load_strategy = server_args.unified_tree_connector_load_strategy
+        self._tp_size = server_args.tp_size
+        # How many consecutive layers one load RPC covers. An object is named
+        # on the wire once per call, so a group of G amortizes the per-object
+        # cost -- key transmission, key hashing, and the nested per-object
+        # vectors the server rebuilds -- across G layers, at the price of
+        # releasing layers to the forward pass G at a time. That cost dominates
+        # under concurrency: measured server-side, resolving keys to slots is
+        # 21% of a read batch while the copy itself is 74%, and 8 concurrent
+        # 32K restores spend ~2.5 ms of a 3 ms RPC outside the tier entirely.
+        #
+        # 8 is the measured optimum on both models and in both regimes, and the
+        # curve is flat enough on either side that one constant serves both:
+        # DeepSeek-V4 8-way at 32K goes 617 -> 404 ms from 1 to 8 and back up to
+        # 453 at 32, GLM-5.1 4-way goes 1332 -> 822. Past the optimum the
+        # coarser release starts to cost more than the amortization saves.
+        self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
+        self._split_load = bool(
+            SPLIT_LOAD and self.load_strategy == "layer_wise" and self._tp_size > 1
+        )
+
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        if self._split_load:
+            self._validate_split_scope(kvcache, server_args)
+
+        distributed = (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        )
+        tp_rank = 0
+        if distributed:
+            tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+        self._tp_rank = tp_rank
+        self._split_pg = None
+        self._split_world = 0
+        if self._split_load and distributed:
+            self._split_process_group()
+
         self.pool_group = _resolve_umbp_pool_group(
             kvcache, self.page_size, params.req_to_token_pool
         )
@@ -209,10 +282,15 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             raise ValueError(
                 f"UMBP pool mappings contain out-of-range logical layers: {invalid_layers}."
             )
-
-        tp_rank = 0
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            tp_rank = torch.distributed.get_rank(group=params.tp_cache_group)
+        self._split_status = (
+            torch.empty(
+                1,
+                dtype=torch.int64,
+                device=next(iter(self.pools.values())).components[0][0].device,
+            )
+            if self._split_load
+            else None
+        )
 
         extra_config = _parse_storage_extra_config(
             server_args.hicache_storage_backend_extra_config
@@ -303,7 +381,9 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 raise ValueError(
                     "Direct UMBP requires a standalone server whose inner backend "
                     "advertises ranged multi-buffer I/O support. Upgrade mori and "
-                    "verify the server's distributed/local backend configuration."
+                    "verify the server's distributed/local backend configuration. "
+                    "For a Distributed inner backend, set "
+                    "UMBP_DISTRIBUTED_RANGED_SCRATCH_BYTES to a positive value."
                 )
             get_backend_mode = getattr(client, "get_backend_mode", None)
             self.backend_mode = (
@@ -331,27 +411,21 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             self.storage.close()
             raise
 
-        self.load_strategy = server_args.unified_tree_connector_load_strategy
-        self._tp_rank = tp_rank
-        self._tp_size = server_args.tp_size
         self._cp_size = params.attn_cp_size
         self._pp_size = params.pp_size
-        # How many consecutive layers one load RPC covers. An object is named
-        # on the wire once per call, so a group of G amortizes the per-object
-        # cost -- key transmission, key hashing, and the nested per-object
-        # vectors the server rebuilds -- across G layers, at the price of
-        # releasing layers to the forward pass G at a time. That cost dominates
-        # under concurrency: measured server-side, resolving keys to slots is
-        # 21% of a read batch while the copy itself is 74%, and 8 concurrent
-        # 32K restores spend ~2.5 ms of a 3 ms RPC outside the tier entirely.
-        #
-        # 8 is the measured optimum on both models and in both regimes, and the
-        # curve is flat enough on either side that one constant serves both:
-        # DeepSeek-V4 8-way at 32K goes 617 -> 404 ms from 1 to 8 and back up to
-        # 453 at 32, GLM-5.1 4-way goes 1332 -> 822. Past the optimum the
-        # coarser release starts to cost more than the amortization saves.
-        self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
-        self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self._split_state: dict[int, dict] = {}
+        self._split_send: torch.Tensor | None = None
+        self._split_recv: torch.Tensor | None = None
+        self.layer_done_counter = LayerWiseLoadCounter(
+            self.num_layers,
+            on_group_ready=self._exchange_ready_groups if self._split_load else None,
+        )
+        if self._split_load:
+            logger.info(
+                "UMBP split load requested: min_pages=%d layer_group=%d",
+                SPLIT_MIN_PAGES,
+                self.layer_group,
+            )
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
@@ -418,6 +492,26 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 name="umbp-extkv-reconcile",
             )
             self._extkv_thread.start()
+
+    @staticmethod
+    def _validate_split_scope(kvcache, server_args) -> None:
+        if not _is_verified_split_kvcache(kvcache):
+            raise ValueError(
+                "UMBP_LOAD_SPLIT is supported only for verified DSA and "
+                "DeepSeek-V4 KV caches."
+            )
+
+        unsupported = []
+        if server_args.attn_cp_size > 1:
+            unsupported.append("attention CP")
+        if server_args.enable_dp_attention:
+            unsupported.append("DP attention")
+        if server_args.pp_size > 1:
+            unsupported.append("pipeline parallelism")
+        if unsupported:
+            raise ValueError(
+                "UMBP_LOAD_SPLIT does not support " + ", ".join(unsupported) + "."
+            )
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -554,15 +648,25 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self._freeze_gc_once()
         pending = self._pending
         self._pending = {}
-        plans = self._build_load_plans(list(pending.values()))
+        plans = self._build_load_plans(list(pending.values()), split=self._split_load)
         counter_index = self.layer_done_counter.update_producer()
+        if self._split_load and any(plan.split for plan in plans):
+            self._split_state[counter_index] = {
+                "plans": plans,
+                "groups": self._layer_groups(),
+                "exchanged": -1,
+                "failure": None,
+                "rows": {},
+            }
         self._load_queue.put((counter_index, plans))
         self._stats["load"] += len(pending)
         return counter_index
 
     def _build_load_plans(
-        self, request_transfers: list[list[PoolTransfer]]
+        self, request_transfers: list[list[PoolTransfer]], *, split: bool = False
     ) -> list[_PoolRangePlan]:
+        """Build a batch plan; splitting is opt-in because offload reuses it."""
+        split_world = self._split_ranks() if split else 1
         grouped: dict[PoolName, list[PoolTransfer]] = {}
         for transfers in request_transfers:
             for transfer in transfers:
@@ -579,10 +683,6 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 transfer_keys, multiplier = self._object_keys_for_pages(
                     page_keys, transfer
                 )
-                # The key scheme and the object layout are decided in different
-                # files, and `batch_*_ranges` pairs them positionally. Check the
-                # equality here so a mismatch is loud instead of silently
-                # shifting every range by one object.
                 if multiplier != entries_per_page:
                     raise ValueError(
                         f"UMBP pool {name} emits {multiplier} keys per page but "
@@ -601,9 +701,23 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                     f"UMBP pool {name} plan mismatch: keys={len(keys)} "
                     f"rows={len(locations)} per_page={entries_per_page}."
                 )
-            plans.append(_PoolRangePlan(name, keys, locations, entries_per_page))
+            windows: tuple[tuple[int, int], ...] = ()
+            if split_world > 1 and len(locations) >= SPLIT_MIN_PAGES:
+                windows = _split_windows(len(locations), split_world)
+                start, end = windows[self._tp_rank]
+                mine = _PoolRangePlan(
+                    name,
+                    keys[start * entries_per_page : end * entries_per_page],
+                    locations[start:end],
+                    entries_per_page,
+                    all_locations=locations,
+                    windows=windows,
+                )
+            else:
+                mine = _PoolRangePlan(name, keys, locations, entries_per_page)
+            plans.append(mine)
 
-        if not plans or not plans[0].keys:
+        if not plans or not (plans[0].keys or plans[0].split):
             raise ValueError("Layer-wise UMBP load has no object keys.")
         return plans
 
@@ -746,19 +860,14 @@ class UMBPTreeConnector(UnifiedTreeConnector):
     def _run_layer_wise_batch(
         self, counter_index: int, plans: list[_PoolRangePlan]
     ) -> None:
+        released = 0
         try:
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
                     by_layer[logical_layer].append(plan)
 
-            for group_start in range(0, self.num_layers, self.layer_group):
-                group = list(
-                    range(
-                        group_start,
-                        min(group_start + self.layer_group, self.num_layers),
-                    )
-                )
+            for group in self._layer_groups():
                 for plan in self._plans_covering(by_layer, group):
                     meta = self._layer_group_ranges(plan, group)
                     if meta is None:
@@ -792,9 +901,224 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 # granularity for fewer times each object is named on the wire.
                 for logical_layer in group:
                     self.layer_done_counter.complete(counter_index, logical_layer)
+                released = group[-1] + 1
         except BaseException as error:
-            self.layer_done_counter.fail(counter_index, error)
+            state = self._split_state.get(counter_index)
+            if state is None:
+                self.layer_done_counter.fail(counter_index, error)
+            else:
+                # The forward pass has to reach the next group exchange, where a
+                # reduction tells every rank to give up together. Failing the
+                # futures here instead would stop this rank at the wait while the
+                # others went on to a collective it never joins.
+                state["failure"] = error
+                for logical_layer in range(released, self.num_layers):
+                    self.layer_done_counter.complete(counter_index, logical_layer)
             logger.exception("UMBP layer-wise load batch failed")
+
+    # ---- split load: exchange the shares the other ranks read ----
+
+    def _layer_groups(self) -> list[list[int]]:
+        return [
+            list(range(start, min(start + self.layer_group, self.num_layers)))
+            for start in range(0, self.num_layers, self.layer_group)
+        ]
+
+    def _split_process_group(self):
+        """Return the device communicator used by the split exchange."""
+        if self._split_pg is None:
+            from sglang.srt.distributed.parallel_state import get_attn_tp_group
+
+            group = get_attn_tp_group().device_group
+            rank = torch.distributed.get_rank(group=group)
+            world = torch.distributed.get_world_size(group=group)
+            if rank != self._tp_rank or world != self._tp_size:
+                raise RuntimeError(
+                    "UMBP split load requires the device attention-TP group to "
+                    "match the connector TP keyspace: "
+                    f"group=({rank}/{world}), connector=({self._tp_rank}/{self._tp_size})."
+                )
+            self._split_pg = group
+            self._split_world = world
+        return self._split_pg
+
+    def _split_ranks(self) -> int:
+        self._split_process_group()
+        return self._split_world
+
+    def _split_pool_geometry(self, plan: _PoolRangePlan, logical_layer: int):
+        """Return tensors and row geometry for one pool layer."""
+        entry = self.pools[plan.name]
+        buffer_index = entry.layer_mapping.get(logical_layer)
+        if buffer_index is None:
+            return None
+        geometry = []
+        for component, meta in zip(entry.components, entry.buffer_meta):
+            _, row_stride, size = meta[buffer_index]
+            if row_stride <= 0 or size % row_stride:
+                raise ValueError(
+                    f"UMBP pool {plan.name} layer {logical_layer} has a row size "
+                    f"{size} that is not a multiple of its stride {row_stride}."
+                )
+            geometry.append((component[buffer_index], row_stride, size // row_stride))
+        spans = {span for _, _, span in geometry}
+        if len(spans) != 1:
+            raise ValueError(
+                f"UMBP pool {plan.name} components disagree on rows per page: "
+                f"{sorted(spans)}."
+            )
+        return geometry
+
+    def _split_layout(self, plans: list[_PoolRangePlan], group: list[int]):
+        layout = []
+        offset = 0
+        for plan in plans:
+            width = max(end - start for start, end in plan.windows)
+            for logical_layer in group:
+                geometry = self._split_pool_geometry(plan, logical_layer)
+                if geometry is None:
+                    continue
+                for tensor, row_stride, row_span in geometry:
+                    span = width * row_span * row_stride
+                    layout.append((plan, tensor, row_span, offset))
+                    offset += -(-span // 256) * 256
+        return layout, offset
+
+    def _split_rows(
+        self, plan: _PoolRangePlan, rank: int, row_span: int, device, cache
+    ):
+        key = (id(plan), rank)
+        rows = cache.get(key)
+        if rows is None:
+            start, end = plan.windows[rank]
+            assert plan.all_locations is not None
+            pages = torch.tensor(
+                plan.all_locations[start:end], dtype=torch.int64, device=device
+            )
+            if row_span > 1:
+                pages = (
+                    pages[:, None]
+                    + torch.arange(row_span, dtype=torch.int64, device=device)
+                ).reshape(-1)
+            rows = pages
+            cache[key] = rows
+        return rows
+
+    @staticmethod
+    def _split_view(buffer: torch.Tensor, offset: int, rows: int, like: torch.Tensor):
+        nbytes = rows * like.stride(0) * like.element_size()
+        return (
+            buffer[offset : offset + nbytes]
+            .view(like.dtype)
+            .view(rows, *like.shape[1:])
+        )
+
+    def _exchange_ready_groups(self, counter_index: int, logical_layer: int) -> None:
+        state = self._split_state.get(counter_index)
+        if state is None:
+            return
+        target = logical_layer // self.layer_group
+        try:
+            while state["exchanged"] < target:
+                state["exchanged"] += 1
+                self._exchange_group(state, state["exchanged"])
+        finally:
+            if target >= len(state["groups"]) - 1:
+                self._split_state.pop(counter_index, None)
+
+    def _prepare_split_group(self, state, plans, group, device):
+        layout, slot_bytes = self._split_layout(plans, group)
+        if not layout:
+            return layout, slot_bytes
+
+        self._split_reserve(slot_bytes, device)
+        for plan, _, row_span, _ in layout:
+            for rank in range(self._split_world):
+                self._split_rows(plan, rank, row_span, device, state["rows"])
+
+        for plan, tensor, row_span, offset in layout:
+            rows = state["rows"][(id(plan), self._tp_rank)]
+            if rows.numel():
+                torch.index_select(
+                    tensor,
+                    0,
+                    rows,
+                    out=self._split_view(
+                        self._split_send, offset, rows.numel(), tensor
+                    ),
+                )
+        return layout, slot_bytes
+
+    def _exchange_group(self, state: dict, group_index: int) -> None:
+        plans = [plan for plan in state["plans"] if plan.split]
+        if not plans:
+            return
+        group = state["groups"][group_index]
+        process_group = self._split_process_group()
+        world = self._split_world
+        device = self.pools[plans[0].name].components[0][0].device
+
+        failure = state["failure"]
+        layout: list = []
+        slot_bytes = 0
+        if failure is None:
+            try:
+                layout, slot_bytes = self._prepare_split_group(
+                    state, plans, group, device
+                )
+            except BaseException as error:
+                logger.exception("UMBP split load could not prepare its share")
+                failure = error
+
+        agreed = self._split_status
+        assert agreed is not None
+        agreed.fill_(0 if failure is not None else 1)
+        torch.distributed.all_reduce(
+            agreed, op=torch.distributed.ReduceOp.MIN, group=process_group
+        )
+        if not agreed.item():
+            raise RuntimeError(
+                "UMBP split load failed, or could not prepare its share, on at "
+                "least one rank"
+            ) from failure
+        if not layout:
+            return
+
+        torch.distributed.all_gather_into_tensor(
+            self._split_recv[: slot_bytes * world],
+            self._split_send[:slot_bytes],
+            group=process_group,
+        )
+
+        for rank in range(world):
+            if rank == self._tp_rank:
+                continue
+            base = rank * slot_bytes
+            for plan, tensor, row_span, offset in layout:
+                rows = state["rows"][(id(plan), rank)]
+                if not rows.numel():
+                    continue
+                tensor.index_copy_(
+                    0,
+                    rows,
+                    self._split_view(
+                        self._split_recv, base + offset, rows.numel(), tensor
+                    ),
+                )
+
+    def _split_reserve(self, slot_bytes: int, device) -> None:
+        needed = slot_bytes * self._split_world
+        if self._split_recv is not None and self._split_recv.numel() >= needed:
+            return
+        send = torch.empty(slot_bytes, dtype=torch.uint8, device=device)
+        recv = torch.empty(needed, dtype=torch.uint8, device=device)
+        self._split_send, self._split_recv = send, recv
+        logger.info(
+            "UMBP split load staging: ranks=%d, %.1f MiB send + %.1f MiB recv per GPU",
+            self._split_world,
+            slot_bytes / (1 << 20),
+            needed / (1 << 20),
+        )
 
     def _extkv_page_hashes(self, expanded: list[PoolTransfer]) -> list[str]:
         """Return the logical KV page hashes exactly once for an offload task."""
@@ -1085,6 +1409,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 self._offload_results.get_nowait()
             except Empty:
                 break
+        self._split_state.clear()
         self.layer_done_counter.reset()
 
     def close(self) -> None:
