@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import threading
@@ -149,6 +150,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
             req_to_token_pool=MagicMock(),
             token_to_kv_pool_allocator=MagicMock(),
             tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
             pp_rank=0,
             pp_size=1,
             attn_cp_rank=0,
@@ -174,6 +177,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
         )
         self.server_args.unified_tree_connector_load_strategy = load_strategy
         with (
+            # A sibling test leaves gloo initialized without sglang parallel groups.
+            patch("torch.distributed.is_initialized", return_value=False),
             patch(
                 "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._resolve_umbp_pool_group",
                 return_value=pool_group,
@@ -627,6 +632,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertTrue(connector.offload([kv]))
         self.wait_for_offloads(connector)
 
+        # Count first: that call is where ranks agree on what may be consumed.
+        self.assertEqual(connector.num_completed_offloads(), 1)
         self.assertTrue(connector.pop_completed_offload())
         sent_keys = [
             key
@@ -824,90 +831,108 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertTrue(connector.pop_completed_offload())
         self.assertFalse(connector.pop_completed_offload())
 
-    @staticmethod
-    def _drain_fixture(
-        pending,
-        local_completed,
-        slowest_rank_completed,
-        *,
-        local_results=None,
-        peer_results=None,
-    ):
-        """A stand-in tree with `pending` queued offloads, whose connector reports
-        `local_completed` finished ones while the slowest rank reports fewer."""
-        local_results = list(local_results or [True] * local_completed)
-        peer_results = list(peer_results or [True] * slowest_rank_completed)
-        nodes = [
-            SimpleNamespace(id=i, connector_offloaded=False) for i in range(pending)
-        ]
+    @contextlib.contextmanager
+    def peer_reductions(self, connector, peer_values):
+        """Inject peer values into successive MIN reductions."""
+        pending = [list(values) for values in peer_values]
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            self.assertTrue(pending, "connector issued more reductions than scripted")
+            peer = torch.tensor(pending.pop(0), dtype=tensor.dtype)
+            self.assertEqual(peer.numel(), tensor.numel())
+            tensor.copy_(torch.minimum(tensor, peer))
+
+        connector._offload_sync_groups = (object(),)
+        with patch("torch.distributed.all_reduce", fake_all_reduce):
+            yield
+        self.assertFalse(pending, f"scripted reductions never happened: {pending}")
+
+    def offload_pages(self, connector, count):
+        for _ in range(count):
+            self.assertTrue(connector.offload([self.transfer(pages=1)]))
+        self.wait_for_offloads(connector)
+
+    def test_completed_offload_count_is_the_cross_rank_minimum(self):
+        connector = self.make_connector()
+        self.offload_pages(connector, 3)
+
+        # This rank finished all three; the slowest peer has one.
+        with self.peer_reductions(connector, [[1], [1]]):
+            self.assertEqual(connector.num_completed_offloads(), 1)
+            self.assertTrue(connector.pop_completed_offload())
+
+        # The other two stay owed and are picked up on a later step.
+        with self.peer_reductions(connector, [[2], [1, 1]]):
+            self.assertEqual(connector.num_completed_offloads(), 2)
+            self.assertTrue(connector.pop_completed_offload())
+            self.assertTrue(connector.pop_completed_offload())
+
+    def test_completed_offload_outcomes_agree_across_ranks(self):
+        connector = self.make_connector()
+        self.offload_pages(connector, 2)
+
+        # Both succeeded here, the second failed on the peer.
+        with self.peer_reductions(connector, [[2], [1, 0]]):
+            self.assertEqual(connector.num_completed_offloads(), 2)
+            self.assertTrue(connector.pop_completed_offload())
+            self.assertFalse(connector.pop_completed_offload())
+
+    def test_already_agreed_results_are_not_reduced_twice(self):
+        """Do not reduce agreed results again before they are consumed."""
+        connector = self.make_connector()
+        self.offload_pages(connector, 2)
+
+        with self.peer_reductions(connector, [[2], [1, 1]]):
+            self.assertEqual(connector.num_completed_offloads(), 2)
+            self.assertTrue(connector.pop_completed_offload())
+        # One agreed result is still buffered, so only the count is reduced.
+        with self.peer_reductions(connector, [[1]]):
+            self.assertEqual(connector.num_completed_offloads(), 1)
+            self.assertTrue(connector.pop_completed_offload())
+
+    def test_idle_steps_issue_no_collective(self):
+        """Do not issue collectives when no offload is owed."""
+        connector = self.make_connector()
+        connector._offload_sync_groups = (object(),)
+
+        with patch("torch.distributed.all_reduce") as all_reduce:
+            self.assertEqual(connector.num_completed_offloads(), 0)
+
+        all_reduce.assert_not_called()
+
+    def test_reset_drops_agreed_results_and_the_owed_count(self):
+        """Reset agreed results and the mirrored owed count together."""
+        connector = self.make_connector()
+        self.offload_pages(connector, 1)
+        with self.peer_reductions(connector, [[1], [1]]):
+            self.assertEqual(connector.num_completed_offloads(), 1)
+
+        connector.reset()
+
+        with patch("torch.distributed.all_reduce") as all_reduce:
+            self.assertEqual(connector.num_completed_offloads(), 0)
+        all_reduce.assert_not_called()
+
+    def test_unmodified_tree_drain_releases_the_same_nodes_on_every_rank(self):
+        """The baseline tree drain must observe connector-side agreement."""
+        connector = self.make_connector()
+        self.offload_pages(connector, 3)
+        nodes = [SimpleNamespace(id=i, connector_offloaded=False) for i in range(3)]
         cache = SimpleNamespace(
-            connector=SimpleNamespace(
-                num_completed_offloads=lambda: local_completed,
-                pop_completed_offload=lambda: local_results.pop(0),
-            ),
-            nodes=nodes,
+            connector=connector,
             connector_offloads=[(node, object()) for node in nodes],
             released=[],
         )
         cache.dec_lock_ref = lambda node, params: cache.released.append(node.id)
-        cache._connector_sync_min = lambda value: (
-            UnifiedCacheConnectorMixin._connector_sync_min(cache, value)
-        )
-        collective_index = 0
 
-        def all_reduce(tensor, op):
-            nonlocal collective_index
-            if collective_index == 0:
-                tensor.fill_(min(int(tensor.item()), slowest_rank_completed))
-            else:
-                peer = torch.tensor(peer_results[: tensor.numel()], dtype=tensor.dtype)
-                tensor.copy_(torch.minimum(tensor, peer))
-            collective_index += 1
-
-        cache._all_reduce_attn_groups = all_reduce
-        return cache
-
-    def test_drain_consumes_the_cross_rank_minimum(self):
-        """Draining a rank-local count desyncs lock_ref across TP ranks, which
-        desyncs evictable_size() and therefore the admission decision -- ranks
-        then disagree on whether to run a forward at all and deadlock."""
-        cache = self._drain_fixture(
-            pending=5, local_completed=4, slowest_rank_completed=2
-        )
-
-        UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
-
-        self.assertEqual(cache.released, [0, 1])
-        self.assertEqual(len(cache.connector_offloads), 3)
-
-    def test_drain_skips_the_collective_when_nothing_is_queued(self):
-        """The empty-queue gate must be rank-consistent on its own: issuing the
-        MIN-reduce on only some ranks would itself hang."""
-        cache = self._drain_fixture(
-            pending=0, local_completed=3, slowest_rank_completed=0
-        )
-        cache._all_reduce_attn_groups = lambda tensor, op: self.fail(
-            "collective issued with an empty offload queue"
-        )
-
-        UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
-
-        self.assertEqual(cache.released, [])
-
-    def test_drain_synchronizes_offload_failures_across_ranks(self):
-        cache = self._drain_fixture(
-            pending=1,
-            local_completed=1,
-            slowest_rank_completed=1,
-            local_results=[True],
-            peer_results=[False],
-        )
-
-        UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
+        with self.peer_reductions(connector, [[1], [0]]):
+            UnifiedCacheConnectorMixin.drain_connector_offloads(cache)
 
         self.assertEqual(cache.released, [0])
-        self.assertFalse(cache.connector_offloads)
-        self.assertFalse(cache.nodes[0].connector_offloaded)
+        self.assertEqual(len(cache.connector_offloads), 2)
+        # The peer failed its first offload, so this rank must not mark the node
+        # as stored either.
+        self.assertFalse(nodes[0].connector_offloaded)
 
     def test_reset_waits_for_offload_and_discards_stale_result(self):
         worker_started = threading.Event()
@@ -1503,6 +1528,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.assertTrue(connector.offload([self.transfer(pages)]))
             self.wait_for_offloads(connector)
 
+        self.assertEqual(connector.num_completed_offloads(), 1)
         self.assertTrue(connector.pop_completed_offload())
         written = set()
         for call in self.client.batch_put_ranges_from_ptr.call_args_list:

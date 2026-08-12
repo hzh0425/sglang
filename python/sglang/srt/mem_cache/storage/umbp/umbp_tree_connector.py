@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -89,6 +89,30 @@ def _is_verified_split_kvcache(kvcache: Any) -> bool:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     return isinstance(kvcache, (DSATokenToKVPool, DeepSeekV4TokenToKVPool))
+
+
+def _drain_sync_groups(params: CacheInitParams) -> tuple[Any, ...]:
+    """Return the cache-rank groups that must agree on drain state."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return ()
+
+    def wide(group: Any) -> Any | None:
+        if group is None or torch.distributed.get_world_size(group=group) <= 1:
+            return None
+        return group
+
+    attn = tuple(
+        group
+        for group in (
+            wide(params.attn_cp_cache_group),
+            wide(params.attn_tp_cache_group),
+        )
+        if group is not None
+    )
+    if attn:
+        return attn
+    tp = wide(params.tp_cache_group)
+    return (tp,) if tp is not None else ()
 
 
 class LayerWiseLoadCounter:
@@ -437,10 +461,15 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
+        # Mirrors UnifiedRadixCache.connector_offloads until results are consumed.
+        self._offload_owed = 0
+        self._offload_agreed: deque[bool] = deque()
+        self._offload_sync_groups = _drain_sync_groups(params)
         self._stats = {
             "lookup": 0,
             "load": 0,
             "offload": 0,
+            "offload_drain_ahead": 0,
             "extkv_reported": 0,
             "extkv_revoked": 0,
             "extkv_reconcile_failures": 0,
@@ -1309,6 +1338,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         ready_event = device_module.Event()
         ready_event.record()
         self._offload_queue.put((expanded, ready_event))
+        self._offload_owed += 1
         return True
 
     def _offload_thread_func(self) -> None:
@@ -1394,10 +1424,41 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self._gc_frozen = True
 
     def num_completed_offloads(self) -> int:
-        return self._offload_results.qsize()
+        """Return the completed-offload count agreed across cache ranks."""
+        # This mirrors the tree queue, so the early return is rank-consistent.
+        if self._offload_owed == 0:
+            return 0
+        available = len(self._offload_agreed) + self._offload_results.qsize()
+        agreed = self._reduce_min_offload_state([available])[0]
+        if agreed < available:
+            # Count steps where this rank was ahead of the slowest rank.
+            self._stats["offload_drain_ahead"] += 1
+        missing = agreed - len(self._offload_agreed)
+        if missing > 0:
+            # Every rank buffers the same number of agreed results.
+            results = [self._offload_results.get_nowait() for _ in range(missing)]
+            self._offload_agreed.extend(
+                bool(value) for value in self._reduce_min_offload_state(results)
+            )
+        return len(self._offload_agreed)
 
     def pop_completed_offload(self) -> bool:
-        return self._offload_results.get_nowait()
+        if not self._offload_agreed:
+            raise RuntimeError(
+                "Call num_completed_offloads() before pop_completed_offload()."
+            )
+        self._offload_owed -= 1
+        return self._offload_agreed.popleft()
+
+    def _reduce_min_offload_state(self, values: list) -> list:
+        if not self._offload_sync_groups:
+            return [int(value) for value in values]
+        synced = torch.tensor([int(value) for value in values], dtype=torch.int)
+        for group in self._offload_sync_groups:
+            torch.distributed.all_reduce(
+                synced, op=torch.distributed.ReduceOp.MIN, group=group
+            )
+        return synced.tolist()
 
     def reset(self) -> None:
         self._pending.clear()
@@ -1409,6 +1470,9 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 self._offload_results.get_nowait()
             except Empty:
                 break
+        # _reset_full clears the tree-side connector_offloads in the same operation.
+        self._offload_agreed.clear()
+        self._offload_owed = 0
         self._split_state.clear()
         self.layer_done_counter.reset()
 

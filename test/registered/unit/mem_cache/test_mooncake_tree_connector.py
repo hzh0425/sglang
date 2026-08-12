@@ -307,9 +307,6 @@ def test_async_offload_pins_node_until_completion():
     mixin.connector = connector
     mixin._components_tuple = (_Component(),)
     mixin.connector_offloads = []
-    # Draining agrees on a count across TP ranks; a bare mixin has no group, and
-    # leaving the tensor untouched keeps this single-rank test's count local.
-    mixin._all_reduce_attn_groups = lambda tensor, op: None
     lock_params = object()
     locks = []
     unlocks = []
