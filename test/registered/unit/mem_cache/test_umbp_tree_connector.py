@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import unittest
 from enum import Enum
@@ -95,6 +96,8 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.client = MagicMock()
         self.client.is_distributed.return_value = True
         self.client.get_deployment_mode.return_value = _DeploymentMode.StandaloneProcess
+        self.client.get_backend_mode.return_value = _DeploymentMode.Local
+        self.client.supports_ranged_io.return_value = True
         self.client.register_memory.return_value = True
         self.client.batch_exists.side_effect = lambda keys: [True] * len(keys)
         self.client.batch_put_ranges_from_ptr.side_effect = lambda keys, *args: [
@@ -103,13 +106,16 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.client.batch_get_ranges_into_ptr.side_effect = lambda keys, *args: [
             True
         ] * len(keys)
+        self.client.report_external_kv_blocks.return_value = True
+        self.client.revoke_external_kv_blocks.return_value = True
+        self.client.revoke_all_external_kv_blocks_at_tier.return_value = True
 
         self.storage = MagicMock()
         self.storage.client = self.client
         self.storage._disable_zero_copy_register = False
         self.storage._get_hybrid_page_component_keys.side_effect = (
-            lambda keys, transfer: (
-                [f"{key}_rank_{transfer.name}" for key in keys],
+            lambda keys, transfer, rank_suffix=None: (
+                [f"{key}_{rank_suffix or 'rank'}_{transfer.name}" for key in keys],
                 1,
             )
         )
@@ -1192,15 +1198,140 @@ class TestUMBPTreeConnector(unittest.TestCase):
     def test_rejects_deployment_modes_without_ranged_io(self):
         """Page-granular objects need ranged multi-buffer I/O.
 
-        Only the StandaloneProcess client implements it; DistributedClient
-        answers all-false. Coming up and then failing every load would look
-        like a cache that never hits, so refuse at startup instead.
+        The worker-facing client must remain StandaloneProcess. The inner
+        backend is checked separately through its advertised capability.
         """
         for mode in (_DeploymentMode.Local, _DeploymentMode.Distributed):
             with self.subTest(mode=mode):
                 self.client.get_deployment_mode.return_value = mode
                 with self.assertRaisesRegex(ValueError, "StandaloneProcess"):
                     self.make_connector()
+
+    def test_rejects_standalone_server_without_ranged_capability(self):
+        self.client.supports_ranged_io.return_value = False
+
+        with self.assertRaisesRegex(ValueError, "ranged multi-buffer I/O"):
+            self.make_connector()
+
+        self.storage.close.assert_called_once()
+
+    def test_external_kv_reconcile_checks_every_rank_and_pool(self):
+        self.client.get_backend_mode.return_value = _DeploymentMode.Distributed
+        self.server_args.tp_size = 2
+        with patch.dict(
+            os.environ,
+            {
+                "UMBP_EXTKV_REPORT": "1",
+                "UMBP_EXTKV_FLUSH_MS": "3600000",
+                "UMBP_EXTKV_RECONCILE_SECONDS": "3600",
+            },
+        ):
+            connector = self.make_connector()
+
+        connector._queue_extkv_pages(["0123456789abcdef0123456789abcdef"])
+        connector._flush_extkv()
+
+        self.client.report_external_kv_blocks.assert_called_once()
+        reported_hash = self.client.report_external_kv_blocks.call_args.args[0][0]
+        required = connector._extkv_required_keys[reported_hash]
+        self.assertEqual(len(required), 4)  # 2 TP ranks x (KV + INDEXER)
+        self.assertTrue(any("tp1_cp0_pp0_kv" in key for key in required))
+        self.assertTrue(any("tp0_cp0_pp0_indexer" in key for key in required))
+
+        # Losing a non-anchor object must revoke the logical block even while
+        # every KV anchor remains present.
+        self.client.batch_exists.side_effect = lambda keys: [
+            "indexer" not in key for key in keys
+        ]
+        connector._reconcile_extkv()
+
+        self.client.revoke_external_kv_blocks.assert_called_once()
+        self.assertNotIn(reported_hash, connector._extkv_reported)
+
+        # Re-report the same block, then lose only a non-tp0 KV key. The full
+        # required-key AND must revoke it again.
+        self.client.batch_exists.side_effect = lambda keys: [True] * len(keys)
+        connector._queue_extkv_pages(["0123456789abcdef0123456789abcdef"])
+        connector._flush_extkv()
+        self.client.batch_exists.side_effect = lambda keys: [
+            "tp1_cp0_pp0_kv" not in key for key in keys
+        ]
+        connector._reconcile_extkv()
+        self.assertEqual(self.client.revoke_external_kv_blocks.call_count, 2)
+        self.assertNotIn(reported_hash, connector._extkv_reported)
+
+    def test_external_kv_reset_revokes_all_and_clears_state(self):
+        self.client.get_backend_mode.return_value = _DeploymentMode.Distributed
+        with patch.dict(
+            os.environ,
+            {
+                "UMBP_EXTKV_REPORT": "1",
+                "UMBP_EXTKV_FLUSH_MS": "3600000",
+                "UMBP_EXTKV_RECONCILE_SECONDS": "3600",
+            },
+        ):
+            connector = self.make_connector()
+        connector._queue_extkv_pages(["fedcba9876543210fedcba9876543210"])
+        connector._flush_extkv()
+        self.assertEqual(len(connector._extkv_reported), 1)
+        connector._queue_extkv_pages(["00112233445566778899aabbccddeeff"])
+        self.assertEqual(len(connector._extkv_pending), 1)
+
+        connector.reset()
+
+        # Publishing a pending tail immediately before revoke-all only wastes a
+        # report RPC. reset clears both reported and pending state directly.
+        self.client.report_external_kv_blocks.assert_called_once()
+        self.client.revoke_all_external_kv_blocks_at_tier.assert_called_once()
+        self.assertFalse(connector._extkv_pending)
+        self.assertFalse(connector._extkv_reported)
+        self.assertFalse(connector._extkv_required_keys)
+
+    def test_external_kv_repeated_report_revoke_keeps_live_state_bounded(self):
+        self.client.get_backend_mode.return_value = _DeploymentMode.Distributed
+        live_hashes = set()
+
+        def report(hashes, _tier):
+            live_hashes.update(hashes)
+            return True
+
+        def revoke(hashes, _tier):
+            live_hashes.difference_update(hashes)
+            return True
+
+        self.client.report_external_kv_blocks.side_effect = report
+        self.client.revoke_external_kv_blocks.side_effect = revoke
+        self.client.batch_exists.side_effect = lambda keys: [False] * len(keys)
+        with patch.dict(
+            os.environ,
+            {
+                "UMBP_EXTKV_REPORT": "1",
+                "UMBP_EXTKV_FLUSH_MS": "3600000",
+                "UMBP_EXTKV_RECONCILE_SECONDS": "3600",
+            },
+        ):
+            connector = self.make_connector()
+
+        for index in range(5):
+            page_hash = f"{index:032x}"
+            connector._queue_extkv_pages([page_hash])
+            connector._flush_extkv()
+            self.assertEqual(len(live_hashes), 1)
+
+            connector._reconcile_extkv()
+
+            self.assertFalse(live_hashes)
+            self.assertFalse(connector._extkv_reported)
+            self.assertFalse(connector._extkv_required_keys)
+
+    def test_external_kv_is_disabled_by_default(self):
+        self.client.get_backend_mode.return_value = _DeploymentMode.Distributed
+        connector = self.make_connector()
+
+        connector._queue_extkv_pages(["page-extkv-disabled"])
+
+        self.client.report_external_kv_blocks.assert_not_called()
+        self.assertIsNone(connector._extkv_thread)
 
     def test_standalone_close_deregisters_before_storage_close(self):
         self.client.is_distributed.return_value = False

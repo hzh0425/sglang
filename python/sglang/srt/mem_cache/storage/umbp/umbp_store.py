@@ -198,6 +198,7 @@ _DISTRIBUTED_ONLY_EXTRA_KEYS = frozenset(
         "io_engine_host",
         "io_engine_port",
         "staging_buffer_size",
+        "ranged_scratch_size",
         "ssd_staging_buffer_size",
         "ssd_staging_buffer_slots",
         "peer_service_port",
@@ -586,6 +587,10 @@ class UMBPStore(HiCacheStorage):
 
             if "staging_buffer_size" in extra:
                 dist_cfg.staging_buffer_size = int(extra["staging_buffer_size"])
+            if "ranged_scratch_size" in extra and hasattr(
+                dist_cfg, "ranged_scratch_size"
+            ):
+                dist_cfg.ranged_scratch_size = int(extra["ranged_scratch_size"])
 
             if "ssd_staging_buffer_size" in extra and hasattr(
                 dist_cfg, "ssd_staging_buffer_size"
@@ -1384,21 +1389,30 @@ class UMBPStore(HiCacheStorage):
     # ------------------------------------------------------------------
     # Multi-pool v2 interface
     # ------------------------------------------------------------------
-    def _get_hybrid_page_component_keys(self, page_keys, transfer: PoolTransfer):
+    def _get_hybrid_page_component_keys(
+        self, page_keys, transfer: PoolTransfer, *, rank_suffix: Optional[str] = None
+    ):
         """Expand logical page keys for one registered hybrid side pool."""
         pool_name = transfer.name
         host_pool = self.registered_pools.get(pool_name)
         if host_pool is None:
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 
+        mla_suffix = self.mla_suffix if rank_suffix is None else rank_suffix
+        mha_suffix = (
+            getattr(self, "mha_suffix", mla_suffix)
+            if rank_suffix is None
+            else rank_suffix
+        )
+
         components = getattr(host_pool, "components", None)
         if pool_name == PoolName.MAMBA:
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            suffixes = [f"_{mha_suffix}_conv_{i}" for i in range(conv_num)]
             if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
-                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
+                suffixes = [f"_{mha_suffix}_temporal"] + suffixes
         elif components is not None and len(components) == 1:
-            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+            suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif components is not None and len(components) == 2:
             # These branches serve the tree connector, whose pools are
             # DevicePoolEntry. One key must name one stored object, and a
@@ -1408,11 +1422,11 @@ class UMBPStore(HiCacheStorage):
             # Mooncake reaches the same layout by giving PoolName.KV a single
             # suffix unconditionally.
             suffixes = (
-                [f"_{self.mha_suffix}_{pool_name}"]
+                [f"_{mha_suffix}_{pool_name}"]
                 if host_pool.packed
                 else [
-                    f"_{self.mha_suffix}_{pool_name}_k",
-                    f"_{self.mha_suffix}_{pool_name}_v",
+                    f"_{mha_suffix}_{pool_name}_k",
+                    f"_{mha_suffix}_{pool_name}_v",
                 ]
             )
         elif components is not None:
@@ -1421,14 +1435,14 @@ class UMBPStore(HiCacheStorage):
                 f"{len(components)}"
             )
         elif self.is_mla_backend:
-            suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+            suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif getattr(host_pool, "v_buffer", None) is not None:
             suffixes = [
-                f"_{self.mha_suffix}_{pool_name}_k",
-                f"_{self.mha_suffix}_{pool_name}_v",
+                f"_{mha_suffix}_{pool_name}_k",
+                f"_{mha_suffix}_{pool_name}_v",
             ]
         else:
-            suffixes = [f"_{self.mha_suffix}_{pool_name}"]
+            suffixes = [f"_{mha_suffix}_{pool_name}"]
 
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
