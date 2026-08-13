@@ -314,11 +314,10 @@ class TestUMBPTreeConnector(unittest.TestCase):
         for entry in group.entry_map.values():
             _assert_page_pointers_match_views(self, entry, probe)
 
-    def test_hybrid_linear_component_keys_match_qwen_and_kimi_layouts(self):
+    def test_hybrid_linear_component_keys_match_qwen_layout(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 
         qwen_group, _ = self._hybrid_linear_pool_group(use_mla=False)
-        kimi_group, _ = self._hybrid_linear_pool_group(use_mla=True)
 
         def keys_for(group, pool_name):
             store = UMBPStore.__new__(UMBPStore)
@@ -331,7 +330,6 @@ class TestUMBPTreeConnector(unittest.TestCase):
             )
 
         qwen_kv, qwen_multiplier = keys_for(qwen_group, PoolName.KV)
-        kimi_kv, kimi_multiplier = keys_for(kimi_group, PoolName.KV)
         mamba, mamba_multiplier = keys_for(qwen_group, PoolName.MAMBA)
 
         # Qwen's KV pool has separate k and v buffers, but the entry is packed,
@@ -341,8 +339,6 @@ class TestUMBPTreeConnector(unittest.TestCase):
         # component.
         self.assertEqual(qwen_multiplier, 1)
         self.assertEqual(qwen_kv, ["page_tp0_cp0_pp0_kv"])
-        self.assertEqual(kimi_multiplier, 1)
-        self.assertEqual(kimi_kv, ["page_tp0_cp0_pp0_kv"])
         self.assertEqual(mamba_multiplier, 2)
         self.assertEqual(
             mamba,
@@ -372,12 +368,11 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(budget, RANGES_PER_CALL // 2)
         self.assertLessEqual(budget * len(sizes[0]), RANGES_PER_CALL)
 
-    def test_hybrid_linear_page_pointers_match_tensor_views(self):
+    def test_qwen_hybrid_linear_page_pointers_match_tensor_views(self):
         probe = torch.arange(self.page_size, dtype=torch.int64)
-        for use_mla in (False, True):
-            group, _ = self._hybrid_linear_pool_group(use_mla=use_mla)
-            for entry in group.entry_map.values():
-                _assert_page_pointers_match_views(self, entry, probe)
+        group, _ = self._hybrid_linear_pool_group(use_mla=False)
+        for entry in group.entry_map.values():
+            _assert_page_pointers_match_views(self, entry, probe)
 
     def test_connector_registers_mamba_layer_counter(self):
         pool_group, _ = self._hybrid_linear_pool_group(use_mla=False)

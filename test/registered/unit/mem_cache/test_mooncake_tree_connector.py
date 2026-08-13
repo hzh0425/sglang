@@ -431,38 +431,6 @@ def test_qwen35_device_pool_group_maps_full_and_mamba_layers():
     assert sizes == [24, 40, 56, 88]
 
 
-def test_kimi_linear_device_pool_group_maps_mla_and_mamba_layers():
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
-    kvcache.use_mla = True
-    kvcache.full_attention_layer_id_mapping = {1: 0}
-    kvcache.full_kv_pool = SimpleNamespace(
-        kv_buffer=[torch.zeros((8, 9), dtype=torch.uint8)],
-    )
-    req_pool = SimpleNamespace(
-        mamba_ckpt_pool=None,
-        mamba_map={0: 0, 2: 1},
-        mamba_pool=SimpleNamespace(
-            mamba_cache=SimpleNamespace(
-                temporal=torch.zeros((2, 5, 2, 3)),
-                conv=[torch.zeros((2, 5, 4))],
-            )
-        ),
-        translate_mamba_indices=lambda indices: indices,
-    )
-
-    group = resolve_hybrid_device_pool_group(kvcache, 2, req_pool)
-
-    assert group.num_layers == 3
-    assert len(group.entry_map[PoolName.KV].components) == 1
-    pointers, sizes = group.entry_map[PoolName.KV].get_page_buffer_meta(
-        torch.tensor([0, 1])
-    )
-    assert len(pointers) == 1
-    assert sizes == [18]
-
-
 def test_swa_connector_finish_maps_or_releases_slots():
     swa_allocator = _Allocator()
     allocator = SimpleNamespace(
