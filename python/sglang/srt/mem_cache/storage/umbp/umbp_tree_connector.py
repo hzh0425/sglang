@@ -8,7 +8,7 @@ from collections import defaultdict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -203,6 +203,11 @@ def _config_bool(value: Any, key: str) -> bool:
     raise ValueError(f"UMBP connector config {key!r} must be boolean, got {value!r}.")
 
 
+def _materialize_cpu_indices(indices: torch.Tensor) -> torch.Tensor:
+    """Materialize CPU indices used to derive per-pool row locations."""
+    return indices.detach().to(device="cpu", dtype=torch.int64).flatten()
+
+
 def _parse_storage_extra_config(raw_config):
     # Keep the connector module importable in CPU-only unit tests. The hybrid
     # controller imports device-specific memory-pool modules transitively.
@@ -234,6 +239,12 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         )
 
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        self._async_offload_index_snapshot = True
+        self._offload_index_fallback_warned = False
+        self._offload_index_stream = None
+        self._offload_index_done = None
+        self._offload_index_device = None
+        self._offload_index_buffers: list[torch.Tensor | None] = []
         if self._split_load:
             self._validate_split_scope(kvcache, server_args)
 
@@ -652,7 +663,11 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         return counter_index
 
     def _build_load_plans(
-        self, request_transfers: list[list[PoolTransfer]], *, split: bool = False
+        self,
+        request_transfers: list[list[PoolTransfer]],
+        *,
+        split: bool = False,
+        materialize_indices: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ) -> list[_PoolRangePlan]:
         """Build a batch plan; splitting is opt-in because offload reuses it."""
         split_world = self._split_ranks() if split else 1
@@ -662,6 +677,10 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                 grouped.setdefault(transfer.name, []).append(transfer)
 
         plans = []
+        # One logical source can fan out to several physical pools (for
+        # example GLM's KV and INDEXER pools). Snapshot it once, then let each
+        # pool independently validate and derive its own row geometry.
+        cpu_indices: dict[int, torch.Tensor] = {}
         for name, transfers in grouped.items():
             entry = self.pools[name]
             entries_per_page = 1 if entry.packed else len(entry.components)
@@ -684,7 +703,19 @@ class UMBPTreeConnector(UnifiedTreeConnector):
                         f"keys={len(transfer_keys)} pages={len(page_keys)}."
                     )
                 keys.extend(transfer_keys)
-                locations.extend(entry.prepare_locations(transfer.host_indices))
+                indices = transfer.host_indices
+                if indices is None:
+                    raise ValueError(f"UMBP pool {name} transfer has no indices.")
+                source_id = id(indices)
+                prepared_indices = cpu_indices.get(source_id)
+                if prepared_indices is None:
+                    prepared_indices = (
+                        materialize_indices(indices)
+                        if materialize_indices is not None
+                        else _materialize_cpu_indices(indices)
+                    )
+                    cpu_indices[source_id] = prepared_indices
+                locations.extend(entry.prepare_locations(prepared_indices))
             if len(keys) != len(locations) * entries_per_page:
                 raise ValueError(
                     f"UMBP pool {name} plan mismatch: keys={len(keys)} "
@@ -709,6 +740,74 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         if not plans or not (plans[0].keys or plans[0].split):
             raise ValueError("Layer-wise UMBP load has no object keys.")
         return plans
+
+    def _materialize_offload_indices(
+        self, indices: torch.Tensor, slot: int
+    ) -> torch.Tensor:
+        if not self._async_offload_index_snapshot or indices.device.type == "cpu":
+            return _materialize_cpu_indices(indices)
+        if (
+            indices.dtype != torch.int64
+            or indices.ndim != 1
+            or not indices.is_contiguous()
+        ):
+            return self._fallback_offload_indices(indices, "tensor shape or dtype")
+        if (
+            self._offload_index_device is not None
+            and indices.device != self._offload_index_device
+        ):
+            return self._fallback_offload_indices(indices, "device mismatch")
+
+        try:
+            with device_module.device(indices.device):
+                if self._offload_index_stream is None:
+                    self._offload_index_device = indices.device
+                    self._offload_index_stream = device_module.Stream(
+                        device=indices.device
+                    )
+                    self._offload_index_done = device_module.Event()
+                while len(self._offload_index_buffers) <= slot:
+                    self._offload_index_buffers.append(None)
+                count = indices.numel()
+                buffer = self._offload_index_buffers[slot]
+                if buffer is None or buffer.numel() < count:
+                    buffer = self._allocate_offload_index_buffer(count)
+                    self._offload_index_buffers[slot] = buffer
+                source = indices.detach()
+                with device_module.stream(self._offload_index_stream):
+                    # Register before enqueue so a failed copy cannot leave an
+                    # untracked side-stream read of the source allocation.
+                    source.record_stream(self._offload_index_stream)
+                    buffer[:count].copy_(source, non_blocking=True)
+                    self._offload_index_done.record(self._offload_index_stream)
+                self._offload_index_done.synchronize()
+                return buffer[:count]
+        except RuntimeError:
+            self._async_offload_index_snapshot = False
+            logger.exception(
+                "UMBP async index snapshot failed; falling back to synchronous D2H"
+            )
+            return _materialize_cpu_indices(indices)
+
+    @staticmethod
+    def _allocate_offload_index_buffer(count: int) -> torch.Tensor:
+        return torch.empty(count, dtype=torch.int64, device="cpu", pin_memory=True)
+
+    def _fallback_offload_indices(
+        self, indices: torch.Tensor, reason: str
+    ) -> torch.Tensor:
+        if not self._offload_index_fallback_warned:
+            self._offload_index_fallback_warned = True
+            logger.warning(
+                "UMBP offload index snapshot is using synchronous fallback: "
+                "%s (device=%s dtype=%s shape=%s contiguous=%s)",
+                reason,
+                indices.device,
+                indices.dtype,
+                tuple(indices.shape),
+                indices.is_contiguous(),
+            )
+        return _materialize_cpu_indices(indices)
 
     def _layer_ranges(self, plan: _PoolRangePlan, logical_layer: int):
         """(ptrs, sizes, offsets) for one layer, one nested list per object."""
@@ -1322,8 +1421,20 @@ class UMBPTreeConnector(UnifiedTreeConnector):
 
     def _run_offload(self, expanded: list[PoolTransfer], ready_event: object) -> bool:
         ready_event.synchronize()
+        next_slot = 0
+
+        def materialize_indices(indices: torch.Tensor) -> torch.Tensor:
+            nonlocal next_slot
+            slot = next_slot
+            next_slot += 1
+            return self._materialize_offload_indices(indices, slot)
+
+        plans = self._build_load_plans(
+            [expanded], materialize_indices=materialize_indices
+        )
+        plans_by_name = {plan.name: plan for plan in plans}
         for transfer in expanded:
-            plan = self._build_load_plans([[transfer]])[0]
+            plan = plans_by_name[transfer.name]
             entry = self.pools[transfer.name]
             # From the pool layout, never from the ranges below: see
             # _object_sizes_per_page.

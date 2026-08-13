@@ -261,6 +261,173 @@ class TestUMBPTreeConnector(unittest.TestCase):
                 self, connector.pools[transfer.name], transfer.host_indices
             )
 
+    def test_load_plan_materializes_a_shared_source_only_once(self):
+        connector = self.make_connector()
+        resolved = connector.pool_group.resolve_transfers([self.transfer(pages=2)])
+        self.assertIs(resolved[0].host_indices, resolved[1].host_indices)
+
+        with patch.object(
+            umbp_tree_connector,
+            "_materialize_cpu_indices",
+            wraps=umbp_tree_connector._materialize_cpu_indices,
+        ) as materialize:
+            plans = connector._build_load_plans([resolved])
+
+        self.assertEqual(materialize.call_count, 1)
+        by_name = {plan.name: plan for plan in plans}
+        # KV buffers are token-row based; INDEXER buffers are page-row based.
+        # Only the immutable source snapshot is shared, never final row geometry.
+        self.assertEqual(by_name[PoolName.KV].locations, [0, 2])
+        self.assertEqual(by_name[PoolName.INDEXER].locations, [0, 1])
+
+    def test_async_offload_snapshot_uses_distinct_reusable_pinned_slots(self):
+        connector = UMBPTreeConnector.__new__(UMBPTreeConnector)
+        connector._async_offload_index_snapshot = True
+        connector._offload_index_fallback_warned = False
+        connector._offload_index_stream = None
+        connector._offload_index_done = None
+        connector._offload_index_device = None
+        connector._offload_index_buffers = []
+
+        device = torch.device("cuda:3")
+
+        class FakeCudaTensor(torch.Tensor):
+            @property
+            def device(self):
+                return device
+
+            def record_stream(self, stream):
+                pass
+
+        def indices(values):
+            return torch.tensor(values, dtype=torch.int64).as_subclass(FakeCudaTensor)
+
+        allocation_sizes = []
+
+        def allocate(count):
+            allocation_sizes.append(count)
+            return torch.empty(count, dtype=torch.int64)
+
+        stream = MagicMock()
+        done = MagicMock()
+        fake_device_module = SimpleNamespace(
+            device=MagicMock(side_effect=lambda _: contextlib.nullcontext()),
+            Stream=MagicMock(return_value=stream),
+            Event=MagicMock(return_value=done),
+            stream=MagicMock(side_effect=lambda _: contextlib.nullcontext()),
+        )
+
+        with (
+            patch.object(umbp_tree_connector, "device_module", fake_device_module),
+            patch.object(
+                connector,
+                "_allocate_offload_index_buffer",
+                side_effect=allocate,
+            ),
+        ):
+            first = connector._materialize_offload_indices(indices([11, 12, 13, 14]), 0)
+            first_before_reuse = first.clone()
+            second = connector._materialize_offload_indices(indices([21, 22]), 1)
+            slot_zero_ptr = first.data_ptr()
+            slot_one_before_reuse = second.clone()
+            reused = connector._materialize_offload_indices(indices([31, 32]), 0)
+
+        self.assertEqual(first_before_reuse.tolist(), [11, 12, 13, 14])
+        self.assertEqual(second.tolist(), [21, 22])
+        self.assertEqual(reused.tolist(), [31, 32])
+        self.assertEqual(reused.data_ptr(), slot_zero_ptr)
+        self.assertNotEqual(second.data_ptr(), slot_zero_ptr)
+        self.assertTrue(torch.equal(second, slot_one_before_reuse))
+        self.assertNotIn(0, allocation_sizes)
+
+    def test_async_offload_snapshot_records_before_copy_failure(self):
+        connector = UMBPTreeConnector.__new__(UMBPTreeConnector)
+        connector._async_offload_index_snapshot = True
+        connector._offload_index_fallback_warned = False
+        connector._offload_index_stream = None
+        connector._offload_index_done = None
+        connector._offload_index_device = None
+        connector._offload_index_buffers = []
+
+        indices = MagicMock()
+        indices.device = torch.device("cuda:2")
+        indices.dtype = torch.int64
+        indices.ndim = 1
+        indices.is_contiguous.return_value = True
+        indices.numel.return_value = 4
+        indices.detach.return_value = indices
+
+        buffer = MagicMock()
+        buffer.numel.return_value = 4
+        buffer.__getitem__.return_value = buffer
+        timeline = []
+        indices.record_stream.side_effect = lambda _: timeline.append("record")
+
+        def fail_copy(*args, **kwargs):
+            timeline.append("copy")
+            raise RuntimeError("copy failed")
+
+        buffer.copy_.side_effect = fail_copy
+        stream = MagicMock()
+        done = MagicMock()
+        fake_device_module = SimpleNamespace(
+            device=lambda _: contextlib.nullcontext(),
+            Stream=lambda **_: stream,
+            Event=lambda: done,
+            stream=lambda _: contextlib.nullcontext(),
+        )
+        fallback = object()
+
+        with (
+            patch.object(umbp_tree_connector, "device_module", fake_device_module),
+            patch.object(
+                connector, "_allocate_offload_index_buffer", return_value=buffer
+            ),
+            patch.object(
+                umbp_tree_connector,
+                "_materialize_cpu_indices",
+                return_value=fallback,
+            ) as sync_copy,
+            self.assertLogs(umbp_tree_connector.logger, level="ERROR"),
+        ):
+            result = connector._materialize_offload_indices(indices, 0)
+
+        self.assertIs(result, fallback)
+        self.assertEqual(timeline, ["record", "copy"])
+        stream.synchronize.assert_not_called()
+        done.record.assert_not_called()
+        sync_copy.assert_called_once_with(indices)
+        self.assertFalse(connector._async_offload_index_snapshot)
+        self.assertIs(connector._offload_index_buffers[0], buffer)
+
+    def test_offload_snapshot_shape_fallback_warns_once(self):
+        connector = UMBPTreeConnector.__new__(UMBPTreeConnector)
+        connector._async_offload_index_snapshot = True
+        connector._offload_index_fallback_warned = False
+        connector._offload_index_device = None
+        device = torch.device("cuda:1")
+
+        class FakeCudaTensor(torch.Tensor):
+            @property
+            def device(self):
+                return device
+
+        indices = torch.tensor([3, 5], dtype=torch.int32).as_subclass(FakeCudaTensor)
+        with patch.object(umbp_tree_connector.logger, "warning") as warning:
+            first = connector._materialize_offload_indices(indices, 0)
+            second = connector._materialize_offload_indices(indices, 0)
+
+        self.assertEqual(first.tolist(), [3, 5])
+        self.assertEqual(first.dtype, torch.int64)
+        self.assertEqual(second.tolist(), [3, 5])
+        warning.assert_called_once()
+
+        with patch.object(umbp_tree_connector.logger, "warning") as warning:
+            connector._materialize_offload_indices(
+                torch.tensor([7, 9], dtype=torch.int32), 0
+            )
+        warning.assert_not_called()
+
     def test_resolver_accepts_deepseek_v4_pool(self):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4LayerItem,
@@ -808,6 +975,22 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(connector.num_completed_offloads(), 2)
         self.assertTrue(connector.pop_completed_offload())
         self.assertFalse(connector.pop_completed_offload())
+
+    def test_offload_materializes_a_shared_source_only_once(self):
+        connector = self.make_connector()
+
+        with patch.object(
+            connector,
+            "_materialize_offload_indices",
+            wraps=connector._materialize_offload_indices,
+        ) as materialize:
+            self.assertTrue(connector.offload([self.transfer(pages=2)]))
+            self.wait_for_offloads(connector)
+
+        self.assertEqual(materialize.call_count, 1)
+        self.assertEqual(connector.num_completed_offloads(), 1)
+        self.assertTrue(connector.pop_completed_offload())
+        self.assertEqual(self.client.batch_put_ranges_from_ptr.call_count, 2)
 
     @contextlib.contextmanager
     def peer_reductions(self, connector, peer_values):
