@@ -20,7 +20,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
-    DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
@@ -34,14 +33,8 @@ device_module = get_device_module()
 # This is a logical-page count; existence queries carry keys only, no ranges.
 CHUNK_PAGES = 64
 
-# The same limit for the data plane, but counted in ranges rather than pages,
-# because the two load strategies put very different numbers of ranges on one
-# object: layer-wise sends one, prefetch sends one per layer. Budgeting the
-# data plane in pages therefore split a layer-wise load into `num_layers` times
-# more RPCs than the message size required -- on GLM-5.1 that was 1248 round
-# trips where 156 would do, and at ~0.34 ms each it was the largest single cost
-# of a restore. 8192 ranges is ~1.5 MB of request in the worst case observed,
-# against gRPC's 4 MB default.
+# Budget by ranges because load strategies attach different counts per object;
+# 8192 stays below gRPC's default message limit.
 RANGES_PER_CALL = int(os.getenv("UMBP_RANGES_PER_CALL", "8192"))
 
 # Split replicated KV reads across the attention TP group. This is experimental
@@ -76,12 +69,6 @@ def _ordered_layers(entry) -> list[int]:
             f"UMBP pool {entry.name} layer mapping is not a contiguous bijection."
         )
     return [by_buffer[index] for index in range(pool_layer_count)]
-
-
-def _resolve_umbp_pool_group(
-    kvcache: Any, page_size: int, req_to_token_pool: Any
-) -> DevicePoolGroup:
-    return resolve_hybrid_device_pool_group(kvcache, page_size, req_to_token_pool)
 
 
 def _is_verified_split_kvcache(kvcache: Any) -> bool:
@@ -164,15 +151,9 @@ class LayerWiseLoadCounter:
 
 @dataclass
 class _PoolRangePlan:
-    """One pool's share of a load: the objects to touch and where they live.
+    """Object keys and locations for one pool load.
 
-    An object is a whole page (or a page's component, when the pool is not
-    packed), holding every layer back to back. A layer is addressed as a byte
-    range inside it, so this plan carries no per-layer state -- the ranges come
-    from `get_prepared_layer_range_meta` at the moment they are needed, which
-    keeps the reader and the writer on one source of truth.
-
-    For split loads, ``keys`` and ``locations`` contain only this rank's share.
+    Layer ranges are derived on demand; split plans contain only this rank's share.
     """
 
     name: PoolName
@@ -197,13 +178,9 @@ def _split_windows(num_pages: int, tp_size: int) -> tuple[tuple[int, int], ...]:
 
 
 def _object_sizes_per_page(entry) -> list[int]:
-    """Byte size of each object one page contributes, in key order.
+    """Return per-page object sizes independently of emitted ranges.
 
-    Derived from the pool layout, never from the ranges a request happens to
-    emit. Deriving it from the emitted ranges would defeat the tier's tiling
-    check: a range builder that dropped its last layer would also shrink the
-    declared size, the two would agree, and a truncated object would be
-    published.
+    This keeps the tier's exact-tiling validation independent of range generation.
     """
     if entry.packed:
         return [
@@ -250,20 +227,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         self.page_size = params.page_size
         self.load_strategy = server_args.unified_tree_connector_load_strategy
         self._tp_size = server_args.tp_size
-        # How many consecutive layers one load RPC covers. An object is named
-        # on the wire once per call, so a group of G amortizes the per-object
-        # cost -- key transmission, key hashing, and the nested per-object
-        # vectors the server rebuilds -- across G layers, at the price of
-        # releasing layers to the forward pass G at a time. That cost dominates
-        # under concurrency: measured server-side, resolving keys to slots is
-        # 21% of a read batch while the copy itself is 74%, and 8 concurrent
-        # 32K restores spend ~2.5 ms of a 3 ms RPC outside the tier entirely.
-        #
-        # 8 is the measured optimum on both models and in both regimes, and the
-        # curve is flat enough on either side that one constant serves both:
-        # DeepSeek-V4 8-way at 32K goes 617 -> 404 ms from 1 to 8 and back up to
-        # 453 at 32, GLM-5.1 4-way goes 1332 -> 822. Past the optimum the
-        # coarser release starts to cost more than the amortization saves.
+        # Group layers to amortize per-object RPC overhead; 8 is the measured default.
         self.layer_group = max(1, int(os.getenv("UMBP_LAYER_GROUP", "8")))
         self._split_load = bool(
             SPLIT_LOAD and self.load_strategy == "layer_wise" and self._tp_size > 1
@@ -285,7 +249,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
         if self._split_load and distributed:
             self._split_process_group()
 
-        self.pool_group = _resolve_umbp_pool_group(
+        self.pool_group = resolve_hybrid_device_pool_group(
             kvcache, self.page_size, params.req_to_token_pool
         )
         self.pools = self.pool_group.entry_map
@@ -389,11 +353,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             client = self.storage.client
             mode = client.get_deployment_mode()
             mode_type = type(mode)
-            # Objects hold every layer and a layer is read back as a byte
-            # range, which needs mori's ranged multi-buffer I/O. Only the
-            # StandaloneProcess client implements it today; DistributedClient
-            # returns all-false. Refuse at startup rather than come up and fail
-            # every load -- the latter is far harder to diagnose.
+            # Page objects require ranged I/O, currently exposed by StandaloneProcess.
             if mode != mode_type.StandaloneProcess:
                 raise ValueError(
                     "Direct UMBP requires the StandaloneProcess deployment mode: "
@@ -1379,12 +1339,7 @@ class UMBPTreeConnector(UnifiedTreeConnector):
             ]
             ptrs, sizes, offsets = self._all_layer_ranges(plan)
 
-            # Objects go out in page order, which is what makes the tier's slot
-            # layout mirror the device layout and lets `dram_tier.cpp` collapse
-            # a whole layer into one strided submission. The old explicit sort
-            # by device address is gone with the per-layer objects it sorted:
-            # an object now spans every layer buffer, so it has no single
-            # device address to sort by.
+            # Preserve page order so the tier can collapse a layer into a strided copy.
 
             # An object's ranges must tile it exactly, so a chunk boundary may
             # fall between objects but never inside one.

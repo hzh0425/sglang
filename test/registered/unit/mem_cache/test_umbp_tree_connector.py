@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
     DevicePoolGroup,
+    resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.storage.umbp import umbp_tree_connector
 from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
@@ -26,7 +27,6 @@ from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
     _object_sizes_per_page,
     _ordered_layers,
     _PoolRangePlan,
-    _resolve_umbp_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_connector_mixin import (
@@ -179,8 +179,9 @@ class TestUMBPTreeConnector(unittest.TestCase):
         with (
             # A sibling test leaves gloo initialized without sglang parallel groups.
             patch("torch.distributed.is_initialized", return_value=False),
-            patch(
-                "sglang.srt.mem_cache.storage.umbp.umbp_tree_connector._resolve_umbp_pool_group",
+            patch.object(
+                umbp_tree_connector,
+                "resolve_hybrid_device_pool_group",
                 return_value=pool_group,
             ),
             patch(
@@ -303,7 +304,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         kvcache.compress_state_pools = [state_pool(), None, state_pool()]
         kvcache.indexer_compress_state_pools = [state_pool(), None, state_pool()]
 
-        group = _resolve_umbp_pool_group(kvcache, self.page_size, None)
+        group = resolve_hybrid_device_pool_group(kvcache, self.page_size, None)
 
         self.assertEqual(group.num_layers, 3)
         self.assertEqual(len(group.entry_map), 6)
@@ -332,11 +333,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         qwen_kv, qwen_multiplier = keys_for(qwen_group, PoolName.KV)
         mamba, mamba_multiplier = keys_for(qwen_group, PoolName.MAMBA)
 
-        # Qwen's KV pool has separate k and v buffers, but the entry is packed,
-        # so a page is one object and gets one key -- same layout Mooncake
-        # reaches by giving PoolName.KV a single suffix unconditionally. MAMBA
-        # is the one entry built with packed=False, so it keeps one key per
-        # component.
+        # Packed Qwen K/V uses one key; unpacked Mamba uses one per component.
         self.assertEqual(qwen_multiplier, 1)
         self.assertEqual(qwen_kv, ["page_tp0_cp0_pp0_kv"])
         self.assertEqual(mamba_multiplier, 2)
@@ -346,14 +343,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         )
 
     def test_range_budget_counts_ranges_not_layers(self):
-        """The per-RPC budget is in ranges, so it must be read off the ranges.
-
-        A packed pool with two components puts two ranges on an object per
-        layer, so deriving the budget from the layer count would overshoot it by
-        the component count and could push a long-context request past gRPC's
-        message limit. Qwen's KV pool is exactly that shape: separate k and v
-        buffers, one packed object.
-        """
+        """Budget packed Qwen objects by their emitted ranges."""
         group, _ = self._hybrid_linear_pool_group(use_mla=False)
         entry = group.entry_map[PoolName.KV]
         self.assertTrue(entry.packed)
@@ -480,7 +470,10 @@ class TestUMBPTreeConnector(unittest.TestCase):
             ),
             translate_mamba_indices=lambda indices: indices,
         )
-        return _resolve_umbp_pool_group(kvcache, self.page_size, req_pool), req_pool
+        return (
+            resolve_hybrid_device_pool_group(kvcache, self.page_size, req_pool),
+            req_pool,
+        )
 
     def test_pool_layers_follow_buffer_indices_not_logical_layer_order(self):
         buffers = [
@@ -677,10 +670,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.assertTrue(connector.offload([self.transfer(pages=5)]))
             self.wait_for_offloads(connector)
 
-        # 3 chunks per pool, 2 objects each. A chunk boundary may
-        # fall between objects but never inside one: the tier requires an
-        # object's ranges to tile it exactly, so a split object could never be
-        # published.
+        # Chunk boundaries may fall between objects, never inside one.
         calls = self.client.batch_put_ranges_from_ptr.call_args_list
         self.assertEqual(len(calls), 6)
         self.assertEqual([len(call.args[0]) for call in calls], [2, 2, 1, 2, 2, 1])
@@ -689,14 +679,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
                 self.assertEqual(sum(sizes), object_size)
 
     def test_offload_keeps_key_range_and_object_size_pairing(self):
-        """Every key must leave with its own ranges and its own declared size.
-
-        Desyncing them would store one object's bytes under another object's
-        key -- silent corruption that no return value would reveal. There is no
-        longer a sort to disturb the pairing (a page object spans every layer
-        buffer, so it has no single device address to sort by), but chunking
-        still slices five parallel lists.
-        """
+        """Keep keys, ranges, and declared object sizes aligned while chunking."""
         connector = self.make_connector()
 
         expected = {}
@@ -1098,14 +1081,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
                 self.assertEqual(len(ranges), 1)
 
     def test_background_load_does_not_split_a_load_that_fits_the_budget(self):
-        """Layer-wise loading must spend its whole range budget on objects.
-
-        A layer-wise call carries one range per object, so the number of
-        objects it may hold is the budget itself. Budgeting it in pages instead
-        divided that by the layer count and split every load into that many
-        more round trips -- on GLM-5.1, 1248 RPCs where 156 sufficed, which
-        dominated the restore.
-        """
+        """Do not split a layer-wise load that fits the range budget."""
         connector = self.make_connector()
         connector.layer_group = 1  # the budget, not the group, is under test
         pages = 7
@@ -1120,14 +1096,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
             self.assertEqual(len(call.args[0]), pages)
 
     def test_layer_group_folds_layers_into_one_call_per_object(self):
-        """A group of G layers must cost one call, not G, and still release all G.
-
-        Naming an object on the wire is what a load pays per call -- key bytes,
-        key hashing, and the per-object vectors the server rebuilds -- and under
-        concurrency that is most of the RPC. Grouping amortizes it, but only if
-        every layer in the group still completes: the forward pass waits on each
-        one individually.
-        """
+        """Fold a layer group into one call while completing every layer."""
         connector = self.make_connector()
         group = 2
         connector.layer_group = group
@@ -1584,11 +1553,7 @@ class TestUMBPTreeConnector(unittest.TestCase):
         self.assertEqual(connector.deployment_mode, _DeploymentMode.StandaloneProcess)
 
     def test_rejects_deployment_modes_without_ranged_io(self):
-        """Page-granular objects need ranged multi-buffer I/O.
-
-        The worker-facing client must remain StandaloneProcess. The inner
-        backend is checked separately through its advertised capability.
-        """
+        """Require a StandaloneProcess client for ranged I/O."""
         for mode in (_DeploymentMode.Local, _DeploymentMode.Distributed):
             with self.subTest(mode=mode):
                 self.client.get_deployment_mode.return_value = mode

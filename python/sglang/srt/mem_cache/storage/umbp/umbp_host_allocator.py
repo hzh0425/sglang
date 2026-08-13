@@ -45,9 +45,8 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         )
         self._numa_node = _int_env("SGLANG_HICACHE_HOST_NUMA_NODE", -1)
         self._prefault = _bool_env("SGLANG_HICACHE_HOST_PREFAULT", True)
-        # The worker hands this buffer's fd to the standalone server over
-        # SCM_RIGHTS, so the backing must be fd-shareable. Read from the
-        # environment because this runs before extra_config is parsed.
+        # Standalone mode needs fd-shareable backing; allocation precedes
+        # config parsing.
         self._standalone_process = bool(os.getenv("UMBP_STANDALONE_ADDRESS"))
         self._handles: Dict[int, Any] = {}
 
@@ -67,8 +66,6 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         nbytes = math.prod(int(dim) for dim in dims) * element_size
 
         if self._standalone_process:
-            # AnonymousShmHugetlb is hugetlbfs-backed AnonymousShm, still
-            # fd-shareable; small-MTT NICs need hugepages for large regions.
             requested_backing = (
                 self._mod.UMBPHostBufferBacking.AnonymousShmHugetlb
                 if self._use_hugepage
@@ -114,7 +111,6 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
             handle.mapped_size,
             self._numa_node,
         )
-        # Each mode demotes to its own 4 KiB variant, so the check needs both.
         demoted = handle.actual_backing == (
             self._mod.UMBPHostBufferBacking.AnonymousShm
             if self._standalone_process

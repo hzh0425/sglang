@@ -3022,12 +3022,8 @@ class Scheduler(
                         self.enable_hierarchical_cache
                         or self.server_args.enable_unified_tree_connector
                     ):
-                        # Both hold lock_ref on nodes until an async write-through
-                        # or connector offload completes, so a NO_TOKEN can be a
-                        # transient shortfall that resolves a few steps later.
-                        # Latching batch_is_full on an empty running batch would
-                        # be permanent: nothing else clears the flag once there is
-                        # no batch left to filter.
+                        # Async cache writes can make NO_TOKEN transient; do not
+                        # latch an empty batch that has nothing to clear the flag.
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )

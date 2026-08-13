@@ -484,8 +484,7 @@ class UMBPStore(HiCacheStorage):
         standalone_extra_address = extra.get("standalone_address")
         standalone_env_address = _optional_env_str("UMBP_STANDALONE_ADDRESS")
         standalone_address = standalone_extra_address or standalone_env_address
-        # Verified after the client is built: a silent demotion to plain local
-        # mode would make every put fail with no error.
+        # Verify the client did not silently fall back to local mode.
         self._standalone_process_expected = bool(standalone_address)
         if master_address and standalone_address:
             raise ValueError(
@@ -497,9 +496,6 @@ class UMBPStore(HiCacheStorage):
             and standalone_extra_address
             and not standalone_env_address
         ):
-            # The allocator picks Anonymous vs. AnonymousShm before this config
-            # is parsed, so with a host pool the address must come from the
-            # environment. The direct GPU connector has no host pool.
             raise ValueError(
                 "standalone_address in hicache-storage-backend-extra-config is "
                 "not supported when a host KV pool is present. The host memory "
@@ -508,9 +504,7 @@ class UMBPStore(HiCacheStorage):
                 "process environment instead."
             )
 
-        # Worker identity. Distributed puts it on master_config; a standalone
-        # server running a distributed backend needs the same values to build
-        # each worker's external-KV identity.
+        # Both remote modes use the same worker identity.
         def _resolve_node_address() -> str:
             node_address = extra.get(
                 "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
@@ -901,13 +895,10 @@ class UMBPStore(HiCacheStorage):
                 safe_cap = int(cfg.ssd.capacity_bytes * 0.95)
                 cfg.ssd.spdk_proxy_tenant_quota_bytes = max(1, safe_cap // dp_size_hint)
 
-        # Initialize multi-pool state before the optional constructor-time
-        # registration below. Logical hybrid anchors have no physical tensor;
-        # their side pools are registered independently through the v2 API.
+        # Logical anchors have no tensor; their side pools register independently.
         self.registered_pools: dict = {}
         self._kv_anchor_is_logical = False
-        # Storage base pointers already handed to register_memory(); views and
-        # pools sharing one allocation must not be registered twice.
+        # Avoid registering shared storage more than once.
         self._registered_regions: set = set()
 
         self.client = UMBPClient(cfg)
@@ -990,14 +981,11 @@ class UMBPStore(HiCacheStorage):
             "page_head",
         ], "UMBP store only supports page_first, page_first_direct, or page_head layout"
 
-        # A hybrid logical anchor owns allocation indices but no physical KV
-        # tensor. Its side pools carry the data and are registered through the
-        # v2 path below.
+        # A logical anchor owns indices; side pools carry the data.
         self._kv_anchor_is_logical = self.mem_pool_host.kv_buffer is None
         self._zero_copy_registered = False
 
-        # Before the logical-anchor early return: register_mem_host_pool_v2()
-        # is driven by the hybrid controller and needs this already set.
+        # Side-pool registration needs the mode even for a logical anchor.
         self._is_standalone_process = False
         if self.client is not None:
             deployment_mode = None
@@ -1029,20 +1017,13 @@ class UMBPStore(HiCacheStorage):
         if self._kv_anchor_is_logical:
             return
 
-        # Pre-register so PoolClient can take the zero-copy path for
-        # batch_get_into_ptr / batch_put_from_ptr. Plain local mode skips it.
         self._zero_copy_registered = self._register_host_buffer_for_zero_copy(
             mem_pool_host
         )
 
     @staticmethod
     def _pool_physical_buffers(host_pool: HostKVCache) -> List[Any]:
-        """Every host tensor of a pool that UMBP must be able to reach.
-
-        Side pools do not all keep their data in `kv_buffer`: mamba pools expose
-        a temporal buffer plus one per conv layer, the DSA indexer pool exposes
-        `index_k_with_scale_buffer`, and a layer-first pool can hand back a list.
-        """
+        """Return every non-empty physical tensor exposed by a host pool."""
         getter = getattr(host_pool, "get_hybrid_pool_buffer", None)
         buffers = getter() if getter is not None else None
         if not buffers:
@@ -1052,11 +1033,7 @@ class UMBPStore(HiCacheStorage):
             if buffer is None:
                 continue
             for tensor in buffer if isinstance(buffer, (list, tuple)) else [buffer]:
-                # A conv-only mamba pool allocates an empty temporal buffer;
-                # key generation already skips it via temporal_state_elem_size,
-                # and register_memory would reject the zero-length region.
-                # Test numel, not storage bytes: an empty view can sit on a
-                # non-empty allocation.
+                # Empty views may share storage; register_memory rejects zero bytes.
                 if tensor is not None and tensor.numel() > 0:
                     flat.append(tensor)
         return flat
@@ -1078,15 +1055,7 @@ class UMBPStore(HiCacheStorage):
         return base, max(size, int(mapped_size or 0))
 
     def _register_host_buffer_for_zero_copy(self, host_pool: HostKVCache) -> bool:
-        """Register a pool's host buffers for zero-copy transfers.
-
-        Distributed registers them with the RDMA IOEngine, standalone-process
-        with the long-lived server by shm fd handoff. Returns False on any
-        skip/failure so the caller falls back to the staging-buffer path --
-        except in standalone-process mode, which has no fallback and raises:
-        an unregistered pointer makes batch_put_from_ptr / batch_get_into_ptr
-        return all-false silently.
-        """
+        """Register host buffers; standalone failures are fatal without fallback."""
         if self.client is None:
             return False
         is_standalone_process = getattr(self, "_is_standalone_process", False)
@@ -1123,8 +1092,7 @@ class UMBPStore(HiCacheStorage):
 
         mode = "standalone-process" if is_standalone_process else "distributed"
         allocator = getattr(host_pool, "allocator", None)
-        # A buffer already in _registered_regions counts as covered, so calling
-        # this twice stays idempotent instead of reporting failure.
+        # Already registered storage counts as covered.
         covered = 0
         for buffer in buffers:
             try:
@@ -1414,13 +1382,7 @@ class UMBPStore(HiCacheStorage):
         elif components is not None and len(components) == 1:
             suffixes = [f"_{mla_suffix}_{pool_name}"]
         elif components is not None and len(components) == 2:
-            # These branches serve the tree connector, whose pools are
-            # DevicePoolEntry. One key must name one stored object, and a
-            # packed entry puts both components of a page in a single object --
-            # emitting a k/v pair there would hand `batch_*_ranges` twice as
-            # many keys as range entries and shift every range by one object.
-            # Mooncake reaches the same layout by giving PoolName.KV a single
-            # suffix unconditionally.
+            # Packed DevicePoolEntry K/V components share one stored object.
             suffixes = (
                 [f"_{mha_suffix}_{pool_name}"]
                 if host_pool.packed
