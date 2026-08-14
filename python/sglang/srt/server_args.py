@@ -2500,6 +2500,14 @@ class ServerArgs:
         "Enable direct external storage through UnifiedRadixCache without a host cache tier.",
         NS("memory"),
     ] = False
+    unified_tree_connector_backend: A[
+        str,
+        Arg(
+            help="Storage backend for --enable-unified-tree-connector.",
+            choices=["mooncake", "mori"],
+        ),
+        NS("memory"),
+    ] = "mooncake"
     unified_tree_connector_load_strategy: A[
         str,
         Arg(

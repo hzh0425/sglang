@@ -3018,8 +3018,12 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
+                    if (
+                        self.enable_hierarchical_cache
+                        or self.server_args.enable_unified_tree_connector
+                    ):
+                        # Async cache writes can make NO_TOKEN transient; do not
+                        # latch an empty batch that has nothing to clear the flag.
                         running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
                             not running_batch.is_empty()
                         )

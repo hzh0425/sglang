@@ -124,11 +124,23 @@ class UnifiedCacheConnectorMixin:
             raise ValueError(
                 "Unified tree connector supports FULL, FULL+SWA, and FULL+MAMBA."
             )
-        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
-            MooncakeTreeConnector,
-        )
+        backend = server_args.unified_tree_connector_backend
+        if backend == "mooncake":
+            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
+                MooncakeTreeConnector,
+            )
 
-        self.connector = MooncakeTreeConnector(server_args, params)
+            connector_cls = MooncakeTreeConnector
+        elif backend == "mori":
+            from sglang.srt.mem_cache.storage.umbp.umbp_tree_connector import (
+                UMBPTreeConnector,
+            )
+
+            connector_cls = UMBPTreeConnector
+        else:
+            raise ValueError(f"Unknown unified tree connector backend: {backend!r}")
+
+        self.connector = connector_cls(server_args, params)
         self.write_through_threshold = 1
 
     # ---- match: probe the remote store and report host_hit_length ----
