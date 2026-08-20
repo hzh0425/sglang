@@ -550,7 +550,9 @@ class TestUMBPDirectLinker(unittest.TestCase):
         counter = connector.layer_done_counter.update_producer()
         connector.layer_done_counter.set_consumer(counter)
 
-        connector._run_layer_wise_batch(counter, [plan])
+        connector._run_layer_wise_batch(
+            counter, [plan], SimpleNamespace(synchronize=lambda: None)
+        )
 
         connector.layer_done_counter.wait_until(2)
         # Layers 0 and 2 belong to the pool; layer 1 has no objects and must
@@ -958,6 +960,53 @@ class TestUMBPDirectLinker(unittest.TestCase):
             self.client.batch_get_ranges_into_ptr.call_count,
             self.num_layers * len(self.pools),
         )
+
+    def test_layerwise_load_waits_for_recording_stream(self):
+        calls = []
+
+        class _Event:
+            def record(self):
+                calls.append("record")
+
+            def synchronize(self):
+                calls.append("synchronize")
+
+        def get_ranges(keys, *args):
+            calls.append("get")
+            return [True] * len(keys)
+
+        connector = self.make_connector()
+        self.client.batch_get_ranges_into_ptr.side_effect = get_ranges
+        with patch.object(umbp_direct_linker.device_module, "Event", _Event):
+            self.assertTrue(connector.load("rid", [self.transfer(pages=1)]))
+            counter = connector.start_layer_wise_loading()
+            connector.layer_done_counter.set_consumer(counter)
+            connector.layer_done_counter.wait_until(self.num_layers - 1)
+
+        self.assertGreater(calls.count("get"), 0)
+        self.assertEqual(calls[:3], ["record", "synchronize", "get"])
+
+    def test_layerwise_load_sync_failure_reaches_consumer(self):
+        connector = self.make_connector()
+        expanded = connector.pool_group.resolve_transfers([self.transfer(pages=1)])
+        plans = connector._build_load_plans([expanded])
+        counter = connector.layer_done_counter.update_producer()
+        connector.layer_done_counter.set_consumer(counter)
+        ready_event = MagicMock()
+        ready_event.synchronize.side_effect = RuntimeError("event failed")
+        self.client.batch_get_ranges_into_ptr.reset_mock()
+
+        with self.assertLogs(umbp_direct_linker.logger, level="ERROR"):
+            connector._run_layer_wise_batch(counter, plans, ready_event)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "UMBP layer-wise KV load failed"
+        ) as raised:
+            connector.layer_done_counter.wait_until(self.num_layers - 1)
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertEqual(str(raised.exception.__cause__), "event failed")
+        ready_event.synchronize.assert_called_once_with()
+        self.client.batch_get_ranges_into_ptr.assert_not_called()
 
     def test_load_and_offload_share_one_gc_freeze(self):
         self.freeze_gc_mock.reset_mock()

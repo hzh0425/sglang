@@ -365,7 +365,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
         self._gc_frozen = False
-        self._load_queue: Queue[tuple[int, list[_PoolRangePlan]] | None] = Queue()
+        self._load_queue: Queue[tuple[int, list[_PoolRangePlan], object] | None] = (
+            Queue()
+        )
         self._offload_queue: Queue[tuple[list[PoolTransfer], object] | None] = Queue()
         self._offload_results: Queue[bool] = Queue()
         self._offload_sync_groups = _drain_sync_groups(params)
@@ -556,7 +558,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._pending = {}
         plans = self._build_load_plans(list(pending.values()))
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans))
+        ready_event = device_module.Event()
+        ready_event.record()
+        self._load_queue.put((counter_index, plans, ready_event))
         self._stats["load"] += len(pending)
         return counter_index
 
@@ -712,8 +716,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, plans = task
-                self._run_layer_wise_batch(counter_index, plans)
+                counter_index, plans, ready_event = task
+                self._run_layer_wise_batch(counter_index, plans, ready_event)
             finally:
                 self._load_queue.task_done()
 
@@ -789,9 +793,10 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         return max(1, RANGES_PER_CALL // max(1, ranges_per_object))
 
     def _run_layer_wise_batch(
-        self, counter_index: int, plans: list[_PoolRangePlan]
+        self, counter_index: int, plans: list[_PoolRangePlan], ready_event: object
     ) -> None:
         try:
+            ready_event.synchronize()
             by_layer: dict[int, list[_PoolRangePlan]] = defaultdict(list)
             for plan in plans:
                 for logical_layer in self.pool_layers[plan.name]:
